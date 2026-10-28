@@ -51,7 +51,7 @@ modules/
 **Одной командой:**
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/Case211/node-diagnostic/main/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/smoorf132/node-diagnostic/main/install.sh | sudo bash
 ```
 
 Скачивает репозиторий в `/opt/node-diagnostic`; в терминале сразу открывает меню. Переопределяемо через env: `ND_REF` (ветка/тег), `ND_DEST` (каталог).
@@ -59,7 +59,7 @@ curl -sSL https://raw.githubusercontent.com/Case211/node-diagnostic/main/install
 **Или вручную** (тулкит модульный — нужен весь репозиторий):
 
 ```bash
-git clone https://github.com/Case211/node-diagnostic
+git clone https://github.com/smoorf132/node-diagnostic
 cd node-diagnostic
 sudo bash node-diagnostic.sh        # интерактивное меню
 ```

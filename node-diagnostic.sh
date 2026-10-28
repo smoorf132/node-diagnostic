@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # node-diagnostic.sh — точка входа модульного тулкита ноды (Remnawave / VPN / Linux).
 # Диспетчер: интерактивное меню или прямой вызов модуля. Логика — в modules/, общее — в lib/common.sh.
-# Источник: https://github.com/Case211/node-diagnostic
+# Источник: https://github.com/smoorf132/node-diagnostic
 #
 #   sudo bash node-diagnostic.sh                 # меню (или диагностика, если не TTY)
 #   sudo bash node-diagnostic.sh diagnose -q     # только диагностика
@@ -20,9 +20,9 @@ MOD="$SELF/modules"
 if ! source "$SELF/lib/common.sh" 2>/dev/null; then
     echo "Ошибка: не найден lib/common.sh рядом со скриптом (запуск через pipe?)." >&2
     echo "Тулкит модульный — нужен весь репозиторий. Установка одной командой:" >&2
-    echo "  curl -sSL https://raw.githubusercontent.com/Case211/node-diagnostic/main/install.sh | sudo bash" >&2
+    echo "  curl -sSL https://raw.githubusercontent.com/smoorf132/node-diagnostic/main/install.sh | sudo bash" >&2
     echo "или вручную:" >&2
-    echo "  git clone https://github.com/Case211/node-diagnostic && cd node-diagnostic && sudo bash node-diagnostic.sh" >&2
+    echo "  git clone https://github.com/smoorf132/node-diagnostic && cd node-diagnostic && sudo bash node-diagnostic.sh" >&2
     exit 1
 fi
 export FINDINGS_FILE ND_STATE_DIR   # общий findings-файл между диагностикой и модулями

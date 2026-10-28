@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # install.sh — бутстрап node-diagnostic: скачать репозиторий целиком и запустить меню.
 # Установка одной командой:
-#   curl -sSL https://raw.githubusercontent.com/Case211/node-diagnostic/main/install.sh | sudo bash
+#   curl -sSL https://raw.githubusercontent.com/smoorf132/node-diagnostic/main/install.sh | sudo bash
 # Переопределяемо через env: ND_REPO, ND_REF (ветка/тег), ND_DEST (каталог).
 set -eu
 
-REPO="${ND_REPO:-https://github.com/Case211/node-diagnostic}"
+REPO="${ND_REPO:-https://github.com/smoorf132/node-diagnostic}"
 REF="${ND_REF:-main}"
 if [ "$(id -u)" -eq 0 ]; then DEST="${ND_DEST:-/opt/node-diagnostic}"
 else DEST="${ND_DEST:-$HOME/.local/share/node-diagnostic}"; fi

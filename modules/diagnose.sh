@@ -4,7 +4,7 @@
 # Компактный дашборд: прогресс-бар → сводка → вердикт → рекомендации по модулям.
 # Только диагностика; применение фиксов — modules/optimize.sh / protect.sh / bbr3.sh (или меню node-diagnostic.sh).
 # Детальный лог пишется в /tmp/node-diagnostic-<ts>.log
-# Источник: https://github.com/Case211/node-diagnostic
+# Источник: https://github.com/smoorf132/node-diagnostic
 # Запуск:
 #   sudo bash modules/diagnose.sh           # обычный прогон
 #   sudo bash modules/diagnose.sh --quick   # без долгих тестов (~1 мин вместо ~5)
