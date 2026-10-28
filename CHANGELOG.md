@@ -13,8 +13,15 @@ fail2ban заменён на CrowdSec; SSH можно пускать из все
 - **`install crowdsec`** (меню `[7]` → `[5]`): движок CrowdSec из packagecloud + `crowdsec-firewall-bouncer-nftables`, коллекции `crowdsecurity/linux` + `crowdsecurity/sshd`. SSH-IP и IP панели заносятся в allowlist `node-diagnostic` до установки bouncer'а, уже выданные по ним решения снимаются, чтобы IP из community-блоклиста не оборвал SSH-сессию посреди установки. Если acquisition для SSH нет, пишется fallback (файлы rsyslog или journald `ssh.service`/`sshd.service`). Перед установкой проверяется, что свободен порт LAPI 8080. Найденный fail2ban установщик предлагает остановить и удалить. Только deb/rpm + systemd.
 - `diagnose` в рекомендациях предлагает `install.sh crowdsec`, если CrowdSec не установлен.
 
+### Changed
+- Репозиторий по умолчанию — `smoorf132/node-diagnostic` (`install.sh`, подсказки, README).
+
 ### Removed
 - **protect: fail2ban** — `fail2ban-sshd.local` больше не генерируется. В `APPLY.txt` шаг 2 теперь ставит CrowdSec, откат — `apt purge crowdsec crowdsec-firewall-bouncer-nftables`.
+
+### Fixed
+- **install.sh**: при обновлении существующей копии `git fetch` шёл из её старого `origin`, а не из `REPO`. Установка из апстрима `Case211` молча оставалась на нём, даже если установщик запускали из форка или с `ND_REPO`. Теперь `origin` переставляется на `REPO` с сообщением «источник: старый → новый».
+- **detect_virt**: на bare-metal `systemd-detect-virt` печатает `none` и выходит с кодом 1, поэтому `|| echo unknown` дописывал вторую строку: в баннере меню выходило `none` + `unknown`, в `diagnose` — переносы в поле Virt. `diagnose` теперь использует общий `detect_virt`.
 
 ## [4.4.0] — в `main` с 2026-07-20
 

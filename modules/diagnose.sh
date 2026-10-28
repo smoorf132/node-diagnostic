@@ -289,7 +289,7 @@ check_identify() {
     if [ "$NO_NET" = "1" ]; then
         kern=$(uname -sr)
         distro=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo unknown)
-        virt=$(systemd-detect-virt 2>/dev/null || echo unknown)
+        virt=$(detect_virt)
         up=$(uptime -p 2>/dev/null || echo "?")
         echo "Hostname: $h"
         echo "Kernel: $kern  Distro: $distro  Virt: $virt  Uptime: $up"
@@ -343,7 +343,7 @@ check_identify() {
 
     kern=$(uname -sr)
     distro=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo unknown)
-    virt=$(systemd-detect-virt 2>/dev/null || echo unknown)
+    virt=$(detect_virt)
     up=$(uptime -p 2>/dev/null || echo "?")
 
     echo "Hostname: $h"

@@ -268,7 +268,9 @@ verify_sysctl() {
 # ────────────────────────────────────────────────────────────────────
 # Детект окружения
 # ────────────────────────────────────────────────────────────────────
-detect_virt() { systemd-detect-virt 2>/dev/null || echo "unknown"; }
+# без виртуализации systemd-detect-virt печатает «none» И выходит с 1 — это ответ, а не ошибка:
+# `|| echo unknown` дописывал вторую строку («none\nunknown» в баннере и в JSON diagnose)
+detect_virt() { local v; v=$(systemd-detect-virt 2>/dev/null); echo "${v:-unknown}"; }
 
 is_container() {
     systemd-detect-virt --container --quiet 2>/dev/null && return 0

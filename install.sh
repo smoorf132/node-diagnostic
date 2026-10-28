@@ -17,6 +17,14 @@ say "node-diagnostic → $DEST  (ref: $REF)"
 
 if have git; then
     if [ -d "$DEST/.git" ]; then
+        # origin старой копии мог смотреть в другой репозиторий (ставили из апстрима,
+        # теперь из форка / ND_REPO) — без set-url fetch молча тянул бы оттуда
+        old_repo=$(git -C "$DEST" remote get-url origin 2>/dev/null || true)
+        if [ "${old_repo%.git}" != "${REPO%.git}" ]; then
+            git -C "$DEST" remote set-url origin "$REPO" 2>/dev/null \
+                || git -C "$DEST" remote add origin "$REPO"
+            say "источник: ${old_repo:-нет} → $REPO"
+        fi
         # FETCH_HEAD вместо origin/$REF — работает и для ветки, и для тега
         # (origin/<тег> не существует, старый вариант на теге молча умирал)
         if git -C "$DEST" fetch --depth 1 origin "$REF" >/dev/null 2>&1 \
