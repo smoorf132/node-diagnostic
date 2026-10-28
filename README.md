@@ -22,10 +22,10 @@
 |---|---|---|
 | `diagnose` | 27 чеков: система, сеть, скорость, сервисы, репутация IP, Xray/Remnanode | — (только читает) |
 | `optimize` | sysctl-тюнинг, BBR+cake, FD-лимиты, RPS/RFS/XPS, NIC, MSS clamp, irqbalance, journald, zram | да (namespaced drop-in) |
-| `protect`  | firewall под Remnawave, fail2ban, SSH-хардненинг, DDoS-хардненинг | **нет — только генерирует файлы** |
+| `protect`  | firewall под Remnawave, SSH-хардненинг, DDoS-хардненинг | **нет — только генерирует файлы** |
 | `shape`    | per-IP шейпер полосы (eBPF/EDT): лимит DL/UL на клиента, whitelist, dynamic-штраф | да (tc clsact + BPF, свой `off`) |
 | `bbr3`     | ядро XanMod для TCP **BBRv3** (mainline даёт только v1) | да, но **без автоперезагрузки** |
-| `install`  | установка ноды Remnawave / Selfsteal / NetBird / мониторинга | да (по подтверждению) |
+| `install`  | установка ноды Remnawave / Selfsteal / NetBird / мониторинга / CrowdSec | да (по подтверждению) |
 | `rollback` | снять всё, что наложил `optimize` | да |
 
 ## Структура
@@ -40,7 +40,7 @@ modules/
   protect.sh                защита ноды (генерация артефактов)
   bbr3.sh                   установка XanMod (BBRv3)
   rollback.sh               откат оптимизаций
-  install.sh                установка ноды/Selfsteal/NetBird/мониторинга
+  install.sh                установка ноды/Selfsteal/NetBird/мониторинга/CrowdSec
   shape.sh                  per-IP eBPF-шейпер (оркестратор)
   nd-shaper.bpf.c           BPF-программа шейпера (clsact + EDT)
   shape_ctrl.py             программирование BPF-карт через bpftool
@@ -77,7 +77,7 @@ sudo bash node-diagnostic.sh optimize --from-findings   # только фикс�
 sudo bash node-diagnostic.sh optimize --dry-run    # показать, что применил бы
 sudo bash node-diagnostic.sh protect --panel-ip 1.2.3.4 --node-port 2222
 sudo bash node-diagnostic.sh bbr3 --install        # XanMod (нужен reboot); --level 2 если CPU маскирован
-sudo bash node-diagnostic.sh install monitoring    # нода/Selfsteal/NetBird/мониторинг
+sudo bash node-diagnostic.sh install monitoring    # нода/Selfsteal/NetBird/мониторинг/CrowdSec
 sudo bash node-diagnostic.sh shape on              # включить eBPF-шейпер
 sudo bash node-diagnostic.sh shape rule 1 443 50 20   # порт 443: 50 Mbit DL / 20 UL на каждый IP
 sudo bash node-diagnostic.sh rollback              # откат оптимизаций
@@ -117,17 +117,23 @@ sudo bash node-diagnostic.sh status                # что наложено н�
 Firewall на удалённой ноде может отрезать SSH, поэтому модуль **ничего не применяет** — пишет готовые артефакты в каталог и даёт пошаговый `APPLY.txt` с защитой от лок-аута (авто-откат правил через `systemd-run` таймер).
 
 Генерируется:
-- `firewall.nft` / `firewall-ufw.sh` — карта портов ноды: **443** (VLESS/Reality + QUIC/HY2) и **80** (ACME/Caddy) всем; **NODE_PORT** (control-API панель→нода) — только с IP панели; **SSH** — с твоего IP; ICMP не режется полностью (нужен для PMTU), только per-IP флуд; per-IP connlimit/SYN-rate; всё прочее — drop. `61000`/localhost и Caddy `:9443`/localhost наружу не открываются.
-- `fail2ban-sshd.local` — джейл SSH с нарастающим баном.
+- `firewall.nft` / `firewall-ufw.sh` — карта портов ноды: **443** (VLESS/Reality + QUIC/HY2) и **80** (ACME/Caddy) всем; **NODE_PORT** (control-API панель→нода) — только с IP панели; **SSH** — с твоего IP или из подсети NetBird (см. ниже); ICMP не режется полностью (нужен для PMTU), только per-IP флуд; per-IP connlimit/SYN-rate; всё прочее — drop. `61000`/localhost и Caddy `:9443`/localhost наружу не открываются.
 - `sshd-hardening.conf` — key-only, `PermitRootLogin prohibit-password` и т.д. (модуль проверяет наличие `authorized_keys` и предупреждает о риске лок-аута).
 - `sysctl` DDoS-хардненинг идёт через `optimize` (syncookies/anti-spoof).
+- Анти-брут SSH здесь не генерируется: CrowdSec ставится через `install crowdsec`, шаг описан в `APPLY.txt`.
 
 ```bash
 sudo bash node-diagnostic.sh protect --panel-ip <IP_панели> --node-port <NODE_PORT>
 # → /root/node-diagnostic-protect/  (открыть APPLY.txt)
+sudo bash node-diagnostic.sh protect --panel-ip <IP_панели> --ssh-from 100.92.0.0/16   # SSH только из NetBird
 ```
 
-Из меню то же самое без флагов: пункт **[3]** спросит IP панели и NODE_PORT (Enter — автодетект/плейсхолдер).
+Откуда пускать SSH:
+- `--ssh-from IP|CIDR` — явно. Хост-биты обнуляются, поэтому можно передать адрес ноды в том виде, в каком его отдаёт NetBird: `100.92.13.5/16` → `100.92.0.0/16`.
+- Без флага, если текущая SSH-сессия пришла **через NetBird** (её IP входит в подсеть интерфейса `wt0` или `netbird status`), SSH открывается всей подсети NetBird. С публичного IP SSH тогда закрыт, а `APPLY.txt` предупреждает о рисках: при падении NetBird вход останется только через VNC-консоль хостера.
+- Иначе SSH открывается только с IP текущей сессии. Если на ноде есть NetBird, модуль подскажет нужный `--ssh-from`.
+
+Из меню то же самое без флагов: пункт **[3]** спросит IP панели, NODE_PORT и откуда пускать SSH (Enter — автодетект/плейсхолдер).
 
 ## `bbr3` — TCP BBRv3 через XanMod
 
@@ -168,9 +174,12 @@ sudo bash node-diagnostic.sh install node         # нода Remnawave (DigneZzZ
 sudo bash node-diagnostic.sh install selfsteal    # Selfsteal
 sudo bash node-diagnostic.sh install netbird      # NetBird + setup-key (спросит ключ)
 sudo bash node-diagnostic.sh install monitoring   # cAdvisor + node_exporter + vmagent → VictoriaMetrics
+sudo bash node-diagnostic.sh install crowdsec     # CrowdSec + nftables-bouncer (анти-брут SSH)
 ```
 
 Мониторинг ставится точно по гайду [wiki.egam.es](https://wiki.egam.es/ru/configuration/grafana-monitoring-setup/): спрашивает имя инстанса и IP сервера мониторинга (NetBird) для `remoteWrite`, всё слушает `127.0.0.1`.
+
+CrowdSec ставится из официального репозитория packagecloud (в штатных репо Debian/Ubuntu лежит устаревший 1.4.x): движок, `crowdsec-firewall-bouncer-nftables` и коллекции `crowdsecurity/linux` + `crowdsecurity/sshd`. Установщик спрашивает IP панели. Этот IP, твой SSH-IP и подсеть NetBird (если он поднят на ноде) попадают в allowlist `node-diagnostic` **до** установки bouncer'а: иначе, если твой IP окажется в community-блоклисте, SSH-сессия оборвётся посреди установки. Если движок сам не подхватил логи SSH (нет rsyslog), пишется acquisition из journald. Если на ноде есть fail2ban, установщик предлагает его удалить. Работает только на deb/rpm-системах с systemd; порт `127.0.0.1:8080` (LAPI) должен быть свободен.
 
 ## Откат
 
@@ -178,7 +187,7 @@ sudo bash node-diagnostic.sh install monitoring   # cAdvisor + node_exporter + v
 sudo bash node-diagnostic.sh rollback            # снять sysctl drop-in, systemd-юниты, limits, MSS clamp
 sudo bash node-diagnostic.sh rollback --dry-run  # показать, что снял бы
 ```
-Не входит: ядро XanMod (`apt purge 'linux-xanmod*' && update-grub && reboot`), firewall/fail2ban/sshd (generate-only — откат в их `APPLY.txt`) и eBPF-шейпер (`shape off`).
+Не входит: ядро XanMod (`apt purge 'linux-xanmod*' && update-grub && reboot`), firewall/sshd (generate-only — откат в их `APPLY.txt`), CrowdSec (`apt purge crowdsec crowdsec-firewall-bouncer-nftables`) и eBPF-шейпер (`shape off`).
 
 ## Артефакты
 
@@ -192,7 +201,8 @@ sudo bash node-diagnostic.sh rollback --dry-run  # показать, что сн
 - bash 4+, root для `optimize`/`protect`/`bbr3`/`rollback` (диагностика работает и без root, часть проверок пропускается).
 - Поддержка дистрибутивов по модулям:
   - `diagnose`, `optimize`, `rollback` — Ubuntu/Debian/RHEL/Fedora/Alpine (sysctl универсален; deps ставятся через apt/dnf/yum/apk).
-  - `protect` — firewall на nftables/ufw универсален; инструкции по fail2ban в `APPLY.txt` даны под apt (для dnf/apk — аналогично).
+  - `protect` — firewall на nftables/ufw универсален.
+  - `install crowdsec` — deb/rpm-дистрибутивы с systemd (Debian/Ubuntu/RHEL/Fedora); на Alpine не поддерживается.
   - `bbr3` — **только Debian/Ubuntu** (XanMod = deb-репозиторий) и **только bare-metal/KVM x86_64** (не контейнер).
   - `shape` — ядро Linux **≥5.4** (EDT/clsact) + `clang`/`bpftool`/`libbpf-dev`; не в контейнере.
 

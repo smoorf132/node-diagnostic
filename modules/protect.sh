@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # modules/protect.sh — защита ноды под стек Remnawave. РЕЖИМ: только генерация.
-# Пишет готовые артефакты (nftables/ufw firewall, fail2ban, SSH-хардненинг) в каталог
+# Пишет готовые артефакты (nftables/ufw firewall, SSH-хардненинг) в каталог
 # и печатает пошаговую инструкцию по применению. САМ НИЧЕГО НЕ ПРИМЕНЯЕТ — фаервол на
 # удалённой ноде может отрезать SSH, поэтому применяешь руками, сверив IP панели/SSH.
+# Анти-брут SSH — CrowdSec, ставится отдельно: node-diagnostic.sh install crowdsec.
 #
-# Standalone:  sudo bash modules/protect.sh [--panel-ip X.X.X.X] [--node-port N] [--out DIR]
+# Standalone:  sudo bash modules/protect.sh [--panel-ip X.X.X.X] [--node-port N] [--ssh-from IP|CIDR] [--out DIR]
+# SSH без --ssh-from: вся подсеть NetBird, если текущая сессия пришла через неё, иначе IP сессии.
 # Как модуль:  source lib/common.sh; source modules/protect.sh; protect_generate
 
 if [ -z "${ND_COMMON_LOADED:-}" ]; then
@@ -36,6 +38,7 @@ detect_node_port() {
 PROTECT_OUT="${PROTECT_OUT:-}"
 PANEL_IP="${PANEL_IP:-}"
 NODE_PORT="${NODE_PORT:-}"
+SSH_FROM="${SSH_FROM:-}"      # откуда пускать SSH: IP или CIDR (пусто — авто: NetBird / твой IP)
 
 # per-IP лимиты в nft (из практики node-accelerator)
 CONN_LIMIT="${CONN_LIMIT:-2048}"
@@ -45,37 +48,65 @@ ICMP_RATE="${ICMP_RATE:-10}"
 SSH_RATE="${SSH_RATE:-6}"     # соединений/мин на IP
 
 protect_generate() {
-    local ssh_port ssh_ip out
+    local ssh_port ssh_ip ssh_src nb_addr nb="" out
     ssh_port=$(detect_ssh_port)
     ssh_ip=$(ssh_client_ip)
+    nb_addr=$(netbird_addr) && nb=$(ipv4_net "$nb_addr")
+    # откуда пускать SSH: явный --ssh-from → вся подсеть NetBird, если текущая сессия
+    # пришла через неё (админ ходит по NetBird) → IP текущей сессии
+    if [ -n "$SSH_FROM" ]; then
+        ssh_src="$SSH_FROM"
+        case "$ssh_src" in */*) ssh_src=$(ipv4_net "$ssh_src" || echo "$ssh_src") ;; esac
+    elif [ -n "$nb" ] && [ -n "$ssh_ip" ] && ip_in_cidr "$ssh_ip" "$nb"; then
+        ssh_src="$nb"
+        msg_info "SSH-сессия идёт через NetBird ($ssh_ip) — SSH открывается всей подсети $nb"
+    else
+        ssh_src="$ssh_ip"
+    fi
     # dual-stack: nft-шаблон сам подставит ip6 saddr / ipv6_addr по семейству адреса
-    case "$ssh_ip"   in *:*) msg_info "SSH-сессия по IPv6 ($ssh_ip) — правила будут на ip6 saddr" ;; esac
+    case "$ssh_src"  in *:*) msg_info "SSH-источник IPv6 ($ssh_src) — правила будут на ip6 saddr" ;; esac
     case "$PANEL_IP" in *:*) msg_info "IP панели IPv6 ($PANEL_IP) — set panel_ip будет типа ipv6_addr" ;; esac
     [ -z "$NODE_PORT" ] && NODE_PORT=$(detect_node_port || echo "")
     if need_root; then out="${PROTECT_OUT:-/root/node-diagnostic-protect}"; else out="${PROTECT_OUT:-$PWD/node-diagnostic-protect}"; fi
     mkdir -p "$out" || die "не создал каталог $out"
 
-    local ph_panel="$PANEL_IP" ph_ssh="$ssh_ip"
+    local ph_panel="$PANEL_IP" ph_ssh="$ssh_src"
     [ -z "$ph_panel" ] && ph_panel="<PANEL_IP>"
     [ -z "$ph_ssh" ]   && ph_ssh="<YOUR_SSH_IP>"
 
     echo
     ui_head "Генерация защиты ноды" "Remnawave · только генерация файлов"
-    echo -e "    ${DIM}SSH-порт:${NC} $ssh_port   ${DIM}твой SSH-IP:${NC} $ph_ssh"
+    echo -e "    ${DIM}SSH-порт:${NC} $ssh_port   ${DIM}SSH разрешён с:${NC} $ph_ssh"
+    [ -n "$nb" ] && echo -e "    ${DIM}NetBird:${NC} ${nb_addr%/*} ${DIM}(подсеть $nb)${NC}"
     echo -e "    ${DIM}NODE_PORT (control-API):${NC} ${NODE_PORT:-<не найден, укажи --node-port>}"
     echo -e "    ${DIM}IP панели:${NC} $ph_panel"
     echo -e "    ${DIM}каталог:${NC} $out"
     echo
     [ "$ph_panel" = "<PANEL_IP>" ] && msg_warn "IP панели не задан — в правилах плейсхолдер <PANEL_IP>, подставь перед применением (--panel-ip)"
     [ -z "$NODE_PORT" ] && msg_warn "NODE_PORT не найден — плейсхолдер <NODE_PORT>, подставь (--node-port)"
-    [ "$ph_ssh" = "<YOUR_SSH_IP>" ] && msg_warn "SSH-IP не определён (не по SSH?) — подставь свой IP вручную"
-    [ "$ph_ssh" != "<YOUR_SSH_IP>" ] && msg_warn "SSH будет открыт ТОЛЬКО с $ph_ssh — если это домашний/динамический IP, после его смены SSH отрежет (детали в APPLY.txt)"
+    # SSH-источник внутри NetBird (пир/подсеть) или накрывает её (100.64.0.0/10)
+    local via_nb=0
+    if [ -n "$nb" ] && { ip_in_cidr "${ph_ssh%/*}" "$nb" || ip_in_cidr "${nb_addr%/*}" "$ph_ssh"; }; then
+        via_nb=1
+    fi
+    if [ "$ph_ssh" = "<YOUR_SSH_IP>" ]; then
+        msg_warn "SSH-IP не определён (не по SSH?) — подставь свой IP вручную или задай --ssh-from"
+    elif [ "$via_nb" = "1" ]; then
+        msg_warn "SSH будет открыт ТОЛЬКО из NetBird ($ph_ssh) — упадёт NetBird на ноде, вход останется только через VNC-консоль хостера"
+    else
+        msg_warn "SSH будет открыт ТОЛЬКО с $ph_ssh — если это домашний/динамический IP, после его смены SSH отрежет (детали в APPLY.txt)"
+        [ -n "$nb" ] && msg_info "SSH только через NetBird: перегенерируй с --ssh-from $nb (и зайди через NetBird)"
+    fi
+    # текущая сессия вне разрешённого источника — firewall её оборвёт (IPv6 не сверяем)
+    case "$ssh_ip$ph_ssh" in *:*|*"<"*) ;; *)
+        [ -n "$ssh_ip" ] && ! ip_in_cidr "$ssh_ip" "$ph_ssh" \
+            && msg_warn "текущая сессия ($ssh_ip) не входит в $ph_ssh — firewall её оборвёт: перед применением зайди через NetBird"
+    esac
 
     _gen_nft   "$out" "$ssh_port" "$ph_ssh" "$ph_panel" "${NODE_PORT:-<NODE_PORT>}"
     _gen_ufw   "$out" "$ssh_port" "$ph_ssh" "$ph_panel" "${NODE_PORT:-<NODE_PORT>}"
-    _gen_fail2ban "$out" "$ssh_port"
     _gen_sshd  "$out"
-    _gen_apply "$out" "$ssh_port" "$ph_ssh"
+    _gen_apply "$out" "$ssh_port" "$ph_ssh" "$via_nb" "$nb_addr"
 
     echo
     echo -e "  ${G}${BOLD}✓ Сгенерировано в $out${NC}"
@@ -120,7 +151,7 @@ table inet node_protect {
         ip  protocol icmp   accept
         ip6 nexthdr icmpv6  accept
 
-        # SSH — только с твоего IP + анти-брут по скорости соединений
+        # SSH — только с $ssh_ip (IP или подсеть, напр. NetBird) + анти-брут по скорости соединений
         tcp dport $ssh_port $ssh_saddr $ssh_ip ct state new \\
             meter ssh_rate { $ssh_saddr limit rate over ${SSH_RATE}/minute } drop
         tcp dport $ssh_port $ssh_saddr $ssh_ip accept
@@ -176,37 +207,17 @@ set -e
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow from $ssh_ip to any port $ssh_port proto tcp comment 'SSH (твой IP)'
+ufw allow from $ssh_ip to any port $ssh_port proto tcp comment 'SSH (только $ssh_ip)'
 ufw allow 443 comment 'VLESS/Reality + QUIC/HY2'
 ufw allow 80/tcp comment 'ACME/Caddy'
 ufw allow from $panel to any port $node_port proto tcp comment 'Remnawave control-API (панель)'
 # ВАЖНО: НЕ добавляй «ufw limit $ssh_port/tcp» — limit в ufw это ALLOW отовсюду
 # (с рейт-лимитом): такое правило открыло бы SSH всему интернету и обесценило
-# ограничение по IP выше. Анти-брут делает fail2ban.
+# ограничение по IP выше. Анти-брут делает CrowdSec (node-diagnostic.sh install crowdsec).
 ufw --force enable
 ufw status verbose
 EOF
     chmod +x "$out/firewall-ufw.sh" 2>/dev/null || true
-}
-
-_gen_fail2ban() {
-    local out=$1 ssh_port=$2
-    cat > "$out/fail2ban-sshd.local" <<EOF
-# node-diagnostic: fail2ban jail для SSH.
-# Скопировать:  sudo cp $out/fail2ban-sshd.local /etc/fail2ban/jail.d/sshd.local && sudo systemctl restart fail2ban
-[sshd]
-enabled  = true
-port     = $ssh_port
-# без systemd (Alpine/OpenRC): замени backend на auto и добавь logpath = /var/log/messages
-backend  = systemd
-maxretry = 4
-findtime = 10m
-bantime  = 1h
-# рецидив — дольше бан
-bantime.increment = true
-bantime.factor    = 2
-bantime.maxtime   = 1w
-EOF
 }
 
 _gen_sshd() {
@@ -237,7 +248,28 @@ EOF
 }
 
 _gen_apply() {
-    local out=$1 ssh_port=$2 ssh_ip=$3
+    local out=$1 ssh_port=$2 ssh_ip=$3 via_nb=$4 nb_addr=$5 nd ssh_note nb_ip nb_net
+    nd="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)/node-diagnostic.sh"
+    nb_ip="${nb_addr%/*}"; nb_net=$(ipv4_net "$nb_addr" 2>/dev/null)
+    if [ "$via_nb" = "1" ]; then
+        ssh_note="⚠ SSH открыт ТОЛЬКО из NetBird «$ssh_ip» — с публичного IP вход закрыт.
+  Заходи по NetBird-IP ноды: ssh root@${nb_ip:-<NETBIRD_IP>}  (кому из пиров можно — решают ACL NetBird).
+  Упадёт NetBird на ноде (демон, management, смена сети) — вход только через VNC/serial-
+  консоль хостера. До применения:
+    · убедись, что VNC-консоль хостера реально работает;
+    · применяй firewall из сессии, открытой ЧЕРЕЗ NetBird (иначе текущая оборвётся);
+    · сменилась сеть NetBird — перегенерируй: protect --ssh-from <новая подсеть>."
+    else
+        ssh_note="⚠ SSH привязан к IP «$ssh_ip». Если это ДОМАШНИЙ/ДИНАМИЧЕСКИЙ IP — после его
+  смены провайдером SSH отрежет наглухо (вход только через VNC/serial-консоль хостера).
+  Варианты до применения:
+    · вписать вместо одного IP подсеть провайдера (whois $ssh_ip → route/CIDR),
+      в firewall.nft: «ip saddr 203.0.113.0/24», в ufw: «from 203.0.113.0/24»;
+    · или убрать ограничение по IP и оставить только rate-limit + CrowdSec
+      (nft: убери «ip saddr …» из SSH-правил; ufw: «ufw limit $ssh_port/tcp»);
+    · ходишь через NetBird — пусти SSH из его подсети: protect --ssh-from ${nb_net:-100.x.0.0/16};
+    · применяешь как есть — убедись, что VNC-консоль хостера реально работает."
+    fi
     cat > "$out/APPLY.txt" <<EOF
 ================  node-diagnostic · применение защиты  ================
 Всё сгенерировано, НО НЕ ПРИМЕНЕНО. Порядок безопасного наката на удалённой ноде.
@@ -246,14 +278,7 @@ _gen_apply() {
   IP панели вместо <PANEL_IP>, NODE_PORT вместо <NODE_PORT>, твой SSH-IP вместо <YOUR_SSH_IP>.
   Файлы: firewall.nft / firewall-ufw.sh.
 
-⚠ SSH привязан к IP «$ssh_ip». Если это ДОМАШНИЙ/ДИНАМИЧЕСКИЙ IP — после его
-  смены провайдером SSH отрежет наглухо (вход только через VNC/serial-консоль хостера).
-  Варианты до применения:
-    · вписать вместо одного IP подсеть провайдера (whois $ssh_ip → route/CIDR),
-      в firewall.nft: «ip saddr 203.0.113.0/24», в ufw: «from 203.0.113.0/24»;
-    · или убрать ограничение по IP и оставить только rate-limit + fail2ban
-      (nft: убери «ip saddr …» из SSH-правил; ufw: «ufw limit $ssh_port/tcp»);
-    · применяешь как есть — убедись, что VNC-консоль хостера реально работает.
+$ssh_note
 
 --- 1. FIREWALL (самое опасное — можно отрезать SSH) ---
 Способ А (nftables, с per-IP rate-limit — рекомендуется):
@@ -270,10 +295,11 @@ _gen_apply() {
   sudo bash $out/firewall-ufw.sh
   # держи ВТОРУЮ SSH-сессию открытой на время применения.
 
---- 2. fail2ban ---
-  sudo apt install -y fail2ban        # Debian/Ubuntu · dnf install fail2ban (RHEL/Fedora) · apk add fail2ban (Alpine)
-  sudo cp $out/fail2ban-sshd.local /etc/fail2ban/jail.d/sshd.local
-  sudo systemctl enable --now fail2ban && sudo fail2ban-client status sshd
+--- 2. CrowdSec (анти-брут SSH + community-блоклист) ---
+  sudo bash $nd install crowdsec      # или меню [7] → [5]
+  # движок + nftables-bouncer; подсеть NetBird, твой SSH-IP и IP панели — в allowlist (не банятся никогда).
+  # Таблицы bouncer'а (crowdsec/crowdsec6) отрабатывают раньше node_protect — уживаются.
+  sudo cscli decisions list           # кто забанен
 
 --- 3. SSH-хардненинг (только если вход по КЛЮЧУ уже работает!) ---
   # проверь из второго окна: ssh -i ключ user@нода  — заходит без пароля?
@@ -284,7 +310,7 @@ _gen_apply() {
 --- ОТКАТ ---
   firewall nft:  sudo nft delete table inet node_protect
   firewall ufw:  sudo ufw disable
-  fail2ban:      sudo rm /etc/fail2ban/jail.d/sshd.local && sudo systemctl restart fail2ban
+  CrowdSec:      sudo apt purge crowdsec crowdsec-firewall-bouncer-nftables   # dnf remove … на RHEL
   sshd:          sudo rm /etc/ssh/sshd_config.d/99-node-diagnostic.conf && sudo systemctl reload ssh
 
 Карта портов Remnawave-ноды: 443 (вход), 80 (ACME), NODE_PORT (панель->нода, только IP панели),
@@ -302,10 +328,15 @@ protect_main() {
             --panel-ip)  PANEL_IP="$2"; shift ;;
             --node-port) NODE_PORT="$2"; shift ;;
             --out)       PROTECT_OUT="$2"; shift ;;
+            --ssh-from)  SSH_FROM="$2"; shift ;;
             *) die "protect: неизвестный аргумент $1" ;;
         esac
         shift
     done
+    # IPv4[/N] строго; IPv6 — грубо (уходит в ip6 saddr, nft -c отвергнет мусор)
+    if [ -n "$SSH_FROM" ] && ! ipv4_net "$SSH_FROM" >/dev/null && [[ ! "$SSH_FROM" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ || "$SSH_FROM" != *:* ]]; then
+        die "protect: --ssh-from ждёт IP или подсеть (напр. 100.92.0.0/16), получено: $SSH_FROM"
+    fi
     protect_generate
 }
 

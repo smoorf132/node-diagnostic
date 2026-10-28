@@ -55,8 +55,9 @@ node-diagnostic.sh v$SCRIPT_VERSION — диагностика VPN/Linux-нод�
       --version      Показать версию и выйти
   -h, --help         Эта справка
 
-Фиксы вынесены в модули: optimize.sh (sysctl/BBR/RPS), protect.sh (firewall/fail2ban),
-bbr3.sh (XanMod-ядро). Единое меню — node-diagnostic.sh в корне репозитория.
+Фиксы вынесены в модули: optimize.sh (sysctl/BBR/RPS), protect.sh (firewall/SSH),
+install.sh crowdsec (анти-брут SSH), bbr3.sh (XanMod-ядро). Единое меню — node-diagnostic.sh
+в корне репозитория.
 
 Примеры:
   sudo bash modules/diagnose.sh                   # полный прогон ~5 мин
@@ -1900,7 +1901,10 @@ if [ -s "$FINDINGS_FILE" ]; then
     if grep -qiE 'bbr (отсутствует|недоступен)' "$FINDINGS_FILE"; then
         echo -e "  ${BOLD}BBRv3-ядро${NC}    ${C}sudo bash $_sd/bbr3.sh --install${NC} ${DIM}— XanMod (нужен reboot)${NC}"
     fi
-    echo -e "  ${BOLD}Защита ноды${NC}   ${C}sudo bash $_sd/protect.sh${NC} ${DIM}— firewall/fail2ban/SSH (генерация под Remnawave)${NC}"
+    echo -e "  ${BOLD}Защита ноды${NC}   ${C}sudo bash $_sd/protect.sh${NC} ${DIM}— firewall/SSH (генерация под Remnawave)${NC}"
+    if ! have cscli; then
+        echo -e "  ${BOLD}Анти-брут${NC}     ${C}sudo bash $_sd/install.sh crowdsec${NC} ${DIM}— CrowdSec + nftables-bouncer${NC}"
+    fi
     echo -e "  ${DIM}или единое меню:${NC} ${C}sudo bash $_sd/../node-diagnostic.sh${NC}"
     echo
 fi
