@@ -15,6 +15,7 @@ bad() { echo "  ✗ $*"; fail=1; }
 
 # shellcheck source=../modules/sshport.sh
 source modules/sshport.sh
+# shellcheck disable=SC2034  # читает _sp_backup из подключённого модуля
 BACKUP_DIR=$(mktemp -d)
 lst() { ss -Hltn "sport = :$1" 2>/dev/null | grep -q .; }
 # sshd реально отвечает баннером (при socket-activation коннект и поднимает ssh.service)

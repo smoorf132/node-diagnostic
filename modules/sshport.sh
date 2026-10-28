@@ -93,8 +93,8 @@ _sp_reload() {
 }
 
 _sp_wait() {    # _sp_wait <порт...> — все слушаются (до 10 с)
-    local i p ok
-    for i in 1 2 3 4 5 6 7 8 9 10; do
+    local p ok
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
         ok=1
         for p in "$@"; do _sp_listening "$p" || ok=0; done
         [ "$ok" = "1" ] && return 0
