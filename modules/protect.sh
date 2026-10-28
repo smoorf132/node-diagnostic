@@ -47,6 +47,9 @@ UDP_RATE="${UDP_RATE:-200}"
 ICMP_RATE="${ICMP_RATE:-10}"
 SSH_RATE="${SSH_RATE:-6}"     # соединений/мин на IP
 
+# перманентный бан подсетей (set banned4, drop раньше любых accept). BAN_NETS="" — без бана
+BAN_NETS="${BAN_NETS-185.224.228.0/22 195.209.120.0/22 212.192.156.0/23 212.192.158.0/24 194.165.22.0/23}"
+
 protect_generate() {
     local ssh_port ssh_ip ssh_src nb_addr nb="" out
     ssh_port=$(detect_ssh_port)
@@ -102,8 +105,16 @@ protect_generate() {
         [ -n "$ssh_ip" ] && ! ip_in_cidr "$ssh_ip" "$ph_ssh" \
             && msg_warn "текущая сессия ($ssh_ip) не входит в $ph_ssh — firewall её оборвёт: перед применением зайди через NetBird"
     esac
+    # бан-подсети: хост-биты обнуляются, не-IPv4 пропускается; свой SSH/панель в бане = лок-аут
+    local n bn ban=""
+    for n in $BAN_NETS; do
+        bn=$(ipv4_net "$n") || { msg_warn "BAN_NETS: «$n» не IPv4-подсеть — пропускаю"; continue; }
+        ban="$ban${ban:+, }$bn"
+        ip_in_cidr "${ph_ssh%/*}" "$bn" && msg_warn "SSH-источник $ph_ssh в забаненной подсети $bn — firewall отрежет SSH"
+        ip_in_cidr "$ph_panel" "$bn" && msg_warn "IP панели $ph_panel в забаненной подсети $bn — нода потеряет панель"
+    done
 
-    _gen_nft   "$out" "$ssh_port" "$ph_ssh" "$ph_panel" "${NODE_PORT:-<NODE_PORT>}"
+    _gen_nft   "$out" "$ssh_port" "$ph_ssh" "$ph_panel" "${NODE_PORT:-<NODE_PORT>}" "$ban"
     _gen_ufw   "$out" "$ssh_port" "$ph_ssh" "$ph_panel" "${NODE_PORT:-<NODE_PORT>}"
     _gen_sshd  "$out"
     _gen_apply "$out" "$ssh_port" "$ph_ssh" "$via_nb" "$nb_addr"
@@ -117,12 +128,15 @@ protect_generate() {
 }
 
 _gen_nft() {
-    local out=$1 ssh_port=$2 ssh_ip=$3 panel=$4 node_port=$5
+    local out=$1 ssh_port=$2 ssh_ip=$3 panel=$4 node_port=$5 ban=$6
 
     # семейство адреса → правильный синтаксис saddr (dual-stack: v6 больше не игнорируется)
     local ssh_saddr="ip saddr" panel_type="ipv4_addr" panel_saddr="ip saddr"
     case "$ssh_ip" in *:*) ssh_saddr="ip6 saddr" ;; esac
     case "$panel"  in *:*) panel_type="ipv6_addr"; panel_saddr="ip6 saddr" ;; esac
+    # пустой set валиден, пустой «elements = { }» — нет
+    local ban_elems=""
+    [ -n "$ban" ] && ban_elems="elements = { $ban }"
 
     cat > "$out/firewall.nft" <<EOF
 #!/usr/sbin/nft -f
@@ -138,10 +152,19 @@ table inet node_protect {
         type $panel_type
         elements = { $panel }
     }
+    # перманентный бан подсетей (BAN_NETS). Добавить на лету: nft add element inet node_protect banned4 { X/N }
+    set banned4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        $ban_elems
+    }
     chain input {
         type filter hook input priority 0; policy drop;
 
         iif "lo" accept
+        # бан раньше established — рвёт и уже открытые сессии из этих подсетей
+        ip saddr @banned4 counter drop
         ct state established,related accept
         ct state invalid drop
 
@@ -186,6 +209,8 @@ table inet node_protect {
     }
     chain forward {
         type filter hook forward priority 0; policy accept;
+        # бан и для трафика в docker-bridge (после DNAT он идёт сюда, а не в input)
+        ip saddr @banned4 counter drop
         # Если remnanode крутится в docker BRIDGE-сети (порт опубликован через -p),
         # трафик к нему проходит DNAT и попадает сюда, а НЕ в input — правило
         # NODE_PORT выше его не видит. Тогда раскомментируй (фильтр по исходному dport):

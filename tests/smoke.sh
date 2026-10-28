@@ -35,6 +35,23 @@ if [ ! -e "$out/fail2ban-sshd.local" ] && grep -q 'install crowdsec' "$out/APPLY
 else
     bad "protect: fail2ban-артефакт или нет шага CrowdSec в APPLY.txt"
 fi
+# перманентный бан подсетей: set banned4 с дефолтными BAN_NETS + drop в input и forward
+if grep -q 'elements = { 185.224.228.0/22, 195.209.120.0/22, 212.192.156.0/23, 212.192.158.0/24, 194.165.22.0/23 }' "$out/firewall.nft" 2>/dev/null \
+   && [ "$(grep -c 'ip saddr @banned4 counter drop' "$out/firewall.nft" 2>/dev/null)" = "2" ]; then
+    ok "protect: бан подсетей (banned4)"
+else
+    bad "protect: нет set banned4 или drop-правил"
+fi
+# BAN_NETS="" — пустой set без elements (иначе nft не примет), мусор отбрасывается
+nob=$(mktemp -d)
+BAN_NETS="" bash modules/protect.sh --panel-ip 203.0.113.5 --node-port 2222 --out "$nob" >/dev/null 2>&1
+BAN_NETS="bogus 10.1.2.3/8" bash modules/protect.sh --panel-ip 203.0.113.5 --node-port 2222 --out "$nob/j" >/dev/null 2>&1
+if ! grep -q 'elements = { *}' "$nob/firewall.nft" 2>/dev/null && grep -q 'set banned4' "$nob/firewall.nft" 2>/dev/null \
+   && grep -q 'elements = { 10.0.0.0/8 }' "$nob/j/firewall.nft" 2>/dev/null; then
+    ok "protect: BAN_NETS пустой / с мусором"
+else
+    bad "protect: BAN_NETS пустой / с мусором"
+fi
 # синтаксис nft (если есть nft) — подставляем плейсхолдеры реальными значениями
 if command -v nft >/dev/null 2>&1; then
     sed -e 's/<PANEL_IP>/198.51.100.1/g' -e 's/<YOUR_SSH_IP>/198.51.100.2/g' \
