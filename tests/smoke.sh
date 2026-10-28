@@ -29,6 +29,12 @@ if [ -s "$out/firewall.nft" ] && [ -s "$out/firewall-ufw.sh" ] && [ -s "$out/APP
 else
     bad "protect artifacts"
 fi
+# анти-брут — CrowdSec через install, fail2ban больше не генерируется
+if [ ! -e "$out/fail2ban-sshd.local" ] && grep -q 'install crowdsec' "$out/APPLY.txt" 2>/dev/null; then
+    ok "protect: без fail2ban, APPLY ведёт на CrowdSec"
+else
+    bad "protect: fail2ban-артефакт или нет шага CrowdSec в APPLY.txt"
+fi
 # синтаксис nft (если есть nft) — подставляем плейсхолдеры реальными значениями
 if command -v nft >/dev/null 2>&1; then
     sed -e 's/<PANEL_IP>/198.51.100.1/g' -e 's/<YOUR_SSH_IP>/198.51.100.2/g' \
@@ -42,6 +48,25 @@ if command -v nft >/dev/null 2>&1; then
         echo "  ~ nft -c не прошёл (без root netlink недоступен) — не блокирую"
     fi
 fi
+
+echo "== protect --ssh-from (SSH из подсети NetBird) =="
+# хелперы CIDR: хост-биты обнуляются (NetBird отдаёт 100.92.13.5/16), вхождение в подсеть
+cidr_ok=$(bash -c 'source lib/common.sh
+    [ "$(ipv4_net 100.92.13.5/16)" = "100.92.0.0/16" ] && ip_in_cidr 100.92.7.7 100.92.0.0/16 \
+    && ! ip_in_cidr 100.93.0.1 100.92.0.0/16 && ! ipv4_net 300.1.1.1 >/dev/null && echo yes' 2>/dev/null)
+[ "$cidr_ok" = "yes" ] && ok "ipv4_net / ip_in_cidr" || bad "ipv4_net / ip_in_cidr"
+nbo=$(mktemp -d)
+bash modules/protect.sh --panel-ip 203.0.113.5 --node-port 2222 --ssh-from 100.92.13.5/16 --out "$nbo" >/dev/null 2>&1
+if grep -q 'tcp dport [0-9]* ip saddr 100.92.0.0/16 accept' "$nbo/firewall.nft" 2>/dev/null \
+   && grep -q 'from 100.92.0.0/16 to any port' "$nbo/firewall-ufw.sh" 2>/dev/null; then
+    ok "SSH из подсети в nft и ufw (хост-биты обнулены)"
+else
+    bad "SSH из подсети: нет правила 100.92.0.0/16 в nft/ufw"
+fi
+if command -v nft >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+    nft -c -f "$nbo/firewall.nft" >/dev/null 2>&1 && ok "nft -c (SSH по подсети)" || bad "nft -c (SSH по подсети)"
+fi
+bash modules/protect.sh --ssh-from bogus --out "$nbo" >/dev/null 2>&1 && bad "--ssh-from мусор принят" || ok "--ssh-from отвергает мусор"
 
 echo "== rollback --dry-run =="
 bash modules/rollback.sh --dry-run >/dev/null 2>&1 && ok "rollback dry-run" || bad "rollback dry-run"
@@ -65,6 +90,8 @@ echo "== install (диспетчер, без сайд-эффектов) =="
 # help — безопасно (ничего не ставит); неизвестная сабкоманда → rc=2
 bash modules/install.sh help >/dev/null 2>&1 && ok "install help" || bad "install help"
 bash modules/install.sh bogus >/dev/null 2>&1; [ "$?" = "2" ] && ok "install отвергает мусор (rc=2)" || bad "install bogus rc"
+# crowdsec известна диспетчеру (не rc=2) и без TTY отказывает ДО любых изменений
+bash modules/install.sh crowdsec </dev/null >/dev/null 2>&1; [ "$?" = "1" ] && ok "install crowdsec без TTY → отказ (rc=1)" || bad "install crowdsec rc"
 bash modules/shape.sh help >/dev/null 2>&1 && ok "shape help" || bad "shape help"
 bash modules/shape.sh bogus >/dev/null 2>&1; [ "$?" = "2" ] && ok "shape отвергает мусор (rc=2)" || bad "shape bogus rc"
 python3 -c 'import ast; ast.parse(open("modules/shape_ctrl.py").read())' 2>/dev/null && ok "shape_ctrl.py синтаксис" || bad "shape_ctrl.py syntax"

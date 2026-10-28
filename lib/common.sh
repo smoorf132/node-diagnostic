@@ -328,6 +328,41 @@ ssh_client_ip() {
     who am i 2>/dev/null | sed -n 's/.*(\(.*\)).*/\1/p' | head -1
 }
 
+# ── IPv4/CIDR (для правил SSH по подсети) ────────────────────────────
+_ip2int() { local a b c d; IFS=. read -r a b c d <<< "$1"; echo $(( (10#$a<<24) | (10#$b<<16) | (10#$c<<8) | 10#$d )); }
+_int2ip() { echo "$(( ($1>>24)&255 )).$(( ($1>>16)&255 )).$(( ($1>>8)&255 )).$(( $1&255 ))"; }
+
+# адрес сети: ipv4_net 100.92.13.5/16 → 100.92.0.0/16 (без /N — /32); return 1 на мусор.
+# Хост-биты обнуляем: ufw отвергает «100.92.13.5/16», а это ровно то, что отдаёт NetBird
+ipv4_net() {
+    local p=32 o
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/([0-9]{1,2}))?$ ]] || return 1
+    for o in "${BASH_REMATCH[@]:1:4}"; do [ "$((10#$o))" -le 255 ] || return 1; done
+    [ -n "${BASH_REMATCH[6]}" ] && p=$((10#${BASH_REMATCH[6]}))
+    [ "$p" -le 32 ] || return 1
+    echo "$(_int2ip $(( $(_ip2int "${1%/*}") & (0xFFFFFFFF << (32 - p)) & 0xFFFFFFFF )))/$p"
+}
+
+# ip_in_cidr <ipv4> <ipv4[/N]> — адрес внутри подсети? (IPv6 → всегда «нет»)
+ip_in_cidr() {
+    local p=32 net
+    case "$2" in */*) p=${2#*/} ;; esac
+    net=$(ipv4_net "$2") || return 1
+    [ "$(ipv4_net "$1/$p" 2>/dev/null)" = "$net" ]
+}
+
+# NetBird: адрес ноды в оверлее с префиксом (100.92.13.5/16) — с интерфейса wt0,
+# иначе из `netbird status` (интерфейс могли переименовать). Пусто — NetBird не поднят.
+netbird_addr() {
+    local a
+    a=$(ip -o -4 addr show dev wt0 2>/dev/null | awk '{print $4; exit}')
+    [ -z "$a" ] && have netbird && a=$(netbird status 2>/dev/null | awk -F': *' '/^NetBird IP/{print $2; exit}')
+    ipv4_net "$a" >/dev/null 2>&1 || return 1
+    echo "$a"
+}
+# подсеть NetBird целиком (100.92.0.0/16)
+netbird_cidr() { local a; a=$(netbird_addr) || return 1; ipv4_net "$a"; }
+
 os_codename() {
     ( . /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}" )
 }

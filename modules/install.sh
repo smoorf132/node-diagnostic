@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # modules/install.sh — установка компонентов ноды Remnawave.
-# Сабкоманды: node | selfsteal | netbird | monitoring.
+# Сабкоманды: node | selfsteal | netbird | monitoring | crowdsec.
 # Вызывается через node-diagnostic.sh (пункт меню «Установка Remnanode»).
 # Внешние установщики запускаются ТОЛЬКО после явного подтверждения.
 set -u
@@ -12,6 +12,9 @@ source "$_self/../lib/common.sh" 2>/dev/null || { echo "install: не найде
 REMNANODE_URL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh"
 SELFSTEAL_URL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh"
 NETBIRD_INSTALL_URL="https://pkgs.netbird.io/install.sh"
+# CrowdSec — официальный репо packagecloud (в штатных Debian/Ubuntu древний 1.4.x без allowlists)
+CROWDSEC_REPO_URL="https://install.crowdsec.net"
+CROWDSEC_ALLOWLIST="node-diagnostic"
 # Мониторинг — версии по гайду https://wiki.egam.es/ru/configuration/grafana-monitoring-setup/
 CADVISOR_VER="0.53.0"
 NODE_EXPORTER_VER="1.9.1"
@@ -23,6 +26,9 @@ _is_ipv4() {
     [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
     local o; for o in "${BASH_REMATCH[@]:1}"; do [ "$o" -le 255 ] || return 1; done
 }
+
+# v4 строго; v6 — грубо (hex + двоеточия): cscli/nft всё равно отвергнут мусор
+_is_ip() { _is_ipv4 "$1" || [[ "$1" == *:* && "$1" =~ ^[0-9A-Fa-f:.]+$ ]]; }
 
 _show_cmd() { echo -e "    ${DIM}будет выполнено:${NC}\n    ${C}$1${NC}"; }
 
@@ -226,13 +232,179 @@ EOF
     msg_info "метрики слушают локально (127.0.0.1:9101/9100/8429); центральный VM собирает их по NetBird ($ip)"
 }
 
+# ── 5. CrowdSec (анти-брут SSH + community-блоклист) ─────────────────
+# Движок + nftables-bouncer. Порядок важен: allowlist (SSH-IP, IP панели) заводится
+# ДО установки bouncer'а — если IP попал в community-блоклист, bouncer дропнул бы
+# и текущую SSH-сессию прямо посреди установки.
+
+# пакеты CrowdSec есть только deb/rpm (packagecloud)
+_cs_pm() {
+    if   have apt-get; then echo apt
+    elif have dnf;     then echo dnf
+    elif have yum;     then echo yum
+    else return 1; fi
+}
+
+_cs_pkg() {   # _cs_pkg <pm> install|remove <pkg...>
+    local pm=$1 op=$2; shift 2
+    if [ "$pm" = "apt" ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=60 "$op" -y -q "$@" </dev/null
+    else
+        "$pm" "$op" -y -q "$@" </dev/null
+    fi
+}
+
+# allowlist действует и на локальные баны, и на блоклисты, но уже выданные решения
+# не снимает (CAPI-блоклист тянется при старте LAPI) — их удаляем явно
+_cs_allowlist() {   # _cs_allowlist <ip...>
+    [ $# -gt 0 ] || { msg_warn "allowlist пуст — свой IP добавь сам: cscli allowlists add $CROWDSEC_ALLOWLIST <IP> -d admin"; return 0; }
+    if ! cscli allowlists list >/dev/null 2>&1; then
+        msg_warn "этот cscli не умеет allowlists (CrowdSec < 1.6.8) — IP не защищены от бана"
+        return 1
+    fi
+    cscli allowlists inspect "$CROWDSEC_ALLOWLIST" >/dev/null 2>&1 \
+        || cscli allowlists create "$CROWDSEC_ALLOWLIST" -d "node-diagnostic: SSH-админ и панель Remnawave" >/dev/null \
+        || { msg_err "не создал allowlist $CROWDSEC_ALLOWLIST"; return 1; }
+    local ip
+    for ip in "$@"; do
+        # повторный add — ошибка cscli («уже есть»): норма при перезапуске пункта
+        cscli allowlists add "$CROWDSEC_ALLOWLIST" "$ip" -d "node-diagnostic" >/dev/null 2>&1 || true
+        case "$ip" in
+            */*) cscli decisions delete --range "$ip" --contained ;;
+            *)   cscli decisions delete --ip "$ip" ;;
+        esac >/dev/null 2>&1 || true
+        msg_ok "allowlist: $ip"
+    done
+}
+
+# Логи SSH CrowdSec находит сам (cscli setup при установке пакета). Если acquisition
+# для sshd всё же нет — движок слеп к брутфорсу, поэтому подстраховка.
+_cs_ssh_acquis() {
+    local f=/etc/crowdsec/acquis.d/node-diagnostic-sshd.yaml unit=sshd.service
+    if grep -rqsE 'ssh|auth\.log|/var/log/secure' /etc/crowdsec/acquis.yaml /etc/crowdsec/acquis.d; then
+        msg_ok "логи SSH уже читаются (acquisition от установщика)"
+        return 0
+    fi
+    mkdir -p /etc/crowdsec/acquis.d
+    if [ -e /var/log/auth.log ] || [ -e /var/log/secure ]; then
+        cat > "$f" <<'EOF'
+# node-diagnostic: логи SSH для CrowdSec (файлы rsyslog)
+source: file
+filenames:
+  - /var/log/auth.log
+  - /var/log/secure
+labels:
+  type: syslog
+EOF
+    else
+        # на deb юнит — ssh.service (sshd.service там алиас, журнал по нему не читается)
+        systemctl cat ssh.service >/dev/null 2>&1 && unit=ssh.service
+        cat > "$f" <<EOF
+# node-diagnostic: логи SSH для CrowdSec из journald (rsyslog не установлен)
+source: journalctl
+journalctl_filter:
+  - "_SYSTEMD_UNIT=$unit"
+labels:
+  type: syslog
+EOF
+    fi
+    msg_ok "acquisition SSH: $f"
+}
+
+inst_crowdsec() {
+    ui_head "Установка CrowdSec" "движок + nftables-bouncer · анти-брут SSH, community-блоклист"
+    need_root || die "нужен root"
+    have systemctl || die "нужен systemd (юниты crowdsec / crowdsec-firewall-bouncer)"
+    local pm; pm=$(_cs_pm) || die "CrowdSec ставится только на deb/rpm-системы (apt/dnf/yum)"
+    # LAPI слушает 127.0.0.1:8080 — занятый порт = движок не стартует, а bouncer без ключа
+    if ! have cscli && have ss && ss -Hltn 'sport = :8080' 2>/dev/null | grep -q .; then
+        die "порт 8080 занят — он нужен LAPI CrowdSec. Освободи его; система не тронута"
+    fi
+
+    local ssh_ip pip nb allow=()
+    ssh_ip=$(ssh_client_ip)
+    nb=$(netbird_cidr) || nb=""
+    while true; do
+        printf "  ${BOLD}IP панели Remnawave${NC} ${DIM}[Enter — пропустить]${NC}: "; read -r pip
+        [ -z "$pip" ] || _is_ip "$pip" && break
+        msg_warn "это не IP-адрес"
+    done
+    # подсеть NetBird — все свои пиры (SSH через оверлей); SSH-IP внутри неё уже покрыт
+    [ -n "$nb" ] && allow+=("$nb")
+    if [ -n "$ssh_ip" ] && ! { [ -n "$nb" ] && ip_in_cidr "$ssh_ip" "$nb"; }; then
+        allow+=("$ssh_ip")
+    fi
+    [ -n "$pip" ] && allow+=("$pip")
+    echo
+    msg_info "allowlist (не банятся никогда): ${allow[*]:-пусто}"
+    [ -z "$ssh_ip" ] && [ -z "$nb" ] && msg_warn "SSH-IP не определён (не по SSH?) — добавь свой IP в allowlist после установки"
+    _show_cmd "curl -fsSL $CROWDSEC_REPO_URL | sh   &&   $pm install crowdsec crowdsec-firewall-bouncer-nftables"
+    confirm "Установить CrowdSec?" || { msg_info "отменено"; return 1; }
+    _need_curl
+
+    ui_head "1/4 движок" "репозиторий packagecloud + crowdsec"
+    # не `curl | sh`: при сбое curl sh получит пустой ввод, вернёт 0 — и apt молча
+    # поставил бы древний crowdsec из штатного репо
+    local repo_sh
+    repo_sh=$(curl -fsSL "$CROWDSEC_REPO_URL") || die "не скачал установщик репозитория CrowdSec"
+    printf '%s\n' "$repo_sh" | sh >/dev/null || die "не подключил репозиторий CrowdSec"
+    _cs_pkg "$pm" install crowdsec || die "пакет crowdsec не установился"
+    have cscli || die "cscli не появился после установки"
+    msg_ok "crowdsec установлен"
+
+    ui_head "2/4 allowlist" "до bouncer'а — чтобы не оборвать свою SSH-сессию"
+    if ! _cs_allowlist ${allow[@]+"${allow[@]}"}; then
+        confirm "Allowlist не заведён — всё равно ставить bouncer (риск бана своего IP)?" \
+            || { msg_info "bouncer не ставился; движок crowdsec уже установлен"; return 1; }
+    fi
+
+    ui_head "3/4 сценарии SSH" "crowdsecurity/linux + crowdsecurity/sshd"
+    if cscli collections install crowdsecurity/linux crowdsecurity/sshd >/dev/null 2>&1; then
+        msg_ok "коллекции linux + sshd"
+    else
+        msg_warn "cscli collections install вернул ошибку — проверь: cscli collections list"
+    fi
+    _cs_ssh_acquis
+    systemctl enable crowdsec >/dev/null 2>&1 || true
+    systemctl restart crowdsec || msg_err "crowdsec не перезапустился — смотри: journalctl -u crowdsec -n 30"
+
+    # отдельной транзакцией ПОСЛЕ движка: postinst bouncer'а сам регистрирует ключ
+    # через cscli, а в одной транзакции dpkg мог сконфигурировать его раньше crowdsec
+    ui_head "4/4 firewall-bouncer" "nftables · таблицы crowdsec/crowdsec6"
+    _cs_pkg "$pm" install crowdsec-firewall-bouncer-nftables || die "пакет crowdsec-firewall-bouncer-nftables не установился"
+    systemctl enable --now crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+    local svc
+    for svc in crowdsec crowdsec-firewall-bouncer; do
+        if systemctl is-active --quiet "$svc"; then
+            msg_ok "$svc активен"
+        else
+            msg_err "$svc НЕ активен — смотри: journalctl -u $svc -n 30"
+        fi
+    done
+    record_fix "crowdsec + firewall-bouncer-nftables (allowlist: ${allow[*]:-—})"
+
+    if have fail2ban-client; then
+        echo
+        msg_warn "найден fail2ban — CrowdSec его заменяет, вместе они дублируют баны"
+        if confirm "Остановить и удалить fail2ban?"; then
+            systemctl disable --now fail2ban >/dev/null 2>&1 || true
+            if _cs_pkg "$pm" remove fail2ban; then msg_ok "fail2ban удалён"
+            else msg_warn "fail2ban не удалился — убери вручную"; fi
+        fi
+    fi
+    echo
+    msg_info "проверка: cscli decisions list · cscli alerts list · cscli metrics"
+    msg_info "ещё IP в allowlist: cscli allowlists add $CROWDSEC_ALLOWLIST <IP> -d admin"
+}
+
 case "${1:-}" in
     node)       _need_tty; inst_node ;;
     selfsteal)  _need_tty; inst_selfsteal ;;
     netbird)    _need_tty; inst_netbird ;;
     monitoring) _need_tty; inst_monitoring ;;
+    crowdsec)   _need_tty; inst_crowdsec ;;
     ""|help|-h|--help)
-        echo "install: sudo bash node-diagnostic.sh install {node|selfsteal|netbird|monitoring}"
+        echo "install: sudo bash node-diagnostic.sh install {node|selfsteal|netbird|monitoring|crowdsec}"
         ;;
-    *) echo "install: неизвестная сабкоманда '$1' (node|selfsteal|netbird|monitoring)" >&2; exit 2 ;;
+    *) echo "install: неизвестная сабкоманда '$1' (node|selfsteal|netbird|monitoring|crowdsec)" >&2; exit 2 ;;
 esac

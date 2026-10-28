@@ -2,6 +2,20 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/).
 
+## [Unreleased]
+
+fail2ban заменён на CrowdSec; SSH можно пускать из всей подсети NetBird.
+
+### Added
+- **protect: SSH из подсети NetBird** — если текущая SSH-сессия пришла через NetBird, правила nft/ufw открывают SSH всей подсети NetBird (`wt0` или `netbird status`), а не одному IP пира. Новый флаг `--ssh-from IP|CIDR` и вопрос в меню `[3]` задают источник явно; хост-биты обнуляются (`100.92.13.5/16` → `100.92.0.0/16`, ufw иначе отвергает правило). Отдельные предупреждения на экране и в `APPLY.txt`: «SSH только через NetBird», «текущая сессия вне разрешённой подсети — firewall её оборвёт». Если NetBird есть, а сессия пришла с публичного IP, модуль подсказывает готовый `--ssh-from`.
+- `lib/common.sh`: `ipv4_net`, `ip_in_cidr`, `netbird_addr`, `netbird_cidr`.
+- `install crowdsec`: подсеть NetBird заносится в allowlist; уже выданные решения по ней снимаются (`decisions delete --range … --contained`).
+- **`install crowdsec`** (меню `[7]` → `[5]`): движок CrowdSec из packagecloud + `crowdsec-firewall-bouncer-nftables`, коллекции `crowdsecurity/linux` + `crowdsecurity/sshd`. SSH-IP и IP панели заносятся в allowlist `node-diagnostic` до установки bouncer'а, уже выданные по ним решения снимаются, чтобы IP из community-блоклиста не оборвал SSH-сессию посреди установки. Если acquisition для SSH нет, пишется fallback (файлы rsyslog или journald `ssh.service`/`sshd.service`). Перед установкой проверяется, что свободен порт LAPI 8080. Найденный fail2ban установщик предлагает остановить и удалить. Только deb/rpm + systemd.
+- `diagnose` в рекомендациях предлагает `install.sh crowdsec`, если CrowdSec не установлен.
+
+### Removed
+- **protect: fail2ban** — `fail2ban-sshd.local` больше не генерируется. В `APPLY.txt` шаг 2 теперь ставит CrowdSec, откат — `apt purge crowdsec crowdsec-firewall-bouncer-nftables`.
+
 ## [4.4.0] — в `main` с 2026-07-20
 
 Per-IP eBPF-шейпер полосы, диагностика «reality over sysctl» и точечный

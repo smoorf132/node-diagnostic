@@ -47,14 +47,15 @@ node-diagnostic.sh v$ND_VERSION — модульный тулкит ноды (Re
                                  Тюнинг: sysctl/BBR/FD-лимиты/RPS-RFS-XPS/NIC/MSS/irqbalance/journald
                                  --all включает irqbalance+journald; --zram (zram-swap) — только явно
                                  --from-findings — только фиксы по находкам последней диагностики
-  protect  [--panel-ip IP] [--node-port N] [--out DIR]
-                                 Защита под Remnawave (firewall/fail2ban/SSH) — ГЕНЕРАЦИЯ, не применяет
+  protect  [--panel-ip IP] [--node-port N] [--ssh-from IP|CIDR] [--out DIR]
+                                 Защита под Remnawave (firewall/SSH) — ГЕНЕРАЦИЯ, не применяет
+                                 SSH по умолчанию: подсеть NetBird, если сессия через неё, иначе твой IP
   bbr3     [--status|--install|--dry-run|--yes]
                                  BBRv3 через XanMod-ядро (гейт контейнеров, без автоперезагрузки)
   rollback [--yes|--dry-run]     Откат наложенных оптимизаций (namespaced-артефакты)
   status                         Что наложено на систему, ядро, cc/qdisc
-  install {node|selfsteal|netbird|monitoring}
-                                 Установка ноды Remnawave / Selfsteal / NetBird / мониторинга
+  install {node|selfsteal|netbird|monitoring|crowdsec}
+                                 Установка ноды Remnawave / Selfsteal / NetBird / мониторинга / CrowdSec
   shape {on|off|status|rule …|wl IP}
                                  Per-IP шейпер полосы (eBPF/EDT) — лимит DL/UL на клиента
   menu                           Интерактивное меню (по умолчанию в TTY)
@@ -70,11 +71,11 @@ menu() {
         echo
         echo -e "    ${C}${BOLD}[1]${NC} Диагностика        ${DIM}27 чеков, дашборд, вердикт${NC}"
         echo -e "    ${C}${BOLD}[2]${NC} Оптимизация        ${DIM}sysctl/BBR/FD/RPS/NIC${NC}"
-        echo -e "    ${C}${BOLD}[3]${NC} Защита ноды        ${DIM}firewall/fail2ban/SSH (Remnawave, генерация)${NC}"
+        echo -e "    ${C}${BOLD}[3]${NC} Защита ноды        ${DIM}firewall/SSH (Remnawave, генерация)${NC}"
         echo -e "    ${C}${BOLD}[4]${NC} BBRv3-ядро         ${DIM}XanMod, нужен reboot${NC}"
         echo -e "    ${C}${BOLD}[5]${NC} Откат              ${DIM}снять наложенные оптимизации${NC}"
         echo -e "    ${C}${BOLD}[6]${NC} Статус             ${DIM}что применено, ядро, cc/qdisc${NC}"
-        echo -e "    ${C}${BOLD}[7]${NC} Установка Remnanode ${DIM}нода/Selfsteal/NetBird/мониторинг${NC}"
+        echo -e "    ${C}${BOLD}[7]${NC} Установка Remnanode ${DIM}нода/Selfsteal/NetBird/мониторинг/CrowdSec${NC}"
         echo -e "    ${C}${BOLD}[8]${NC} Шейпер трафика     ${DIM}per-IP лимиты полосы (eBPF)${NC}"
         echo -e "    ${C}${BOLD}[0]${NC} Выход"
         echo
@@ -172,8 +173,8 @@ is_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 
 menu_protect() {
     if [ ! -t 0 ]; then run protect; return; fi
-    echo -e "  ${BOLD}Защита ноды${NC} ${DIM}(генерация firewall/fail2ban/SSH — ничего не применяет)${NC}"
-    local pip np
+    echo -e "  ${BOLD}Защита ноды${NC} ${DIM}(генерация firewall/SSH — ничего не применяет)${NC}"
+    local pip np sf nb
     while true; do
         printf "  IP панели Remnawave ${DIM}[Enter — оставить плейсхолдер <PANEL_IP>]${NC}: "
         read -r pip
@@ -186,9 +187,17 @@ menu_protect() {
         [ -z "$np" ] || is_port "$np" && break
         echo -e "    ${Y}порт — это число 1-65535${NC}"
     done
+    nb=$(netbird_cidr) && echo -e "    ${DIM}NetBird на ноде: подсеть $nb${NC}"
+    while true; do
+        printf "  SSH пускать с ${DIM}[Enter — авто: подсеть NetBird, если зашёл через неё, иначе твой IP]${NC}: "
+        read -r sf
+        [ -z "$sf" ] || ipv4_net "$sf" >/dev/null && break
+        echo -e "    ${Y}нужен IPv4 или подсеть${NC} ${DIM}(напр. ${nb:-100.92.0.0/16})${NC}"
+    done
     local args=()
     [ -n "$pip" ] && args+=(--panel-ip "$pip")
     [ -n "$np" ]  && args+=(--node-port "$np")
+    [ -n "$sf" ]  && args+=(--ssh-from "$sf")
     run protect ${args[@]+"${args[@]}"}
 }
 
@@ -199,13 +208,15 @@ menu_install() {
     echo -e "    ${C}${BOLD}[2]${NC} Selfsteal          ${DIM}selfsteal.sh @ install${NC}"
     echo -e "    ${C}${BOLD}[3]${NC} NetBird            ${DIM}агент + setup-key${NC}"
     echo -e "    ${C}${BOLD}[4]${NC} Мониторинг         ${DIM}cAdvisor+node_exporter+vmagent${NC}"
+    echo -e "    ${C}${BOLD}[5]${NC} CrowdSec           ${DIM}анти-брут SSH + nftables-bouncer${NC}"
     echo -e "    ${C}${BOLD}[0]${NC} Назад"
-    printf "  ${BOLD}Выбор${NC} ${DIM}[0-4]${NC}: "; local c; read -r c; echo
+    printf "  ${BOLD}Выбор${NC} ${DIM}[0-5]${NC}: "; local c; read -r c; echo
     case "$c" in
         1) run install node ;;
         2) run install selfsteal ;;
         3) run install netbird ;;
         4) run install monitoring ;;
+        5) run install crowdsec ;;
         0|q|"") return 0 ;;
         *) echo -e "  ${Y}нет такого пункта${NC}" ;;
     esac
