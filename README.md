@@ -26,6 +26,7 @@
 | `shape`    | per-IP шейпер полосы (eBPF/EDT): лимит DL/UL на клиента, whitelist, dynamic-штраф | да (tc clsact + BPF, свой `off`) |
 | `bbr3`     | ядро XanMod для TCP **BBRv3** (mainline даёт только v1) | да, но **без автоперезагрузки** |
 | `install`  | установка ноды Remnawave / Selfsteal / NetBird / мониторинга / CrowdSec | да (по подтверждению) |
+| `ssh-port` | быстрая смена SSH-порта: sshd + firewall + SELinux, проверка входа, откат | да (по подтверждению входа) |
 | `rollback` | снять всё, что наложил `optimize` | да |
 
 ## Структура
@@ -41,6 +42,7 @@ modules/
   bbr3.sh                   установка XanMod (BBRv3)
   rollback.sh               откат оптимизаций
   install.sh                установка ноды/Selfsteal/NetBird/мониторинга/CrowdSec
+  sshport.sh                смена SSH-порта без лок-аута
   shape.sh                  per-IP eBPF-шейпер (оркестратор)
   nd-shaper.bpf.c           BPF-программа шейпера (clsact + EDT)
   shape_ctrl.py             программирование BPF-карт через bpftool
@@ -80,6 +82,7 @@ sudo bash node-diagnostic.sh bbr3 --install        # XanMod (нужен reboot);
 sudo bash node-diagnostic.sh install monitoring    # нода/Selfsteal/NetBird/мониторинг/CrowdSec
 sudo bash node-diagnostic.sh shape on              # включить eBPF-шейпер
 sudo bash node-diagnostic.sh shape rule 1 443 50 20   # порт 443: 50 Mbit DL / 20 UL на каждый IP
+sudo bash node-diagnostic.sh ssh-port 2222         # сменить SSH-порт (с проверкой входа и откатом)
 sudo bash node-diagnostic.sh rollback              # откат оптимизаций
 sudo bash node-diagnostic.sh status                # что наложено на систему, ядро, cc/qdisc
 ```
@@ -180,6 +183,22 @@ sudo bash node-diagnostic.sh install crowdsec     # CrowdSec + nftables-bouncer 
 Мониторинг ставится точно по гайду [wiki.egam.es](https://wiki.egam.es/ru/configuration/grafana-monitoring-setup/): спрашивает имя инстанса и IP сервера мониторинга (NetBird) для `remoteWrite`, всё слушает `127.0.0.1`.
 
 CrowdSec ставится из официального репозитория packagecloud (в штатных репо Debian/Ubuntu лежит устаревший 1.4.x): движок, `crowdsec-firewall-bouncer-nftables` и коллекции `crowdsecurity/linux` + `crowdsecurity/sshd`. Установщик спрашивает IP панели. Этот IP, твой SSH-IP и подсеть NetBird (если он поднят на ноде) попадают в allowlist `node-diagnostic` **до** установки bouncer'а: иначе, если твой IP окажется в community-блоклисте, SSH-сессия оборвётся посреди установки. Если движок сам не подхватил логи SSH (нет rsyslog), пишется acquisition из journald. Если на ноде есть fail2ban, установщик предлагает его удалить. Работает только на deb/rpm-системах с systemd; порт `127.0.0.1:8080` (LAPI) должен быть свободен.
+
+## `ssh-port` — смена SSH-порта без лок-аута
+
+Пункт меню **[9]** и команда `ssh-port [ПОРТ]` (без аргумента — спросит).
+
+```bash
+sudo bash node-diagnostic.sh ssh-port 2222
+```
+
+Смена идёт в два шага, и ни на одном из них текущая сессия не рвётся:
+1. sshd начинает слушать **и старый, и новый** порт. Новый порт открывается в найденном firewall для тех же источников, что и старый: таблица `node_protect` из `protect` (твой IP или подсеть NetBird), ufw или firewalld. При SELinux в режиме Enforcing порт размечается через `semanage`.
+2. Ты проверяешь вход по новому порту во втором окне (команда подсказывается с тем адресом, по которому ты зашёл сейчас) и подтверждаешь. Только после этого старый порт снимается. Если не подтвердил или что-то пошло не так, конфиги sshd возвращаются из бэкапа (`/var/backups/node-diagnostic/sshd-*`).
+
+Порт пишется в `/etc/ssh/sshd_config.d/99-node-diagnostic-port.conf`. Чужие строки `Port` комментируются, потому что директива аддитивна и они добавили бы свои порты. Без `Include` в `sshd_config` (RHEL 8 и т.п.) используется управляемый блок в начале основного конфига. На Ubuntu 22.10+ с socket-activation порт переносится в `ssh.socket` через `daemon-reload`.
+
+После смены перегенерируй `protect`: в `firewall.nft` правило с rate-limit ещё на старом порту. Firewall или security group у хостера модуль не видит, там порт открывается вручную. В `rollback` смена порта не входит: вернуть порт вслепую значит получить лок-аут за firewall. Возврат делается той же командой: `ssh-port 22`.
 
 ## Откат
 

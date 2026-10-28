@@ -58,6 +58,7 @@ node-diagnostic.sh v$ND_VERSION — модульный тулкит ноды (Re
                                  Установка ноды Remnawave / Selfsteal / NetBird / мониторинга / CrowdSec
   shape {on|off|status|rule …|wl IP}
                                  Per-IP шейпер полосы (eBPF/EDT) — лимит DL/UL на клиента
+  ssh-port [ПОРТ]                Смена SSH-порта без лок-аута (sshd + firewall, проверка входа, откат)
   menu                           Интерактивное меню (по умолчанию в TTY)
   help | --version
 
@@ -77,9 +78,10 @@ menu() {
         echo -e "    ${C}${BOLD}[6]${NC} Статус             ${DIM}что применено, ядро, cc/qdisc${NC}"
         echo -e "    ${C}${BOLD}[7]${NC} Установка Remnanode ${DIM}нода/Selfsteal/NetBird/мониторинг/CrowdSec${NC}"
         echo -e "    ${C}${BOLD}[8]${NC} Шейпер трафика     ${DIM}per-IP лимиты полосы (eBPF)${NC}"
+        echo -e "    ${C}${BOLD}[9]${NC} SSH-порт           ${DIM}быстрая смена без лок-аута${NC}"
         echo -e "    ${C}${BOLD}[0]${NC} Выход"
         echo
-        printf "  ${BOLD}Выбор${NC} ${DIM}[0-8]${NC}: "
+        printf "  ${BOLD}Выбор${NC} ${DIM}[0-9]${NC}: "
         local c; read -r c
         echo
         case "$c" in
@@ -91,6 +93,7 @@ menu() {
             6) show_status ;;
             7) menu_install ;;
             8) menu_shape ;;
+            9) run sshport ;;
             0|q|"") echo -e "  ${DIM}выход${NC}"; return 0 ;;
             *) echo -e "  ${Y}нет такого пункта${NC}" ;;
         esac
@@ -118,7 +121,8 @@ show_status() {
     for f in /etc/sysctl.d/${ND_DROPIN_PREFIX}-*.conf \
              /etc/security/limits.d/99-node-diagnostic.conf \
              /etc/modules-load.d/${ND_DROPIN_PREFIX}.conf \
-             /etc/systemd/journald.conf.d/99-node-diagnostic.conf; do
+             /etc/systemd/journald.conf.d/99-node-diagnostic.conf \
+             /etc/ssh/sshd_config.d/${ND_DROPIN_PREFIX}-port.conf; do
         [ -e "$f" ] && { box_row "${C_OK}${I_OK}${NC} ${f}"; found=1; }
     done
     for svc in node-diagnostic-rps node-diagnostic-nic node-diagnostic-zram; do
@@ -263,6 +267,7 @@ case "$cmd" in
     status|st)             show_status ;;
     install|setup)         run install "$@" ;;
     shape|shaper)          run shape "$@" ;;
+    ssh-port|sshport)      run sshport "$@" ;;
     menu)                  menu ;;
     help|-h|--help)        usage ;;
     --version|-V)          echo "node-diagnostic $ND_VERSION" ;;

@@ -12,7 +12,7 @@ jobs:
       - name: install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: shellcheck (severity=warning)
-        run: shellcheck --severity=warning --shell=bash node-diagnostic.sh install.sh lib/common.sh modules/*.sh tests/smoke.sh
+        run: shellcheck --severity=warning --shell=bash node-diagnostic.sh install.sh lib/common.sh modules/*.sh tests/smoke.sh tests/sshport-it.sh
 
   # компиляция eBPF-шейпера (nd-shaper.bpf.c) — чтобы правки BPF-программы
   # не ломались молча; сам attach проверяется только на живой ноде
@@ -77,6 +77,29 @@ jobs:
           docker run --rm --cap-add NET_ADMIN -v "$PWD:/w" -w /w alpine:3.19 sh -c '
             apk add -q bash nftables python3 >/dev/null
             bash tests/smoke.sh'
+
+  # ssh-port с настоящим sshd под systemd (PID 1): socket-activation (Ubuntu 24.04) и reload (Debian 12)
+  sshport:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:24.04", "debian:12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: ssh-port in ${{ matrix.image }}
+        run: |
+          docker run -d --name sp --privileged --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw -v "$PWD:/w" -w /w ${{ matrix.image }} bash -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq && apt-get install -y -qq systemd systemd-sysv openssh-server iproute2 >/dev/null
+              exec /sbin/init'
+          for i in $(seq 1 90); do
+            docker exec sp sh -c 'ss -Hltn "sport = :22" | grep -q .' 2>/dev/null && break
+            sleep 2
+          done
+          docker exec sp systemctl is-active ssh.socket ssh.service || true
+          docker exec -e ND_INTEGRATION=1 sp bash tests/sshport-it.sh
 
   # РЕАЛЬНОЕ применение optimize→verify→rollback→protect в privileged-контейнере —
   # то, что smoke (dry-run) не видит: значения в ядре, идемпотентность, чистоту отката

@@ -10,7 +10,7 @@ ok()  { echo "  ✓ $*"; }
 bad() { echo "  ✗ $*"; fail=1; }
 
 echo "== bash -n =="
-for f in node-diagnostic.sh install.sh lib/common.sh modules/*.sh tests/smoke.sh; do
+for f in node-diagnostic.sh install.sh lib/common.sh modules/*.sh tests/smoke.sh tests/sshport-it.sh; do
     bash -n "$f" && ok "$f" || bad "syntax $f"
 done
 
@@ -92,6 +92,15 @@ bash modules/install.sh help >/dev/null 2>&1 && ok "install help" || bad "instal
 bash modules/install.sh bogus >/dev/null 2>&1; [ "$?" = "2" ] && ok "install отвергает мусор (rc=2)" || bad "install bogus rc"
 # crowdsec известна диспетчеру (не rc=2) и без TTY отказывает ДО любых изменений
 bash modules/install.sh crowdsec </dev/null >/dev/null 2>&1; [ "$?" = "1" ] && ok "install crowdsec без TTY → отказ (rc=1)" || bad "install crowdsec rc"
+bash modules/sshport.sh help >/dev/null 2>&1 && ok "ssh-port help" || bad "ssh-port help"
+bash modules/sshport.sh 70000 >/dev/null 2>&1; [ "$?" = "2" ] && ok "ssh-port отвергает мусор (rc=2)" || bad "ssh-port bogus rc"
+# без TTY — отказ ДО любых изменений sshd (смена порта ждёт подтверждения входа)
+bash modules/sshport.sh 2222 </dev/null >/dev/null 2>&1; rc=$?
+if [ "$rc" = "1" ] && [ ! -e /etc/ssh/sshd_config.d/99-node-diagnostic-port.conf ]; then
+    ok "ssh-port без TTY → отказ, sshd не тронут"
+else
+    bad "ssh-port без TTY (rc=$rc)"
+fi
 bash modules/shape.sh help >/dev/null 2>&1 && ok "shape help" || bad "shape help"
 bash modules/shape.sh bogus >/dev/null 2>&1; [ "$?" = "2" ] && ok "shape отвергает мусор (rc=2)" || bad "shape bogus rc"
 python3 -c 'import ast; ast.parse(open("modules/shape_ctrl.py").read())' 2>/dev/null && ok "shape_ctrl.py синтаксис" || bad "shape_ctrl.py syntax"
