@@ -195,6 +195,7 @@ _secret_write() {   # _secret_write <файл> <содержимое>
     msg_info "ключ сохранён в $f — по нему certbot продлевает сертификат"
 }
 
+# shellcheck disable=SC2120  # [файл] передаёт certs.sh (продление со старым путём ini)
 cf_secret_write() {   # [файл] — по умолчанию $CERTBOT_SECRETS/cloudflare.ini
     local body
     if cf_is_token; then

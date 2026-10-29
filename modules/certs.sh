@@ -103,6 +103,7 @@ cf_check_api() {
         resp=$(curl -s --max-time 20 https://api.cloudflare.com/client/v4/zones "${_CF_H[@]}" -H "Content-Type: application/json")
         if echo "$resp" | grep -q '"success":true'; then msg_ok "ключ Cloudflare принят"; return 0; fi
         msg_err "Cloudflare не принял ключ (попытка $attempt/3)"
+        # shellcheck disable=SC2034  # читает cf_ask_key/_cf_auth из lib/dns.sh
         [ "$attempt" -lt 3 ] && { CLOUDFLARE_EMAIL=""; cf_ask_key || return 1; }
     done
     return 1
