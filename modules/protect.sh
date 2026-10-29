@@ -19,9 +19,16 @@ fi
 # ── детект параметров Remnawave-ноды ────────────────────────────────
 detect_node_port() {
     local f v
-    for f in /opt/remnanode/.env /root/remnanode/.env /opt/remnawave/node/.env ./.env; do
+    for f in "$REMNANODE_DIR/.env" /opt/remnanode/.env /root/remnanode/.env /opt/remnawave/node/.env ./.env; do
         [ -r "$f" ] || continue
         v=$(awk -F= '/^[[:space:]]*NODE_PORT[[:space:]]*=/{gsub(/[" ]/,"",$2);print $2;exit}' "$f")
+        [ -n "$v" ] && { echo "$v"; return 0; }
+    done
+    # environment прямо в compose (установки remnawave-reverse-proxy):
+    #   - NODE_PORT=2222   или   NODE_PORT: 2222
+    for f in "$REMNANODE_DIR/docker-compose.yml" /opt/remnawave/docker-compose.yml; do
+        [ -r "$f" ] || continue
+        v=$(sed -nE 's/^[[:space:]]*-?[[:space:]]*"?NODE_PORT[=:][[:space:]]*"?([0-9]+).*/\1/p' "$f" | head -n1)
         [ -n "$v" ] && { echo "$v"; return 0; }
     done
     # из запущенного контейнера remnanode — ТОЛЬКО он: первый попавшийся published-порт

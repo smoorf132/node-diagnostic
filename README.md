@@ -25,7 +25,10 @@
 | `protect`  | firewall под Remnawave, SSH-хардненинг, DDoS-хардненинг | **нет — только генерирует файлы** |
 | `shape`    | per-IP шейпер полосы (eBPF/EDT): лимит DL/UL на клиента, whitelist, dynamic-штраф | да (tc clsact + BPF, свой `off`) |
 | `bbr3`     | ядро XanMod для TCP **BBRv3** (mainline даёт только v1) | да, но **без автоперезагрузки** |
-| `install`  | установка ноды Remnawave / Selfsteal / NetBird / мониторинга / CrowdSec | да (по подтверждению) |
+| `install`  | установка ноды Remnawave (nginx-selfsteal + сертификат) / WARP / NetBird / мониторинга / CrowdSec | да (по подтверждению) |
+| `certs`    | сертификаты: продление, выпуск (Cloudflare / Gcore / Bunny / HTTP-01), свой сертификат | да |
+| `warp`     | WARP Native: интерфейс `warp` для outbound Xray | да (по подтверждению) |
+| `ipv6`     | включить/выключить IPv6 (sysctl `disable_ipv6`) | да |
 | `ssh-port` | быстрая смена SSH-порта: sshd + firewall + SELinux, проверка входа, откат | да (по подтверждению входа) |
 | `rollback` | снять всё, что наложил `optimize` | да |
 
@@ -35,13 +38,18 @@
 node-diagnostic.sh          точка входа: меню + диспетчер команд
 install.sh                  bootstrap-установщик (curl|bash)
 lib/common.sh               палитра, детекторы (virt/psABI/ssh), backup, namespaced drop-in, dry-run, ensure_pkg
+lib/dns.sh                  базовый домен, публичный IP, A-записи через API Cloudflare/Gcore/Bunny
 modules/
   diagnose.sh               27 чеков, дашборд, вердикт, рекомендации
   optimize.sh               сетевой/системный тюнинг
   protect.sh                защита ноды (генерация артефактов)
   bbr3.sh                   установка XanMod (BBRv3)
   rollback.sh               откат оптимизаций
-  install.sh                установка ноды/Selfsteal/NetBird/мониторинга/CrowdSec
+  install.sh                диспетчер установки: нода/WARP/NetBird/мониторинг/CrowdSec
+  node.sh                   установка ноды: remnanode + nginx-selfsteal + шаблон сайта
+  certs.sh                  сертификаты: выпуск 5 методами, продление, хуки, cron
+  warp.sh                   WARP Native (distillium/warp-native)
+  ipv6.sh                   включение/выключение IPv6
   sshport.sh                смена SSH-порта без лок-аута
   shape.sh                  per-IP eBPF-шейпер (оркестратор)
   nd-shaper.bpf.c           BPF-программа шейпера (clsact + EDT)
@@ -56,7 +64,7 @@ modules/
 curl -sSL https://raw.githubusercontent.com/smoorf132/node-diagnostic/main/install.sh | sudo bash
 ```
 
-Скачивает репозиторий в `/opt/node-diagnostic`; в терминале сразу открывает меню. Переопределяемо через env: `ND_REF` (ветка/тег), `ND_DEST` (каталог).
+Скачивает репозиторий в `/opt/node-diagnostic`, ставит команду **`rr`** (`/usr/local/bin/rr`) и в терминале сразу открывает меню. Дальше тулкит запускается просто `rr` (`rr certs renew`, `rr ipv6 status` и т.д.); не под root `rr` сам перезапускается через `sudo`. Если на сервере остался alias `rr` от remnawave-reverse-proxy (`/etc/bash.bashrc`), установщик его комментирует, а сам скрипт остаётся доступен как `remnawave_reverse`. Переопределяемо через env: `ND_REF` (ветка/тег), `ND_DEST` (каталог), `ND_BIN_DIR` (куда положить `rr`).
 
 **Или вручную** (тулкит модульный — нужен весь репозиторий):
 
@@ -79,7 +87,10 @@ sudo bash node-diagnostic.sh optimize --from-findings   # только фикс�
 sudo bash node-diagnostic.sh optimize --dry-run    # показать, что применил бы
 sudo bash node-diagnostic.sh protect --panel-ip 1.2.3.4 --node-port 2222
 sudo bash node-diagnostic.sh bbr3 --install        # XanMod (нужен reboot); --level 2 если CPU маскирован
-sudo bash node-diagnostic.sh install monitoring    # нода/Selfsteal/NetBird/мониторинг/CrowdSec
+sudo bash node-diagnostic.sh install node          # нода Remnawave: nginx-selfsteal + сертификат
+sudo bash node-diagnostic.sh certs renew           # продлить сертификаты, у которых ≤30 дней
+sudo bash node-diagnostic.sh ipv6 off              # выключить IPv6
+sudo bash node-diagnostic.sh install monitoring    # WARP/NetBird/мониторинг/CrowdSec — так же
 sudo bash node-diagnostic.sh shape on              # включить eBPF-шейпер
 sudo bash node-diagnostic.sh shape rule 1 443 50 20   # порт 443: 50 Mbit DL / 20 UL на каждый IP
 sudo bash node-diagnostic.sh ssh-port 2222         # сменить SSH-порт (с проверкой входа и откатом)
@@ -173,16 +184,60 @@ sudo bash node-diagnostic.sh shape off                     # снять
 Пункт меню **[7]** и команда `install`. Внешние установщики запускаются только после подтверждения (показ команды + `y/N`).
 
 ```bash
-sudo bash node-diagnostic.sh install node         # нода Remnawave (DigneZzZ/remnawave-scripts)
-sudo bash node-diagnostic.sh install selfsteal    # Selfsteal
+sudo bash node-diagnostic.sh install node         # нода Remnawave: remnanode + nginx-selfsteal + сертификат
+sudo bash node-diagnostic.sh install warp         # WARP Native (то же: warp install)
 sudo bash node-diagnostic.sh install netbird      # NetBird + setup-key (спросит ключ)
 sudo bash node-diagnostic.sh install monitoring   # cAdvisor + node_exporter + vmagent → VictoriaMetrics
 sudo bash node-diagnostic.sh install crowdsec     # CrowdSec + nftables-bouncer (анти-брут SSH)
 ```
 
+### Нода Remnawave (`install node`)
+
+Порт установки ноды из [eGamesAPI/remnawave-reverse-proxy](https://github.com/eGamesAPI/remnawave-reverse-proxy) (вариант с nginx) **без Caddy и ufw**. Только Debian 11+ / Ubuntu 22.04+.
+
+1. Пакеты: Docker (get.docker.com → проверенная копия с зеркала → `docker.io` из дистрибутива), certbot, `dig`, `jq`, cron, зеркала Docker Hub (`mirror.gcr.io`, `dockerhub.timeweb.cloud`), unattended-upgrades. BBR не трогает: это делает `optimize`.
+2. Проверки: на сервере не запущены `remnanode`/`remnawave-nginx`, порт 443 свободен.
+3. Selfsteal-домен: A-запись должна указывать на сервер **без прокси Cloudflare**. Если записи нет или она чужая, её можно создать через API Cloudflare / Gcore / Bunny или вручную (установщик ждёт, пока запись появится).
+4. IP панели, `SECRET_KEY` из карточки ноды (можно вставить целиком вместе с `NODE_PORT=`), `NODE_PORT` (по умолчанию 2222).
+5. Сертификат: уже есть подходящий — берётся он; нет — выпускается (см. `certs`). Если A-запись только что создана через API провайдера, wildcard выпускается тем же провайдером без вопроса.
+6. `/opt/remnanode`: `docker-compose.yml` (nginx + remnanode, `network_mode: host`), `.env` (`NODE_PORT`, `SECRET_KEY`, права 600), `nginx.conf`. Прежние конфиги сохраняются как `*.bak-<время>`.
+7. Случайный шаблон сайта-маскировки в `/var/www/html` из одного из трёх наборов: simple-web-templates, sni-templates, nothing-sni. Title, meta и классы рандомизируются.
+8. `docker compose up -d` и проверка, что `https://домен` отвечает сайтом.
+
+nginx слушает только unix-сокет `/dev/shm/nginx.sock` с `proxy_protocol`. В профиле Xray в панели: Reality `target` = `/dev/shm/nginx.sock`, `xver: 1`, `serverNames: ["домен"]`. ufw нет, поэтому `NODE_PORT` открыт всем, пока его не закроет firewall. Установщик в конце подсказывает команду `rr protect --panel-ip … --node-port …`; `protect` и сам находит порт в `/opt/remnanode/.env`.
+
+### WARP Native (`warp`)
+
+Запускает установщик/деинсталлятор [distillium/warp-native](https://github.com/distillium/warp-native). Скрипт выполняется только тогда, когда два независимых источника (GitHub и прокси) отдали одинаковые байты. Поднимается WireGuard-интерфейс `warp`. Outbound `warp-out` (`sockopt.interface: "warp"`) добавляется в профиль Xray в панели, и установщик печатает готовый JSON. Правка профиля через API панели из апстрима сюда не перенесена: на ноде панели нет.
+
 Мониторинг ставится точно по гайду [wiki.egam.es](https://wiki.egam.es/ru/configuration/grafana-monitoring-setup/): спрашивает имя инстанса и IP сервера мониторинга (NetBird) для `remoteWrite`, всё слушает `127.0.0.1`.
 
 CrowdSec ставится из официального репозитория packagecloud (в штатных репо Debian/Ubuntu лежит устаревший 1.4.x): движок, `crowdsec-firewall-bouncer-nftables` и коллекции `crowdsecurity/linux` + `crowdsecurity/sshd`. Установщик спрашивает IP панели. Этот IP, твой SSH-IP и подсеть NetBird (если он поднят на ноде) попадают в allowlist `node-diagnostic` **до** установки bouncer'а: иначе, если твой IP окажется в community-блоклисте, SSH-сессия оборвётся посреди установки. Если движок сам не подхватил логи SSH (нет rsyslog), пишется acquisition из journald. Если на ноде есть fail2ban, установщик предлагает его удалить. Работает только на deb/rpm-системах с systemd; порт `127.0.0.1:8080` (LAPI) должен быть свободен.
+
+## `certs` — сертификаты
+
+Пункт меню **[10]** и команда `certs`. Порт управления сертификатами из remnawave-reverse-proxy без Telegram-уведомлений и без ufw.
+
+```bash
+sudo bash node-diagnostic.sh certs                 # меню
+sudo bash node-diagnostic.sh certs renew           # продлить те, у кого ≤30 дней
+sudo bash node-diagnostic.sh certs issue node.example.com
+sudo bash node-diagnostic.sh certs manual example.com   # загрузить свой fullchain.pem + privkey.pem
+```
+
+| Метод | Что выпускает | Что нужно |
+|---|---|---|
+| Cloudflare DNS API | wildcard `база + *.база` | API-токен (или глобальный ключ + email) |
+| Gcore DNS API | wildcard | API-ключ (плагин `certbot-dns-gcore` ставится через pip) |
+| Bunny.net DNS API | wildcard, базу зоны спрашивает | API-ключ (плагин `certbot-dns-bunny`) |
+| ACME HTTP-01 | один домен | открытый снаружи 80/tcp (firewall `protect` его открывает) |
+| Свой сертификат | что загрузишь | `fullchain.pem` + `privkey.pem`; проверяются пара, домен и срок |
+
+Ключи DNS-провайдеров хранятся в `/root/.secrets/certbot/*.ini` (600): по ним certbot продлевает сертификат, и следующая установка их не спрашивает. Ключи ECDSA secp384r1. Продление идёт через `certbot.timer` пакета и cron (`0 5 * * 0 certbot renew`). Хук перезапускает `remnawave-nginx`, потому что сертификат примонтирован в контейнер файлом. Для HTTP-01 хуки останавливают nginx на время проверки и запускают обратно. Свой сертификат certbot не продлевает: `renew` только показывает его срок.
+
+## `ipv6` — IPv6 на ноде
+
+Пункт меню **[11]** и команда `ipv6 [status|on|off]`. Значение пишется в `/etc/sysctl.d/99-remnawave-ipv6.conf`: это тот же файл, что у remnawave-reverse-proxy, поэтому две настройки не конфликтуют. Старые ключи вычищаются из `/etc/sysctl.conf`. После включения проверяется, что sysctl применился (`ipv6.disable=1` в GRUB он молча игнорирует). Если глобального адреса нет, установщик предлагает обновить сеть (netplan / ifupdown / networkd) и подсказывает, где прописать адрес. Если SSH-сессия идёт по IPv6, перед выключением спрашивается подтверждение. В `rollback` не входит.
 
 ## `ssh-port` — смена SSH-порта без лок-аута
 
@@ -222,6 +277,7 @@ sudo bash node-diagnostic.sh rollback --dry-run  # показать, что сн
   - `diagnose`, `optimize`, `rollback` — Ubuntu/Debian/RHEL/Fedora/Alpine (sysctl универсален; deps ставятся через apt/dnf/yum/apk).
   - `protect` — firewall на nftables/ufw универсален.
   - `install crowdsec` — deb/rpm-дистрибутивы с systemd (Debian/Ubuntu/RHEL/Fedora); на Alpine не поддерживается.
+  - `install node`, `certs` — Debian 11+ / Ubuntu 22.04+ с systemd (Docker, certbot из apt).
   - `bbr3` — **только Debian/Ubuntu** (XanMod = deb-репозиторий) и **только bare-metal/KVM x86_64** (не контейнер).
   - `shape` — ядро Linux **≥5.4** (EDT/clsact) + `clang`/`bpftool`/`libbpf-dev`; не в контейнере.
 

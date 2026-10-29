@@ -12,7 +12,7 @@ jobs:
       - name: install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: shellcheck (severity=warning)
-        run: shellcheck --severity=warning --shell=bash node-diagnostic.sh install.sh lib/common.sh modules/*.sh tests/smoke.sh tests/sshport-it.sh
+        run: shellcheck --severity=warning --shell=bash node-diagnostic.sh install.sh lib/common.sh lib/dns.sh modules/*.sh tests/smoke.sh tests/sshport-it.sh
 
   # компиляция eBPF-шейпера (nd-shaper.bpf.c) — чтобы правки BPF-программы
   # не ломались молча; сам attach проверяется только на живой ноде

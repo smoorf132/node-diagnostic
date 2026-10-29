@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # modules/install.sh — установка компонентов ноды Remnawave.
-# Сабкоманды: node | selfsteal | netbird | monitoring | crowdsec.
+# Сабкоманды: node | warp | netbird | monitoring | crowdsec.
 # Вызывается через node-diagnostic.sh (пункт меню «Установка Remnanode»).
+# Нода и WARP — отдельные модули (node.sh, warp.sh); здесь только диспетчер к ним.
 # Внешние установщики запускаются ТОЛЬКО после явного подтверждения.
 set -u
 _self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -9,8 +10,6 @@ _self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 source "$_self/../lib/common.sh" 2>/dev/null || { echo "install: не найден lib/common.sh" >&2; exit 1; }
 
 # ── источники (обнови здесь при смене репо/версий) ────────────────────
-REMNANODE_URL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh"
-SELFSTEAL_URL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh"
 NETBIRD_INSTALL_URL="https://pkgs.netbird.io/install.sh"
 # CrowdSec — официальный репо packagecloud (в штатных Debian/Ubuntu древний 1.4.x без allowlists)
 CROWDSEC_REPO_URL="https://install.crowdsec.net"
@@ -34,27 +33,7 @@ _show_cmd() { echo -e "    ${DIM}будет выполнено:${NC}\n    ${C}$1
 
 _need_curl() { have curl || ensure_pkg curl curl curl curl || die "нужен curl (не удалось поставить)"; }
 
-# ── 1. Нода Remnawave (DigneZzZ/remnawave-scripts) ───────────────────
-inst_node() {
-    ui_head "Установка ноды Remnawave" "репозиторий DigneZzZ/remnawave-scripts"
-    _show_cmd "bash <(curl -Ls $REMNANODE_URL) @ install"
-    msg_info "это интерактивный установщик из стороннего репозитория — он задаст свои вопросы"
-    confirm "Скачать и запустить установщик ноды?" || { msg_info "отменено"; return 1; }
-    _need_curl
-    bash <(curl -Ls "$REMNANODE_URL") @ install
-}
-
-# ── 2. Selfsteal ─────────────────────────────────────────────────────
-inst_selfsteal() {
-    ui_head "Установка Selfsteal" "репозиторий DigneZzZ/remnawave-scripts"
-    _show_cmd "bash <(curl -Ls $SELFSTEAL_URL) @ install"
-    msg_info "интерактивный установщик из стороннего репозитория"
-    confirm "Скачать и запустить установщик Selfsteal?" || { msg_info "отменено"; return 1; }
-    _need_curl
-    bash <(curl -Ls "$SELFSTEAL_URL") @ install
-}
-
-# ── 3. NetBird + подключение по setup-key ────────────────────────────
+# ── 1. NetBird + подключение по setup-key ────────────────────────────
 inst_netbird() {
     ui_head "Установка NetBird" "агент оверлей-сети + подключение по setup-key"
     local key
@@ -69,7 +48,7 @@ inst_netbird() {
     msg_ok "NetBird подключён — проверь: netbird status"
 }
 
-# ── 4. Мониторинг ноды (cAdvisor + node_exporter + vmagent) ──────────
+# ── 2. Мониторинг ноды (cAdvisor + node_exporter + vmagent) ──────────
 # Точно по гайду wiki.egam.es: всё слушает 127.0.0.1, vmagent шлёт remoteWrite
 # на центральный VictoriaMetrics по адресу NetBird.
 inst_monitoring() {
@@ -232,7 +211,7 @@ EOF
     msg_info "метрики слушают локально (127.0.0.1:9101/9100/8429); центральный VM собирает их по NetBird ($ip)"
 }
 
-# ── 5. CrowdSec (анти-брут SSH + community-блоклист) ─────────────────
+# ── 3. CrowdSec (анти-брут SSH + community-блоклист) ─────────────────
 # Движок + nftables-bouncer. Порядок важен: allowlist (SSH-IP, IP панели) заводится
 # ДО установки bouncer'а — если IP попал в community-блоклист, bouncer дропнул бы
 # и текущую SSH-сессию прямо посреди установки.
@@ -398,13 +377,16 @@ inst_crowdsec() {
 }
 
 case "${1:-}" in
-    node)       _need_tty; inst_node ;;
-    selfsteal)  _need_tty; inst_selfsteal ;;
+    node)       _need_tty; bash "$_self/node.sh" install ;;
+    warp)       _need_tty; shift; bash "$_self/warp.sh" "${@:-install}" ;;
     netbird)    _need_tty; inst_netbird ;;
     monitoring) _need_tty; inst_monitoring ;;
     crowdsec)   _need_tty; inst_crowdsec ;;
+    selfsteal)
+        echo "install: selfsteal теперь часть установки ноды (nginx + шаблон сайта) — sudo bash node-diagnostic.sh install node" >&2
+        exit 2 ;;
     ""|help|-h|--help)
-        echo "install: sudo bash node-diagnostic.sh install {node|selfsteal|netbird|monitoring|crowdsec}"
+        echo "install: sudo bash node-diagnostic.sh install {node|warp|netbird|monitoring|crowdsec}"
         ;;
-    *) echo "install: неизвестная сабкоманда '$1' (node|selfsteal|netbird|monitoring|crowdsec)" >&2; exit 2 ;;
+    *) echo "install: неизвестная сабкоманда '$1' (node|warp|netbird|monitoring|crowdsec)" >&2; exit 2 ;;
 esac

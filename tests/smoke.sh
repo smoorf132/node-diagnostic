@@ -10,7 +10,7 @@ ok()  { echo "  ✓ $*"; }
 bad() { echo "  ✗ $*"; fail=1; }
 
 echo "== bash -n =="
-for f in node-diagnostic.sh install.sh lib/common.sh modules/*.sh tests/smoke.sh tests/sshport-it.sh; do
+for f in node-diagnostic.sh install.sh lib/common.sh lib/dns.sh modules/*.sh tests/smoke.sh tests/sshport-it.sh; do
     bash -n "$f" && ok "$f" || bad "syntax $f"
 done
 
@@ -118,6 +118,77 @@ if [ "$rc" = "1" ] && [ ! -e /etc/ssh/sshd_config.d/99-node-diagnostic-port.conf
 else
     bad "ssh-port без TTY (rc=$rc)"
 fi
+# selfsteal от DigneZzZ убран — теперь часть install node
+bash modules/install.sh selfsteal >/dev/null 2>&1; [ "$?" = "2" ] && ok "install selfsteal → указатель на install node (rc=2)" || bad "install selfsteal rc"
+
+echo "== нода / сертификаты / WARP / IPv6 (диспетчеры) =="
+for m in node certs warp ipv6; do
+    bash "modules/$m.sh" help >/dev/null 2>&1 && ok "$m help" || bad "$m help"
+    bash "modules/$m.sh" bogus >/dev/null 2>&1; [ "$?" = "2" ] && ok "$m отвергает мусор (rc=2)" || bad "$m bogus rc"
+done
+# без TTY (или без root) — отказ ДО любых изменений
+bash modules/node.sh install </dev/null >/dev/null 2>&1; [ "$?" = "1" ] && ok "node install без TTY → отказ (rc=1)" || bad "node install rc"
+bash modules/certs.sh issue </dev/null >/dev/null 2>&1; [ "$?" = "1" ] && ok "certs issue без TTY → отказ (rc=1)" || bad "certs issue rc"
+bash modules/warp.sh install </dev/null >/dev/null 2>&1; [ "$?" = "1" ] && ok "warp install без TTY → отказ (rc=1)" || bad "warp install rc"
+bash modules/warp.sh status >/dev/null 2>&1 && ok "warp status" || bad "warp status"
+# статус: 0 (включён) или 1 (выключен) — оба валидны; 2+/127 = падение
+bash modules/ipv6.sh status >/dev/null 2>&1; rc=$?
+[ "$rc" -le 1 ] && ok "ipv6 status (rc=$rc)" || bad "ipv6 status crash (rc=$rc)"
+bash node-diagnostic.sh help 2>/dev/null | grep -q 'certs' && ok "help: certs/warp/ipv6" || bad "help без certs"
+
+echo "== нода: домены, покрытие сертификатом =="
+fn=$(bash -c 'source lib/common.sh; source modules/node.sh
+    [ "$(extract_domain node.example.com)" = example.com ] || exit 1
+    [ "$(extract_domain a.b.example.com.ru)" = example.com.ru ] || exit 1
+    [ "$(extract_domain Node.Example.CO.UK)" = example.co.uk ] || exit 1
+    cert_covers_domain node.example.com "*.example.com" || exit 1
+    cert_covers_domain example.com "$(printf "example.com\n*.example.com")" || exit 1
+    ! cert_covers_domain deep.node.example.com "*.example.com" || exit 1
+    ! cert_covers_domain example.org "*.example.com" || exit 1
+    is_domain node.example.com && ! is_domain "bad domain" && ! is_domain localhost || exit 1
+    is_ipv4 203.0.113.5 && ! is_ipv4 256.1.1.1 || exit 1
+    echo yes' 2>/dev/null)
+[ "$fn" = "yes" ] && ok "extract_domain / cert_covers_domain / is_domain" || bad "extract_domain / cert_covers_domain / is_domain"
+
+echo "== нода: рендер docker-compose.yml / .env / nginx.conf =="
+nd=$(mktemp -d)
+bash -c 'source lib/common.sh; source modules/node.sh
+    node_render_env "$1" 2222 eyJhbGciOiJIUzI1NiJ9.dGVzdC1zZWNyZXQ
+    node_render_compose "$1" example.com
+    node_render_nginx "$1" node.example.com example.com' _ "$nd" >/dev/null 2>&1
+if grep -qx 'NODE_PORT=2222' "$nd/.env" 2>/dev/null && grep -q '^SECRET_KEY=eyJ' "$nd/.env" \
+   && [ "$(stat -c %a "$nd/.env" 2>/dev/null)" = "600" ]; then
+    ok ".env (NODE_PORT, SECRET_KEY, 600)"
+else
+    bad ".env"
+fi
+if grep -q 'env_file:' "$nd/docker-compose.yml" 2>/dev/null \
+   && grep -qF '/etc/letsencrypt/live/example.com/fullchain.pem:/etc/nginx/ssl/example.com/fullchain.pem:ro' "$nd/docker-compose.yml" \
+   && grep -qF "rm -f /dev/shm/nginx.sock && exec nginx" "$nd/docker-compose.yml" \
+   && ! grep -qiE 'caddy|ufw' "$nd/docker-compose.yml"; then
+    ok "docker-compose.yml (nginx + remnanode, маунты сертификата, без Caddy)"
+else
+    bad "docker-compose.yml"
+fi
+if grep -q 'server_name node.example.com;' "$nd/nginx.conf" 2>/dev/null \
+   && grep -q 'listen unix:/dev/shm/nginx.sock ssl proxy_protocol;' "$nd/nginx.conf" \
+   && grep -qF 'ssl_certificate "/etc/nginx/ssl/example.com/fullchain.pem";' "$nd/nginx.conf" \
+   && grep -qF 'map $http_upgrade $connection_upgrade' "$nd/nginx.conf" \
+   && grep -q 'ssl_reject_handshake on;' "$nd/nginx.conf"; then
+    ok "nginx.conf (selfsteal на unix-сокете, reject неизвестных SNI)"
+else
+    bad "nginx.conf"
+fi
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    (cd "$nd" && docker compose config -q) >/dev/null 2>&1 && ok "docker compose config" || bad "docker compose config"
+fi
+
+echo "== protect: NODE_PORT из docker-compose.yml ноды =="
+rn=$(mktemp -d); po=$(mktemp -d)
+printf 'services:\n  remnanode:\n    environment:\n      - NODE_PORT=2345\n' > "$rn/docker-compose.yml"
+REMNANODE_DIR="$rn" bash modules/protect.sh --panel-ip 203.0.113.5 --out "$po" >/dev/null 2>&1
+grep -q 'tcp dport 2345 ' "$po/firewall.nft" 2>/dev/null && ok "detect_node_port: compose environment" || bad "detect_node_port: compose environment"
+
 bash modules/shape.sh help >/dev/null 2>&1 && ok "shape help" || bad "shape help"
 bash modules/shape.sh bogus >/dev/null 2>&1; [ "$?" = "2" ] && ok "shape отвергает мусор (rc=2)" || bad "shape bogus rc"
 python3 -c 'import ast; ast.parse(open("modules/shape_ctrl.py").read())' 2>/dev/null && ok "shape_ctrl.py синтаксис" || bad "shape_ctrl.py syntax"

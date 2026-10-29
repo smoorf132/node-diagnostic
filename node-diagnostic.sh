@@ -54,8 +54,14 @@ node-diagnostic.sh v$ND_VERSION — модульный тулкит ноды (Re
                                  BBRv3 через XanMod-ядро (гейт контейнеров, без автоперезагрузки)
   rollback [--yes|--dry-run]     Откат наложенных оптимизаций (namespaced-артефакты)
   status                         Что наложено на систему, ядро, cc/qdisc
-  install {node|selfsteal|netbird|monitoring|crowdsec}
-                                 Установка ноды Remnawave / Selfsteal / NetBird / мониторинга / CrowdSec
+  install {node|warp|netbird|monitoring|crowdsec}
+                                 Установка ноды Remnawave (nginx-selfsteal + сертификат) / WARP /
+                                 NetBird / мониторинга / CrowdSec
+  certs    [menu|renew|issue [ДОМЕН]|manual [ДОМЕН]]
+                                 Сертификаты: продление, выпуск (Cloudflare/Gcore/Bunny/HTTP-01), свой
+  warp     [menu|install|uninstall|status]
+                                 WARP Native (distillium/warp-native) — интерфейс warp для outbound Xray
+  ipv6     [menu|status|on|off]  Включить/выключить IPv6 (sysctl disable_ipv6)
   shape {on|off|status|rule …|wl IP}
                                  Per-IP шейпер полосы (eBPF/EDT) — лимит DL/UL на клиента
   ssh-port [ПОРТ]                Смена SSH-порта без лок-аута (sshd + firewall, проверка входа, откат)
@@ -63,6 +69,7 @@ node-diagnostic.sh v$ND_VERSION — модульный тулкит ноды (Re
   help | --version
 
 Без аргументов: меню в терминале, диагностика — если ввод не интерактивный (curl | bash).
+После install.sh тулкит доступен командой rr (например: rr, rr certs renew, rr ipv6 status).
 HELP
 }
 
@@ -76,12 +83,14 @@ menu() {
         echo -e "    ${C}${BOLD}[4]${NC} BBRv3-ядро         ${DIM}XanMod, нужен reboot${NC}"
         echo -e "    ${C}${BOLD}[5]${NC} Откат              ${DIM}снять наложенные оптимизации${NC}"
         echo -e "    ${C}${BOLD}[6]${NC} Статус             ${DIM}что применено, ядро, cc/qdisc${NC}"
-        echo -e "    ${C}${BOLD}[7]${NC} Установка Remnanode ${DIM}нода/Selfsteal/NetBird/мониторинг/CrowdSec${NC}"
+        echo -e "    ${C}${BOLD}[7]${NC} Установка Remnanode ${DIM}нода+selfsteal/WARP/NetBird/мониторинг/CrowdSec${NC}"
         echo -e "    ${C}${BOLD}[8]${NC} Шейпер трафика     ${DIM}per-IP лимиты полосы (eBPF)${NC}"
         echo -e "    ${C}${BOLD}[9]${NC} SSH-порт           ${DIM}быстрая смена без лок-аута${NC}"
+        echo -e "   ${C}${BOLD}[10]${NC} Сертификаты        ${DIM}продление/выпуск/свой${NC}"
+        echo -e "   ${C}${BOLD}[11]${NC} IPv6               ${DIM}включить/выключить${NC}"
         echo -e "    ${C}${BOLD}[0]${NC} Выход"
         echo
-        printf "  ${BOLD}Выбор${NC} ${DIM}[0-9]${NC}: "
+        printf "  ${BOLD}Выбор${NC} ${DIM}[0-11]${NC}: "
         local c; read -r c
         echo
         case "$c" in
@@ -94,6 +103,8 @@ menu() {
             7) menu_install ;;
             8) menu_shape ;;
             9) run sshport ;;
+            10) run certs menu ;;
+            11) run ipv6 menu ;;
             0|q|"") echo -e "  ${DIM}выход${NC}"; return 0 ;;
             *) echo -e "  ${Y}нет такого пункта${NC}" ;;
         esac
@@ -122,7 +133,8 @@ show_status() {
              /etc/security/limits.d/99-node-diagnostic.conf \
              /etc/modules-load.d/${ND_DROPIN_PREFIX}.conf \
              /etc/systemd/journald.conf.d/99-node-diagnostic.conf \
-             /etc/ssh/sshd_config.d/${ND_DROPIN_PREFIX}-port.conf; do
+             /etc/ssh/sshd_config.d/${ND_DROPIN_PREFIX}-port.conf \
+             /etc/sysctl.d/99-remnawave-ipv6.conf; do
         [ -e "$f" ] && { box_row "${C_OK}${I_OK}${NC} ${f}"; found=1; }
     done
     for svc in node-diagnostic-rps node-diagnostic-nic node-diagnostic-zram; do
@@ -168,11 +180,6 @@ menu_diagnose() {
     esac
 }
 
-is_ipv4() {
-    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
-    local o
-    for o in "${BASH_REMATCH[@]:1}"; do [ "$o" -le 255 ] || return 1; done
-}
 is_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 
 menu_protect() {
@@ -208,8 +215,8 @@ menu_protect() {
 menu_install() {
     if [ ! -t 0 ]; then echo -e "  ${Y}установка доступна только в интерактивном режиме${NC}"; return 0; fi
     echo -e "  ${BOLD}Установка Remnanode${NC}"
-    echo -e "    ${C}${BOLD}[1]${NC} Нода Remnawave     ${DIM}remnanode.sh @ install${NC}"
-    echo -e "    ${C}${BOLD}[2]${NC} Selfsteal          ${DIM}selfsteal.sh @ install${NC}"
+    echo -e "    ${C}${BOLD}[1]${NC} Нода Remnawave     ${DIM}remnanode + nginx-selfsteal + сертификат${NC}"
+    echo -e "    ${C}${BOLD}[2]${NC} WARP Native        ${DIM}интерфейс warp для outbound Xray${NC}"
     echo -e "    ${C}${BOLD}[3]${NC} NetBird            ${DIM}агент + setup-key${NC}"
     echo -e "    ${C}${BOLD}[4]${NC} Мониторинг         ${DIM}cAdvisor+node_exporter+vmagent${NC}"
     echo -e "    ${C}${BOLD}[5]${NC} CrowdSec           ${DIM}анти-брут SSH + nftables-bouncer${NC}"
@@ -217,7 +224,7 @@ menu_install() {
     printf "  ${BOLD}Выбор${NC} ${DIM}[0-5]${NC}: "; local c; read -r c; echo
     case "$c" in
         1) run install node ;;
-        2) run install selfsteal ;;
+        2) run warp menu ;;
         3) run install netbird ;;
         4) run install monitoring ;;
         5) run install crowdsec ;;
@@ -268,6 +275,9 @@ case "$cmd" in
     install|setup)         run install "$@" ;;
     shape|shaper)          run shape "$@" ;;
     ssh-port|sshport)      run sshport "$@" ;;
+    certs|cert|ssl)        run certs "$@" ;;
+    warp)                  run warp "$@" ;;
+    ipv6)                  run ipv6 "$@" ;;
     menu)                  menu ;;
     help|-h|--help)        usage ;;
     --version|-V)          echo "node-diagnostic $ND_VERSION" ;;

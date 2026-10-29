@@ -59,9 +59,40 @@ fi
 
 chmod +x "$DEST/node-diagnostic.sh" "$DEST"/modules/*.sh "$DEST"/lib/*.sh 2>/dev/null || true
 
+# ── команда rr ───────────────────────────────────────────────────────
+# Обёртка, а не симлинк: node-diagnostic.sh ищет lib/ рядом с собой, а рядом с
+# симлинком в /usr/local/bin тулкита нет. Не под root — перезапускает себя через sudo.
+if [ "$(id -u)" -eq 0 ]; then BIN_DIR="${ND_BIN_DIR:-/usr/local/bin}"
+else BIN_DIR="${ND_BIN_DIR:-$HOME/.local/bin}"; fi
+RR="$BIN_DIR/rr"
+if [ -e "$RR" ] && ! grep -q 'node-diagnostic' "$RR" 2>/dev/null; then
+    say "ВНИМАНИЕ: $RR уже есть и это не node-diagnostic — не перезаписываю"
+else
+    mkdir -p "$BIN_DIR"
+    cat > "$RR" <<EOF
+#!/usr/bin/env bash
+# rr — запуск node-diagnostic (ставит install.sh; источник: $REPO)
+if [ "\$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+    exec sudo bash "$DEST/node-diagnostic.sh" "\$@"
+fi
+exec bash "$DEST/node-diagnostic.sh" "\$@"
+EOF
+    chmod 755 "$RR"
+    say "команда rr → $RR"
+    case ":$PATH:" in *":$BIN_DIR:"*) ;; *) say "ВНИМАНИЕ: $BIN_DIR нет в PATH — добавь его или запускай $RR" ;; esac
+fi
+# remnawave-reverse-proxy вешает alias rr='remnawave_reverse' в /etc/bash.bashrc — alias
+# перекрывает команду в интерактивном bash, rr открывал бы чужой скрипт
+for rc in /etc/bash.bashrc "$HOME/.bashrc"; do
+    [ -w "$rc" ] && grep -qE "^[[:space:]]*alias rr=" "$rc" || continue
+    sed -i -E "s/^([[:space:]]*alias rr=.*)$/# node-diagnostic: rr теперь node-diagnostic; было: \1/" "$rc"
+    say "alias rr в $rc отключён (remnawave-reverse-proxy остаётся командой remnawave_reverse)"
+    say "  в этой сессии он ещё жив: выполни 'unalias rr' или перелогинься"
+done
+
 echo
 say "Готово. Запуск:"
-say "  sudo bash $DEST/node-diagnostic.sh"
+say "  rr          (или: sudo bash $DEST/node-diagnostic.sh)"
 
 # В терминале — сразу открыть меню. При `curl | bash` stdin занят пайпом,
 # поэтому подключаем клавиатуру через /dev/tty (иначе меню не открылось бы никогда).

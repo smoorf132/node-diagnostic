@@ -158,12 +158,55 @@ confirm() {
     read -r a
     [ "${a,,}" = "y" ] || [ "${a,,}" = "yes" ]
 }
+# Спросить строку: ask "Вопрос" VAR [дефолт] — пустой ввод берёт дефолт.
+# rc=1 на EOF (закрытый stdin): циклы ввода выходят, а не крутятся вхолостую.
+ask() {
+    local _q=$1 _var=$2 _def=${3:-} _a
+    if [ -n "$_def" ]; then
+        printf '  %s%s%s %s[Enter — %s]%s: ' "$BOLD" "$_q" "$NC" "$DIM" "$_def" "$NC"
+    else
+        printf '  %s%s%s: ' "$BOLD" "$_q" "$NC"
+    fi
+    read -r _a || return 1
+    printf -v "$_var" '%s' "${_a:-$_def}"
+}
 msg_ok()   { echo -e "    ${G}${I_OK}${NC} $*"; }
 msg_warn() { echo -e "    ${Y}${I_WARN}${NC} $*"; }
 msg_err()  { echo -e "    ${R}${I_BAD}${NC} $*"; }
 msg_info() { echo -e "    ${DIM}$*${NC}"; }
 
 die() { echo -e "${R}${BOLD}${I_BAD}${NC} $*" >&2; exit 1; }
+
+# ── скачивание (GitHub напрямую, затем прокси — для серверов, где github.com режется) ──
+GH_PREFIXES=("" "https://gh-proxy.com/" "https://ghfast.top/" "https://ghproxy.net/")
+
+download_file() {   # <url> <файл> — rc=0, только если файл скачан и не пуст
+    rm -f "$2"
+    if have curl; then
+        curl -fsSL --connect-timeout 10 --speed-limit 1024 --speed-time 60 -o "$2" "$1" 2>/dev/null || return 1
+    elif have wget; then
+        wget -q --timeout=60 --tries=1 -O "$2" "$1" 2>/dev/null || return 1
+    else
+        return 1
+    fi
+    [ -s "$2" ]
+}
+
+# Скрипт, который пойдёт под root: принимается, только если два независимых источника
+# (GitHub и/или прокси) отдали байт-в-байт одно и то же. Иначе файла нет.
+download_verified() {   # <url> <файл> <shebang, напр. /bin/bash>
+    local url=$1 dest=$2 chk="$2.check" p sum first="" agreed=0
+    rm -f "$dest" "$chk"
+    for p in "${GH_PREFIXES[@]}"; do
+        { download_file "$p$url" "$chk" && head -1 "$chk" | grep -q "^#!$3"; } || continue
+        sum=$(sha256sum "$chk" | cut -d' ' -f1)
+        if [ -z "$first" ]; then first=$sum; agreed=1
+        elif [ "$sum" = "$first" ]; then agreed=$((agreed + 1)); fi
+        [ "$agreed" -ge 2 ] && { mv -f "$chk" "$dest"; return 0; }
+    done
+    rm -f "$chk"
+    return 1
+}
 
 # ────────────────────────────────────────────────────────────────────
 # Состояние (общий findings-файл между модулями)
@@ -371,6 +414,14 @@ os_codename() {
 os_id() {
     ( . /etc/os-release 2>/dev/null; echo "${ID:-unknown}" )
 }
+
+is_ipv4() {
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    local o; for o in "${BASH_REMATCH[@]:1}"; do [ "$((10#$o))" -le 255 ] || return 1; done
+}
+
+# каталог ноды Remnawave (docker-compose.yml, .env, nginx.conf) — общий для install/protect/warp
+REMNANODE_DIR="${REMNANODE_DIR:-/opt/remnanode}"
 
 # apt-подобный дистрибутив?
 is_debian_like() {
