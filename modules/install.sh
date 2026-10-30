@@ -14,6 +14,11 @@ NETBIRD_INSTALL_URL="https://pkgs.netbird.io/install.sh"
 # CrowdSec — официальный репо packagecloud (в штатных Debian/Ubuntu древний 1.4.x без allowlists)
 CROWDSEC_REPO_URL="https://install.crowdsec.net"
 CROWDSEC_ALLOWLIST="node-diagnostic"
+# cscli (Go ≥1.24) шлёт постквантовый ClientHello (X25519MLKEM768, ~1.8 КБ — два TCP-сегмента),
+# и DPI на части маршрутов его режет: запрос к version.crowdsec.net (Cloudflare) висит до
+# «TLS handshake timeout», хотя curl на OpenSSL 3.0 проходит. Туда ходит только cscli (выбор
+# ветки хаба), демон — нет. Если Go уберёт tlsmlkem, cscli упадёт сразу с «removed GODEBUG».
+CROWDSEC_GODEBUG="tlsmlkem=0"
 # Мониторинг — версии по гайду https://wiki.egam.es/ru/configuration/grafana-monitoring-setup/
 CADVISOR_VER="0.53.0"
 NODE_EXPORTER_VER="1.9.1"
@@ -290,6 +295,21 @@ EOF
     msg_ok "acquisition SSH: $f"
 }
 
+# Пакет раз в сутки зовёт `cscli hub update` из crowdsec-hubupdate.service — ему тот же GODEBUG.
+# Нет юнита — хаб обновляется иначе (cron.daily пакета), его не трогаем.
+_cs_hubupdate_godebug() {
+    local d=/etc/systemd/system/crowdsec-hubupdate.service.d
+    systemctl cat crowdsec-hubupdate.service >/dev/null 2>&1 || return 0
+    mkdir -p "$d"
+    cat > "$d/${ND_DROPIN_PREFIX}.conf" <<EOF
+# node-diagnostic: cscli без постквантового TLS (см. CROWDSEC_GODEBUG в modules/install.sh)
+[Service]
+Environment=GODEBUG=$CROWDSEC_GODEBUG
+EOF
+    systemctl daemon-reload
+    msg_ok "crowdsec-hubupdate: GODEBUG=$CROWDSEC_GODEBUG"
+}
+
 inst_crowdsec() {
     ui_head "Установка CrowdSec" "движок + nftables-bouncer · анти-брут SSH, community-блоклист"
     need_root || die "нужен root"
@@ -317,9 +337,11 @@ inst_crowdsec() {
     echo
     msg_info "allowlist (не банятся никогда): ${allow[*]:-пусто}"
     [ -z "$ssh_ip" ] && [ -z "$nb" ] && msg_warn "SSH-IP не определён (не по SSH?) — добавь свой IP в allowlist после установки"
-    _show_cmd "curl -fsSL $CROWDSEC_REPO_URL | sh   &&   $pm install crowdsec crowdsec-firewall-bouncer-nftables"
+    _show_cmd "curl -fsSL $CROWDSEC_REPO_URL | sh   &&   GODEBUG=$CROWDSEC_GODEBUG $pm install crowdsec crowdsec-firewall-bouncer-nftables"
     confirm "Установить CrowdSec?" || { msg_info "отменено"; return 1; }
     _need_curl
+    # cscli зовут postinst пакета (`hub update`) и шаг 3 — всем без ML-KEM (см. CROWDSEC_GODEBUG)
+    local -x GODEBUG=$CROWDSEC_GODEBUG
 
     ui_head "1/4 движок" "репозиторий packagecloud + crowdsec"
     # не `curl | sh`: при сбое curl sh получит пустой ввод, вернёт 0 — и apt молча
@@ -330,6 +352,7 @@ inst_crowdsec() {
     _cs_pkg "$pm" install crowdsec || die "пакет crowdsec не установился"
     have cscli || die "cscli не появился после установки"
     msg_ok "crowdsec установлен"
+    _cs_hubupdate_godebug
 
     ui_head "2/4 allowlist" "до bouncer'а — чтобы не оборвать свою SSH-сессию"
     if ! _cs_allowlist ${allow[@]+"${allow[@]}"}; then

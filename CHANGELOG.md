@@ -33,6 +33,7 @@ WARP, IPv6 и команда `rr`. fail2ban заменён на CrowdSec; SSH м
 - **protect: fail2ban** — `fail2ban-sshd.local` больше не генерируется. В `APPLY.txt` шаг 2 теперь ставит CrowdSec, откат — `apt purge crowdsec crowdsec-firewall-bouncer-nftables`.
 
 ### Fixed
+- **install crowdsec**: на части маршрутов пакет `crowdsec` не ставился — postinst падал на `cscli hub update` с `TLS handshake timeout`, хотя `curl https://version.crowdsec.net/latest` отвечал. cscli собран на Go 1.27 и шлёт постквантовый ClientHello (X25519MLKEM768, ~1,8 КБ), который DPI на пути до Cloudflare режет; curl на OpenSSL 3.0 шлёт маленький. Теперь пакеты и коллекции ставятся с `GODEBUG=tlsmlkem=0`, а ежедневный `crowdsec-hubupdate.service` получает тот же `GODEBUG` через drop-in `99-node-diagnostic.conf`. Демон это не затрагивает: в `version.crowdsec.net` ходит только cscli.
 - **install.sh**: при обновлении существующей копии `git fetch` шёл из её старого `origin`, а не из `REPO`. Установка из апстрима `Case211` молча оставалась на нём, даже если установщик запускали из форка или с `ND_REPO`. Теперь `origin` переставляется на `REPO` с сообщением «источник: старый → новый».
 - **detect_virt**: на bare-metal `systemd-detect-virt` печатает `none` и выходит с кодом 1, поэтому `|| echo unknown` дописывал вторую строку: в баннере меню выходило `none` + `unknown`, в `diagnose` — переносы в поле Virt. `diagnose` теперь использует общий `detect_virt`.
 
