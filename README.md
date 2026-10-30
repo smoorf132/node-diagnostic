@@ -196,15 +196,15 @@ sudo bash node-diagnostic.sh install crowdsec     # CrowdSec + nftables-bouncer 
 Порт установки ноды из [eGamesAPI/remnawave-reverse-proxy](https://github.com/eGamesAPI/remnawave-reverse-proxy) (вариант с nginx) **без Caddy и ufw**. Только Debian 11+ / Ubuntu 22.04+.
 
 1. Пакеты: Docker (get.docker.com → проверенная копия с зеркала → `docker.io` из дистрибутива), certbot, `dig`, `jq`, cron, зеркала Docker Hub (`mirror.gcr.io`, `dockerhub.timeweb.cloud`), unattended-upgrades. BBR не трогает: это делает `optimize`.
-2. Проверки: на сервере не запущены `remnanode`/`remnawave-nginx`, порт 443 свободен.
+2. Проверки: на сервере не запущены `remnanode`/`remnawave-nginx`, свободны порты 443 (xray ноды) и 80 (nginx, редирект на https).
 3. Selfsteal-домен: A-запись должна указывать на сервер **без прокси Cloudflare**. Если записи нет или она чужая, её можно создать через API Cloudflare / Gcore / Bunny или вручную (установщик ждёт, пока запись появится).
 4. IP панели, `SECRET_KEY` из карточки ноды (можно вставить целиком вместе с `NODE_PORT=`), `NODE_PORT` (по умолчанию 2222).
 5. Сертификат: уже есть подходящий — берётся он; нет — выпускается (см. `certs`). Если A-запись только что создана через API провайдера, wildcard выпускается тем же провайдером без вопроса.
-6. `/opt/remnanode`: `docker-compose.yml` (nginx + remnanode, `network_mode: host`), `.env` (`NODE_PORT`, `SECRET_KEY`, права 600), `nginx.conf`. Прежние конфиги сохраняются как `*.bak-<время>`.
+6. `/opt/remnanode`: `docker-compose.yml` (nginx + remnanode, `network_mode: host`), `.env` (`NODE_PORT`, `SECRET_KEY`, права 600), `nginx.conf` (сайт, монтируется в `conf.d/default.conf`), `nginx-main.conf` (главный `/etc/nginx/nginx.conf` контейнера: воркеры, буферы, gzip, `log_format proxy_protocol`). Прежние конфиги сохраняются как `*.bak-<время>`.
 7. Случайный шаблон сайта-маскировки в `/var/www/html` из одного из трёх наборов: simple-web-templates, sni-templates, nothing-sni. Title, meta и классы рандомизируются.
 8. `docker compose up -d` и проверка, что `https://домен` отвечает сайтом.
 
-nginx слушает только unix-сокет `/dev/shm/nginx.sock` с `proxy_protocol`. В профиле Xray в панели: Reality `target` = `/dev/shm/nginx.sock`, `xver: 1`, `serverNames: ["домен"]`. ufw нет, поэтому `NODE_PORT` открыт всем, пока его не закроет firewall. Установщик в конце подсказывает команду `rr protect --panel-ip … --node-port …`; `protect` и сам находит порт в `/opt/remnanode/.env`.
+nginx принимает selfsteal только на unix-сокете `/dev/shm/nginx.sock` с `proxy_protocol` (TLS 1.3, access-лог с реальным IP клиента, неизвестные SNI — обрыв рукопожатия), а на `:80` отвечает редиректом на https. При продлении HTTP-01 certbot на время останавливает `remnawave-nginx` (pre/post-хуки), чтобы освободить 80. В профиле Xray в панели: Reality `target` = `/dev/shm/nginx.sock`, `xver: 1`, `serverNames: ["домен"]`. ufw нет, поэтому `NODE_PORT` открыт всем, пока его не закроет firewall. Установщик в конце подсказывает команду `rr protect --panel-ip … --node-port …`; `protect` и сам находит порт в `/opt/remnanode/.env`.
 
 ### WARP Native (`warp`)
 

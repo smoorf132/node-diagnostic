@@ -164,13 +164,14 @@ node_check_existing() {
     fi
 }
 
-# 443 займёт xray ноды: чужой слушатель (Caddy от другого установщика и т.п.) — стоп
-node_port443_free() {
+# 443 займёт xray ноды, 80 — nginx (редирект на https): чужой слушатель
+# (Caddy/apache от другого установщика и т.п.) — стоп до записи конфигов
+node_port_free() {   # <порт> <кто его займёт>
     local who
-    who=$(ss -Htlnp 'sport = :443' 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | sort -u | paste -sd, -)
-    if [ -z "$who" ] && ss -Htln 'sport = :443' 2>/dev/null | grep -q .; then who="неизвестный процесс"; fi
+    who=$(ss -Htlnp "sport = :$1" 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | sort -u | paste -sd, -)
+    if [ -z "$who" ] && ss -Htln "sport = :$1" 2>/dev/null | grep -q .; then who="неизвестный процесс"; fi
     [ -z "$who" ] && return 0
-    die "порт 443 занят ($who) — его должен занять xray ноды. Останови сервис и запусти установку снова"
+    die "порт $1 занят ($who) — его должен занять $2. Останови сервис и запусти установку снова"
 }
 
 # SECRET_KEY из карточки ноды: вставка в несколько строк, конец — пустая строка.
@@ -225,6 +226,7 @@ services:
     <<: [*common, *logging]
     network_mode: host
     volumes:
+      - ./nginx-main.conf:/etc/nginx/nginx.conf:ro
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - $LE_LIVE/$l/fullchain.pem:/etc/nginx/ssl/$l/fullchain.pem:ro
       - $LE_LIVE/$l/privkey.pem:/etc/nginx/ssl/$l/privkey.pem:ro
@@ -248,8 +250,11 @@ services:
 EOF
 }
 
-# selfsteal: xray (Reality, xver 1) отдаёт «чужие» TLS-соединения на unix-сокет,
-# nginx отвечает сайтом-заглушкой; неизвестные SNI — обрыв рукопожатия
+# Сайт selfsteal (conf.d/default.conf): xray (Reality, xver 1) отдаёт «чужие»
+# TLS-соединения на unix-сокет, nginx отвечает сайтом-заглушкой; неизвестные SNI —
+# обрыв рукопожатия; :80 — редирект на https, как у обычного сайта.
+# access_log в формате proxy_protocol (реальный IP клиента) — формат объявлен в
+# nginx-main.conf, без него nginx не стартует.
 node_render_nginx() {   # <каталог> <домен> <каталог сертификата в live/>
     local d=$2 l=$3
     cat > "$1/nginx.conf" <<EOF
@@ -260,13 +265,9 @@ map \$http_upgrade \$connection_upgrade {
     default upgrade;
     ""      close;
 }
-
-ssl_protocols TLSv1.2 TLSv1.3;
-ssl_ecdh_curve X25519:prime256v1:secp384r1;
-ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305';
-ssl_prefer_server_ciphers on;
-ssl_session_timeout 1d;
-ssl_session_cache shared:MozSSL:10m;
+ssl_protocols       TLSv1.3;
+ssl_session_timeout 1h;
+ssl_session_cache   shared:SSL:10m;
 ssl_session_tickets off;
 
 server {
@@ -278,9 +279,33 @@ server {
     ssl_certificate_key "/etc/nginx/ssl/$l/privkey.pem";
     ssl_trusted_certificate "/etc/nginx/ssl/$l/fullchain.pem";
 
+    # OCSP Stapling (faster TLS handshake)
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    resolver 1.1.1.1 8.8.8.8 valid=300s;
+    resolver_timeout 5s;
+
+    # Logging (proxy_protocol format includes real client IP)
+    access_log /var/log/nginx/access.log proxy_protocol;
+    error_log /var/log/nginx/error.log warn;
+
     root /var/www/html;
     index index.html;
-    add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet, noimageindex" always;
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+
+    # Cache static files
+    location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)\$ {
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+    }
 }
 
 server {
@@ -290,7 +315,84 @@ server {
     ssl_reject_handshake on;
     return 444;
 }
+
+server {
+    listen 80 default_server;
+    server_name _;
+    return 301 https://\$host\$request_uri;
+}
 EOF
+}
+
+# Главный /etc/nginx/nginx.conf контейнера: воркеры, лимиты, буферы, gzip и
+# log_format proxy_protocol, на который ссылается сайт
+node_render_nginx_main() {   # <каталог>
+    {
+        echo "# Managed by node-diagnostic ($ND_VERSION): rr install node"
+        cat <<'EOF'
+user nginx;
+worker_processes auto;
+worker_rlimit_nofile 131072;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 65535;
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+
+    log_format proxy_protocol '$proxy_protocol_addr - $remote_user [$time_local] "$request" '
+                              '$status $body_bytes_sent "$http_referer" '
+                              '"$http_user_agent"';
+
+    access_log /var/log/nginx/access.log main;
+
+    # Performance optimizations
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    keepalive_requests 1000;
+    types_hash_max_size 2048;
+    server_tokens off;
+
+    # Buffer optimizations
+    client_body_buffer_size 16k;
+    client_header_buffer_size 1k;
+    client_max_body_size 8m;
+    large_client_header_buffers 4 8k;
+
+    # Open file cache for static files
+    open_file_cache max=10000 inactive=30s;
+    open_file_cache_valid 60s;
+    open_file_cache_min_uses 2;
+    open_file_cache_errors on;
+
+    # Gzip compression (aggressive)
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_min_length 256;
+    gzip_buffers 16 8k;
+    gzip_types text/plain text/css text/xml text/javascript application/json application/javascript
+               application/xml application/rss+xml application/atom+xml image/svg+xml
+               application/x-javascript application/xhtml+xml application/x-font-ttf
+               font/opentype image/x-icon;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+EOF
+    } > "$1/nginx-main.conf"
 }
 
 # ── шаблон selfsteal-сайта ───────────────────────────────────────────
@@ -391,7 +493,7 @@ node_wait_https() {   # <домен>
 node_backup_old() {
     local ts f n=0
     ts=$(date +%Y%m%d-%H%M%S)
-    for f in docker-compose.yml .env nginx.conf; do
+    for f in docker-compose.yml .env nginx.conf nginx-main.conf; do
         [ -e "$REMNANODE_DIR/$f" ] || continue
         cp -a "$REMNANODE_DIR/$f" "$REMNANODE_DIR/$f.bak-$ts" && n=$((n + 1))
     done
@@ -406,12 +508,14 @@ node_install() {
     [ -t 0 ] || die "нужен интерактивный терминал — установка спрашивает домен, IP панели и ключ"
     have systemctl || die "нужен systemd"
     node_check_os
-    msg_info "будет: Docker + certbot, сертификат, $REMNANODE_DIR/{docker-compose.yml,.env,nginx.conf}, сайт в $WEB_ROOT"
+    msg_info "будет: Docker + certbot, сертификат, $REMNANODE_DIR/{docker-compose.yml,.env,nginx.conf,nginx-main.conf}, сайт в $WEB_ROOT"
+    msg_info "порты: 443 — xray ноды, 80 — nginx (редирект на https)"
     confirm "Продолжить?" || { msg_info "отменено"; return 1; }
 
     node_packages || die "подготовка пакетов не удалась"
     node_check_existing
-    node_port443_free
+    node_port_free 443 "xray ноды"
+    node_port_free 80 "nginx ноды (редирект http→https)"
 
     local domain pip port lineage
     ui_head "Параметры ноды" ""
@@ -452,7 +556,8 @@ node_install() {
     node_render_env "$REMNANODE_DIR" "$port" "$NODE_SECRET"
     node_render_compose "$REMNANODE_DIR" "$lineage"
     node_render_nginx "$REMNANODE_DIR" "$domain" "$lineage"
-    msg_ok "docker-compose.yml · .env (NODE_PORT=$port) · nginx.conf"
+    node_render_nginx_main "$REMNANODE_DIR"
+    msg_ok "docker-compose.yml · .env (NODE_PORT=$port) · nginx.conf (сайт) · nginx-main.conf"
 
     ui_head "Сайт-заглушка" "случайный шаблон selfsteal"
     selfsteal_template "$WEB_ROOT" || msg_warn "шаблон не поставлен — положи свой сайт в $WEB_ROOT (index.html), иначе nginx отдаст пустой каталог"

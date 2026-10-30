@@ -150,12 +150,13 @@ fn=$(bash -c 'source lib/common.sh; source modules/node.sh
     echo yes' 2>/dev/null)
 [ "$fn" = "yes" ] && ok "extract_domain / cert_covers_domain / is_domain" || bad "extract_domain / cert_covers_domain / is_domain"
 
-echo "== нода: рендер docker-compose.yml / .env / nginx.conf =="
+echo "== нода: рендер docker-compose.yml / .env / nginx.conf / nginx-main.conf =="
 nd=$(mktemp -d)
 bash -c 'source lib/common.sh; source modules/node.sh
     node_render_env "$1" 2222 eyJhbGciOiJIUzI1NiJ9.dGVzdC1zZWNyZXQ
     node_render_compose "$1" example.com
-    node_render_nginx "$1" node.example.com example.com' _ "$nd" >/dev/null 2>&1
+    node_render_nginx "$1" node.example.com example.com
+    node_render_nginx_main "$1"' _ "$nd" >/dev/null 2>&1
 if grep -qx 'NODE_PORT=2222' "$nd/.env" 2>/dev/null && grep -q '^SECRET_KEY=eyJ' "$nd/.env" \
    && [ "$(stat -c %a "$nd/.env" 2>/dev/null)" = "600" ]; then
     ok ".env (NODE_PORT, SECRET_KEY, 600)"
@@ -165,8 +166,10 @@ fi
 if grep -q 'env_file:' "$nd/docker-compose.yml" 2>/dev/null \
    && grep -qF '/etc/letsencrypt/live/example.com/fullchain.pem:/etc/nginx/ssl/example.com/fullchain.pem:ro' "$nd/docker-compose.yml" \
    && grep -qF "rm -f /dev/shm/nginx.sock && exec nginx" "$nd/docker-compose.yml" \
+   && grep -qF './nginx-main.conf:/etc/nginx/nginx.conf:ro' "$nd/docker-compose.yml" \
+   && grep -qF './nginx.conf:/etc/nginx/conf.d/default.conf:ro' "$nd/docker-compose.yml" \
    && ! grep -qiE 'caddy|ufw' "$nd/docker-compose.yml"; then
-    ok "docker-compose.yml (nginx + remnanode, маунты сертификата, без Caddy)"
+    ok "docker-compose.yml (nginx + remnanode, маунты конфигов и сертификата, без Caddy)"
 else
     bad "docker-compose.yml"
 fi
@@ -174,13 +177,43 @@ if grep -q 'server_name node.example.com;' "$nd/nginx.conf" 2>/dev/null \
    && grep -q 'listen unix:/dev/shm/nginx.sock ssl proxy_protocol;' "$nd/nginx.conf" \
    && grep -qF 'ssl_certificate "/etc/nginx/ssl/example.com/fullchain.pem";' "$nd/nginx.conf" \
    && grep -qF 'map $http_upgrade $connection_upgrade' "$nd/nginx.conf" \
-   && grep -q 'ssl_reject_handshake on;' "$nd/nginx.conf"; then
-    ok "nginx.conf (selfsteal на unix-сокете, reject неизвестных SNI)"
+   && grep -qF 'try_files $uri $uri/ /index.html;' "$nd/nginx.conf" \
+   && grep -qF 'access_log /var/log/nginx/access.log proxy_protocol;' "$nd/nginx.conf" \
+   && grep -q 'ssl_reject_handshake on;' "$nd/nginx.conf" \
+   && grep -q 'listen 80 default_server;' "$nd/nginx.conf" \
+   && grep -qF 'return 301 https://$host$request_uri;' "$nd/nginx.conf"; then
+    ok "nginx.conf (selfsteal на unix-сокете, reject неизвестных SNI, :80 → https)"
 else
     bad "nginx.conf"
 fi
-if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    (cd "$nd" && docker compose config -q) >/dev/null 2>&1 && ok "docker compose config" || bad "docker compose config"
+if grep -qF "log_format proxy_protocol '\$proxy_protocol_addr" "$nd/nginx-main.conf" 2>/dev/null \
+   && grep -q 'worker_rlimit_nofile 131072;' "$nd/nginx-main.conf" \
+   && grep -q 'server_tokens off;' "$nd/nginx-main.conf" \
+   && grep -qF 'include /etc/nginx/conf.d/*.conf;' "$nd/nginx-main.conf"; then
+    ok "nginx-main.conf (log_format proxy_protocol для сайта, include conf.d)"
+else
+    bad "nginx-main.conf"
+fi
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    if docker compose version >/dev/null 2>&1; then
+        (cd "$nd" && docker compose config -q) >/dev/null 2>&1 && ok "docker compose config" || bad "docker compose config"
+    fi
+    # оба конфига целиком через nginx -t в том же образе, что ставит нода;
+    # сертификат самоподписанный — на OCSP stapling nginx только предупреждает
+    if command -v openssl >/dev/null 2>&1; then
+        img=$(bash -c 'source lib/common.sh; source modules/node.sh; echo "$NGINX_IMAGE"')
+        mkdir -p "$nd/ssl/example.com"
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 -nodes -days 1 \
+            -subj /CN=node.example.com -keyout "$nd/ssl/example.com/privkey.pem" \
+            -out "$nd/ssl/example.com/fullchain.pem" >/dev/null 2>&1
+        if nt=$(docker run --rm -v "$nd/nginx-main.conf:/etc/nginx/nginx.conf:ro" \
+                -v "$nd/nginx.conf:/etc/nginx/conf.d/default.conf:ro" \
+                -v "$nd/ssl:/etc/nginx/ssl:ro" "$img" nginx -t 2>&1); then
+            ok "nginx -t ($img): nginx-main.conf + nginx.conf"
+        else
+            bad "nginx -t ($img)"; printf '%s\n' "$nt" | tail -n 5 | sed 's/^/      /'
+        fi
+    fi
 fi
 
 echo "== protect: NODE_PORT из docker-compose.yml ноды =="
