@@ -20,7 +20,7 @@ source "$_node_self/certs.sh" || { echo "не найден modules/certs.sh" >&2
 
 # ── источники и версии (обнови здесь) ────────────────────────────────
 NODE_IMAGE="remnawave/node:latest"
-NGINX_IMAGE="nginx:1.30"
+NGINX_IMAGE="nginx:1.30.6-alpine"
 NODE_PORT_DEFAULT=2222
 NGINX_SOCK="/dev/shm/nginx.sock"
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
