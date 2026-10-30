@@ -254,7 +254,8 @@ EOF
 # TLS-соединения на unix-сокет, nginx отвечает сайтом-заглушкой; неизвестные SNI —
 # обрыв рукопожатия; :80 — редирект на https, как у обычного сайта.
 # access_log в формате proxy_protocol (реальный IP клиента) — формат объявлен в
-# nginx-main.conf, без него nginx не стартует.
+# nginx-main.conf, без него nginx не стартует. OCSP stapling нет: Let's Encrypt
+# с 2025 не пишет OCSP-URL в сертификаты и выключил респондеры — nginx его игнорирует.
 node_render_nginx() {   # <каталог> <домен> <каталог сертификата в live/>
     local d=$2 l=$3
     cat > "$1/nginx.conf" <<EOF
@@ -278,12 +279,6 @@ server {
     ssl_certificate "/etc/nginx/ssl/$l/fullchain.pem";
     ssl_certificate_key "/etc/nginx/ssl/$l/privkey.pem";
     ssl_trusted_certificate "/etc/nginx/ssl/$l/fullchain.pem";
-
-    # OCSP Stapling (faster TLS handshake)
-    ssl_stapling on;
-    ssl_stapling_verify on;
-    resolver 1.1.1.1 8.8.8.8 valid=300s;
-    resolver_timeout 5s;
 
     # Logging (proxy_protocol format includes real client IP)
     access_log /var/log/nginx/access.log proxy_protocol;
@@ -325,7 +320,9 @@ EOF
 }
 
 # Главный /etc/nginx/nginx.conf контейнера: воркеры, лимиты, буферы, gzip и
-# log_format proxy_protocol, на который ссылается сайт
+# log_format proxy_protocol, на который ссылается сайт. worker_connections 4096:
+# таблица соединений выделяется заранее (~450 байт × N на воркер), а до nginx
+# через xray доходят только зонды и редкие заходы на сайт
 node_render_nginx_main() {   # <каталог>
     {
         echo "# Managed by node-diagnostic ($ND_VERSION): rr install node"
@@ -337,7 +334,7 @@ error_log /var/log/nginx/error.log warn;
 pid /var/run/nginx.pid;
 
 events {
-    worker_connections 65535;
+    worker_connections 4096;
     use epoll;
     multi_accept on;
 }

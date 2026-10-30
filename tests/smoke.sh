@@ -181,13 +181,15 @@ if grep -q 'server_name node.example.com;' "$nd/nginx.conf" 2>/dev/null \
    && grep -qF 'access_log /var/log/nginx/access.log proxy_protocol;' "$nd/nginx.conf" \
    && grep -q 'ssl_reject_handshake on;' "$nd/nginx.conf" \
    && grep -q 'listen 80 default_server;' "$nd/nginx.conf" \
-   && grep -qF 'return 301 https://$host$request_uri;' "$nd/nginx.conf"; then
-    ok "nginx.conf (selfsteal на unix-сокете, reject неизвестных SNI, :80 → https)"
+   && grep -qF 'return 301 https://$host$request_uri;' "$nd/nginx.conf" \
+   && ! grep -qE 'ssl_stapling|resolver' "$nd/nginx.conf"; then
+    ok "nginx.conf (selfsteal на unix-сокете, reject неизвестных SNI, :80 → https, без OCSP)"
 else
     bad "nginx.conf"
 fi
 if grep -qF "log_format proxy_protocol '\$proxy_protocol_addr" "$nd/nginx-main.conf" 2>/dev/null \
    && grep -q 'worker_rlimit_nofile 131072;' "$nd/nginx-main.conf" \
+   && grep -q 'worker_connections 4096;' "$nd/nginx-main.conf" \
    && grep -q 'server_tokens off;' "$nd/nginx-main.conf" \
    && grep -qF 'include /etc/nginx/conf.d/*.conf;' "$nd/nginx-main.conf"; then
     ok "nginx-main.conf (log_format proxy_protocol для сайта, include conf.d)"
@@ -198,8 +200,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     if docker compose version >/dev/null 2>&1; then
         (cd "$nd" && docker compose config -q) >/dev/null 2>&1 && ok "docker compose config" || bad "docker compose config"
     fi
-    # оба конфига целиком через nginx -t в том же образе, что ставит нода;
-    # сертификат самоподписанный — на OCSP stapling nginx только предупреждает
+    # оба конфига целиком через nginx -t в том же образе, что ставит нода
     if command -v openssl >/dev/null 2>&1; then
         img=$(bash -c 'source lib/common.sh; source modules/node.sh; echo "$NGINX_IMAGE"')
         mkdir -p "$nd/ssl/example.com"
