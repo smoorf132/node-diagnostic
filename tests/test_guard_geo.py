@@ -6,6 +6,7 @@ import io
 import ipaddress
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -61,6 +62,52 @@ class GuardGeoTest(unittest.TestCase):
     def test_sanity_rejects_small(self):
         ok, reason = guard_geo.sanity([net(x) for x in ("5.3.0.0/23", "5.3.2.0/24", "5.3.3.0/25", "5.3.3.128/26", "5.3.3.192/27", "5.3.3.224/29")], [], (25000000, 3000, 300))
         self.assertEqual((ok, reason), (False, "мало v4-адресов: 1000 < 25000000"))
+
+    def test_sanity_rejects_too_many_prefixes(self):
+        v4 = [net(x) for x in ("5.3.0.0/16", "5.4.0.0/16", "5.5.0.0/16")]
+        v6 = [net("2a00:1fa0::/32"), net("2a00:1fa1::/32")]
+        self.assertEqual(guard_geo.sanity(v4, v6, (1, 1, 1), (2, 10)),
+                         (False, "много v4-префиксов: 3 > 2 (geo-карта — %d)" % guard_geo.GEO_MAP_CAPACITY))
+        self.assertEqual(guard_geo.sanity(v4, v6, (1, 1, 1), (10, 1)),
+                         (False, "много v6-префиксов: 2 > 1 (geo-карта — %d)" % guard_geo.GEO_MAP_CAPACITY))
+        self.assertEqual(guard_geo.sanity(v4, v6, (1, 1, 1), (3, 2)), (True, ""))
+
+    def test_build_too_many_prefixes_rc3_keeps_old(self):
+        old = os.path.join(self.tmp, "geo4.txt")
+        with open(old, "wb") as f:
+            f.write(b"1.2.3.0/24\n")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = guard_geo.main(["build", "--cc", "RU", "--out-dir", self.tmp, "--ripe", RIPE,
+                                 "--max-v4-prefixes", "1"] + LOW)
+        self.assertEqual(rc, 3)
+        self.assertIn("много v4-префиксов: 2 > 1", err.getvalue())
+        self.assertEqual(read(old), b"1.2.3.0/24\n")
+
+    def test_capacity_in_sync_with_bpf_maps(self):
+        # max_entries geo4_map/geo6_map = GUARD_GEO_MAX_ENTRIES (C) = GEO_MAP_CAPACITY (python)
+        with open(os.path.join(REPO, "modules", "nd-guard-xdp.bpf.c"), encoding="utf-8") as f:
+            src = f.read()
+        m = re.search(r"^#define GUARD_GEO_MAX_ENTRIES (\d+)\s*$", src, re.M)
+        self.assertIsNotNone(m, "нет #define GUARD_GEO_MAX_ENTRIES в nd-guard-xdp.bpf.c")
+        self.assertEqual(int(m.group(1)), guard_geo.GEO_MAP_CAPACITY)
+        for name in ("geo4_map", "geo6_map"):
+            body = re.search(r"struct \{([^}]*)\} %s SEC" % name, src)
+            self.assertIsNotNone(body, name)
+            self.assertIn("__uint(max_entries, GUARD_GEO_MAX_ENTRIES);", body.group(1), name)
+        # верхняя граница по умолчанию: старый и новый список вместе (geo-sync: add, потом delete) влезают
+        self.assertLessEqual(2 * guard_geo.GEO_MAX_PREFIXES, guard_geo.GEO_MAP_CAPACITY)
+        # флаги по умолчанию берут GEO_MAX_PREFIXES (фикстура: v4 — 2 префикса)
+        saved = guard_geo.GEO_MAX_PREFIXES
+        self.addCleanup(setattr, guard_geo, "GEO_MAX_PREFIXES", saved)
+        guard_geo.GEO_MAX_PREFIXES = 1
+        self.assertEqual(run_main(["build", "--cc", "RU", "--out-dir", self.tmp, "--ripe", RIPE] + LOW), 3)
+        guard_geo.GEO_MAX_PREFIXES = saved
+        self.assertEqual(run_main(["build", "--cc", "RU", "--out-dir", self.tmp, "--ripe", RIPE] + LOW), 0)
+        # реальный RU (RIPEstat ∪ db-ip, 2026-11; один db-ip — 12902/10152): ёмкость ≥ 4× замера
+        for measured in (11679, 8580, 12902, 10152):
+            self.assertLessEqual(4 * measured, guard_geo.GEO_MAP_CAPACITY)
+            self.assertLess(measured, guard_geo.GEO_MAX_PREFIXES)
 
     def test_build_keeps_old_files_on_sanity_fail(self):
         old = {"geo4.txt": b"1.2.3.0/24\n", "geo6.txt": b"2001:db8::/32\n", "geo.meta": b"{}"}

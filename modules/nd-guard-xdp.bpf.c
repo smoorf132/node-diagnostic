@@ -24,9 +24,16 @@
 #include "nd-guard.h"
 #include "nd-guard-cookie.h"
 
+/* Ёмкость geo4_map/geo6_map. Реальный RU (RIPEstat ∪ db-ip, 2026-11): v4 11679, v6 8580 префиксов;
+ * один db-ip — v4 12902, v6 10152. Здесь ≥ 4× с запасом на рост, степень двойки; LPM с
+ * BPF_F_NO_PREALLOC платит память только за занятые узлы. guard_geo.py: GEO_MAP_CAPACITY — то же
+ * число (tests/test_guard_geo.py сверяет), верхняя граница списка — половина (geo-sync сначала
+ * добавляет новые префиксы, потом удаляет старые: в карте временно оба списка). */
+#define GUARD_GEO_MAX_ENTRIES 131072
+
 struct {
 	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
-	__uint(max_entries, 65536);
+	__uint(max_entries, GUARD_GEO_MAX_ENTRIES);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, struct lpm4);
 	__type(value, __u8);
@@ -34,7 +41,7 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
-	__uint(max_entries, 65536);
+	__uint(max_entries, GUARD_GEO_MAX_ENTRIES);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, struct lpm6);
 	__type(value, __u8);

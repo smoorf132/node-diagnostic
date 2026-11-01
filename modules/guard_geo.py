@@ -6,8 +6,8 @@
   --dbip FILE  db-ip country lite CSV (start,end,cc), .csv или .csv.gz
 
 Результат: DIR/geo4.txt, DIR/geo6.txt (по CIDR на строку), DIR/geo.meta (json).
-rc 0 — записано; rc 3 — проверка здравости не прошла (файлы не тронуты);
-rc 4 — ни один источник не распарсился (файлы не тронуты).
+rc 0 — записано; rc 3 — проверка здравости не прошла (мало адресов/префиксов или префиксов больше,
+чем влезет в geo-карту XDP; файлы не тронуты); rc 4 — ни один источник не распарсился (файлы не тронуты).
 Только stdlib, совместимо с Python 3.9.
 """
 import argparse
@@ -18,6 +18,12 @@ import ipaddress
 import json
 import os
 import sys
+
+# = GUARD_GEO_MAX_ENTRIES в modules/nd-guard-xdp.bpf.c (max_entries geo4_map/geo6_map); меняются вместе,
+# tests/test_guard_geo.py сверяет. Верхняя граница списка по умолчанию — половина: geo-sync сначала
+# добавляет новые префиксы, потом удаляет старые, и в карте временно лежат оба списка (иначе ENOSPC).
+GEO_MAP_CAPACITY = 131072
+GEO_MAX_PREFIXES = GEO_MAP_CAPACITY // 2
 
 
 def _addr_range(a, b):
@@ -79,9 +85,11 @@ def _addrs(nets):
     return sum(n.num_addresses for n in nets)
 
 
-def sanity(v4, v6, mins):
-    """mins = (мин. v4-адресов, мин. v4-префиксов, мин. v6-префиксов) -> (ok, причина)."""
+def sanity(v4, v6, mins, maxs=(GEO_MAX_PREFIXES, GEO_MAX_PREFIXES)):
+    """mins = (мин. v4-адресов, мин. v4-префиксов, мин. v6-префиксов),
+    maxs = (макс. v4-префиксов, макс. v6-префиксов) -> (ok, причина)."""
     min_addrs, min_p4, min_p6 = mins
+    max_p4, max_p6 = maxs
     a = _addrs(v4)
     if a < min_addrs:
         return False, "мало v4-адресов: %d < %d" % (a, min_addrs)
@@ -89,6 +97,10 @@ def sanity(v4, v6, mins):
         return False, "мало v4-префиксов: %d < %d" % (len(v4), min_p4)
     if len(v6) < min_p6:
         return False, "мало v6-префиксов: %d < %d" % (len(v6), min_p6)
+    if len(v4) > max_p4:
+        return False, "много v4-префиксов: %d > %d (geo-карта — %d)" % (len(v4), max_p4, GEO_MAP_CAPACITY)
+    if len(v6) > max_p6:
+        return False, "много v6-префиксов: %d > %d (geo-карта — %d)" % (len(v6), max_p6, GEO_MAP_CAPACITY)
     return True, ""
 
 
@@ -137,7 +149,8 @@ def cmd_build(args):
         _err("ни один источник не распарсился")
         return 4
     v4, v6 = merge(*v4s), merge(*v6s)
-    ok, reason = sanity(v4, v6, (args.min_v4_addrs, args.min_v4_prefixes, args.min_v6_prefixes))
+    ok, reason = sanity(v4, v6, (args.min_v4_addrs, args.min_v4_prefixes, args.min_v6_prefixes),
+                        (args.max_v4_prefixes, args.max_v6_prefixes))
     if not ok:
         _err("проверка здравости не прошла: %s" % reason)
         return 3
@@ -163,6 +176,8 @@ def main(argv=None):
     b.add_argument("--min-v4-addrs", type=int, default=25000000)
     b.add_argument("--min-v4-prefixes", type=int, default=3000)
     b.add_argument("--min-v6-prefixes", type=int, default=300)
+    b.add_argument("--max-v4-prefixes", type=int, default=GEO_MAX_PREFIXES)
+    b.add_argument("--max-v6-prefixes", type=int, default=GEO_MAX_PREFIXES)
     args = p.parse_args(argv)
     if args.cmd != "build":
         p.print_usage(sys.stderr)
