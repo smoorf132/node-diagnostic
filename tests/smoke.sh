@@ -302,6 +302,12 @@ _guard_iface_ether '2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq
   && ! _guard_iface_ether '5: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\    link/none ' \
   && ! _guard_iface_ether '7: ppp0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1492 qdisc fq state UNKNOWN qlen 3\    link/ppp ' \
   && ok "iface_ether: link/ether — да; link/none, link/ppp — нет" || bad "iface_ether"
+# F8: cookie_sent ≥ 100 при cookie_ok = 0 — драйвер теряет XDP_TX; подсказка сохраняет вариант
+_guard_xdp_tx_lost 100 0 2>/dev/null && ! _guard_xdp_tx_lost 99 0 && ! _guard_xdp_tx_lost 5000 1 && ! _guard_xdp_tx_lost "" 0 \
+  && ok "xdp_tx_lost: 100/0 — да; 99/0, 5000/1 — нет" || bad "xdp_tx_lost"
+[ "$(_guard_cookies_off_cmd ru 443,80 eth0 eth0 2>/dev/null)" = "rr guard on --geo ru --cookies off" ] \
+  && [ "$(_guard_cookies_off_cmd off 443 ens3 eth0)" = "rr guard on --ports 443 --iface ens3 --cookies off" ] \
+  && ok "cookies_off_cmd: вариант, порты и интерфейс сохраняются" || bad "cookies_off_cmd"
 printf '%s\n' "$gr" | grep -q 'iifname "eth0" tcp dport { 443, 80 } notrack' && printf '%s\n' "$gr" | grep -q 'priority raw' \
   && ok "notrack tcp in, priority raw" || bad "notrack tcp in"
 # фейковый docker в PATH: опубликованный :443 → конфликт (печать имени); host-сеть и :8443->443 — нет

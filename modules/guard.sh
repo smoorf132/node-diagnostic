@@ -89,6 +89,24 @@ _guard_rcv_wscale() {
 # Generic XDP без дела не вешаем: он линеаризует GRO-пакеты и съедает пропускную способность.
 _guard_need_xdp() { [ "$1" = ru ] || { [ "$2" != off ] && [ "$3" = 1 ]; }; }
 
+# COOKIE_SENT COOKIE_OK → rc 0, если cookie-ответы уходят (≥ 100), а ни одно соединение по ним не
+# завершилось: похоже, драйвер принимает XDP, но молча теряет XDP_TX (R13: только предупреждение в status)
+_guard_xdp_tx_lost() {
+    case "$1" in '' | *[!0-9]*) return 1 ;; esac
+    case "$2" in '' | *[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 100 ] 2>/dev/null && [ "$2" -eq 0 ] 2>/dev/null
+}
+
+# GEO PORTS IFACE DEFAULT_IFACE → команда «тот же вариант, но cookies off»: on начинает с умолчаний,
+# поэтому гео, нестандартные порты и интерфейс повторяются явно
+_guard_cookies_off_cmd() {
+    local c="rr guard on"
+    [ "$1" = ru ] && c="$c --geo ru"
+    [ -n "$2" ] && [ "$2" != 443,80 ] && c="$c --ports $2"
+    [ -n "$3" ] && [ "$3" != "$4" ] && c="$c --iface $3"
+    echo "$c --cookies off"
+}
+
 # COOKIES HAS_KFUNC → режим cookies с учётом ядра: без kfunc — off
 _guard_effective_cookies() { if [ "$2" = 1 ]; then echo "$1"; else echo off; fi; }
 
@@ -1096,7 +1114,7 @@ guard_hook() {   # certbot pre|post (D7): только вариант 1 и то�
 }
 
 guard_status() {
-    local conf=0 root=0 ifc xm="" tcon=0 nft=0 v s n att now
+    local conf=0 root=0 ifc xm="" tcon=0 nft=0 v s n att now txlost=0
     [ $# -eq 0 ] || _guard_badarg "status: лишние аргументы"
     _guard_defaults
     need_root && root=1
@@ -1161,6 +1179,11 @@ guard_status() {
         box_kv "Счётчики" "$(echo "$s" | cut -d' ' -f1-3)"
         box_kv "" "$(echo "$s" | cut -d' ' -f4-6)"
         box_kv "" "$(echo "$s" | cut -d' ' -f7-)"
+        if _guard_xdp_tx_lost "$(echo "$s" | sed -n 's/.*cookie_sent=\([0-9]*\).*/\1/p')" \
+            "$(echo "$s" | sed -n 's/.*cookie_ok=\([0-9]*\).*/\1/p')"; then
+            txlost=1
+            box_kv "${I_WARN} XDP_TX" "cookie-ответы уходят, соединений по ним — 0"
+        fi
     fi
     if _guard_deadman_armed; then
         box_kv "Dead-man" "взведён — подтвердить: guard confirm"
@@ -1168,6 +1191,9 @@ guard_status() {
         box_kv "Dead-man" "не подтверждён: reboot откатит — guard confirm"
     fi
     box_bottom
+    if [ "$txlost" = 1 ]; then   # F8/R13: только сигнал, без watchdog
+        msg_warn "cookie-ответы уходят, но ни одно соединение не завершилось — похоже, драйвер теряет XDP_TX; выключи cookies: $(_guard_cookies_off_cmd "$G_GEO" "$G_PORTS" "$G_IFACE" "$(default_iface)") (вариант сохранится)"
+    fi
     return 0
 }
 
