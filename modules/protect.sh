@@ -5,7 +5,7 @@
 # удалённой ноде может отрезать SSH, поэтому применяешь руками, сверив IP панели/SSH.
 # Анти-брут SSH — CrowdSec, ставится отдельно: node-diagnostic.sh install crowdsec.
 #
-# Standalone:  sudo bash modules/protect.sh [--panel-ip X.X.X.X] [--node-port N] [--ssh-from IP|CIDR] [--allow IP|CIDR]... [--out DIR]
+# Standalone:  sudo bash modules/protect.sh [--panel-ip X.X.X.X] [--node-port N] [--ssh-from IP|CIDR] [--out DIR]
 # SSH без --ssh-from: вся подсеть NetBird, если текущая сессия пришла через неё, иначе IP сессии.
 # Как модуль:  source lib/common.sh; source modules/protect.sh; protect_generate
 
@@ -56,10 +56,6 @@ SSH_RATE="${SSH_RATE:-6}"     # соединений/мин на IP
 
 # перманентный бан подсетей (set banned4, drop раньше любых accept). BAN_NETS="" — без бана
 BAN_NETS="${BAN_NETS-185.224.228.0/22 195.209.120.0/22 212.192.156.0/23 212.192.158.0/24 194.165.22.0/23}"
-# мосты/каскады (set trusted4): другие ноды, которые ходят сюда цепочкой. Мост — один IP за всеми
-# своими юзерами: тысячи соединений и пачки SYN, per-IP лимиты 443 отрезали бы его целиком.
-# trusted4 пропускает на 443 мимо лимитов; бан сильнее. Дополняется флагом --allow (повторяемым).
-ALLOW_NETS="${ALLOW_NETS:-}"
 
 protect_generate() {
     local ssh_port ssh_ip ssh_src nb_addr nb="" out
@@ -124,19 +120,8 @@ protect_generate() {
         ip_in_cidr "${ph_ssh%/*}" "$bn" && msg_warn "SSH-источник $ph_ssh в забаненной подсети $bn — firewall отрежет SSH"
         ip_in_cidr "$ph_panel" "$bn" && msg_warn "IP панели $ph_panel в забаненной подсети $bn — нода потеряет панель"
     done
-    # мосты: хост-биты обнуляются, не-IPv4 пропускается; мост внутри бана не пройдёт — бан раньше
-    local an trusted=""
-    for n in $ALLOW_NETS; do
-        an=$(ipv4_net "$n") || { msg_warn "ALLOW_NETS: «$n» не IPv4-подсеть — пропускаю"; continue; }
-        trusted="$trusted${trusted:+, }$an"
-        for bn in $BAN_NETS; do
-            bn=$(ipv4_net "$bn") || continue
-            ip_in_cidr "${an%/*}" "$bn" && msg_warn "мост $an в забаненной подсети $bn — бан сильнее, мост будет отрезан"
-        done
-    done
-    [ -n "$trusted" ] && echo -e "    ${DIM}мосты мимо per-IP лимитов 443:${NC} $trusted"
 
-    _gen_nft   "$out" "$ssh_port" "$ph_ssh" "$ph_panel" "${NODE_PORT:-<NODE_PORT>}" "$ban" "$trusted"
+    _gen_nft   "$out" "$ssh_port" "$ph_ssh" "$ph_panel" "${NODE_PORT:-<NODE_PORT>}" "$ban"
     _gen_ufw   "$out" "$ssh_port" "$ph_ssh" "$ph_panel" "${NODE_PORT:-<NODE_PORT>}"
     _gen_sshd  "$out"
     _gen_apply "$out" "$ssh_port" "$ph_ssh" "$via_nb" "$nb_addr"
@@ -150,16 +135,15 @@ protect_generate() {
 }
 
 _gen_nft() {
-    local out=$1 ssh_port=$2 ssh_ip=$3 panel=$4 node_port=$5 ban=$6 trusted=$7
+    local out=$1 ssh_port=$2 ssh_ip=$3 panel=$4 node_port=$5 ban=$6
 
     # семейство адреса → правильный синтаксис saddr (dual-stack: v6 больше не игнорируется)
     local ssh_saddr="ip saddr" panel_type="ipv4_addr" panel_saddr="ip saddr"
     case "$ssh_ip" in *:*) ssh_saddr="ip6 saddr" ;; esac
     case "$panel"  in *:*) panel_type="ipv6_addr"; panel_saddr="ip6 saddr" ;; esac
     # пустой set валиден, пустой «elements = { }» — нет
-    local ban_elems="" trusted_elems=""
+    local ban_elems=""
     [ -n "$ban" ] && ban_elems="elements = { $ban }"
-    [ -n "$trusted" ] && trusted_elems="elements = { $trusted }"
 
     cat > "$out/firewall.nft" <<EOF
 #!/usr/sbin/nft -f
@@ -182,14 +166,6 @@ table inet node_protect {
         auto-merge
         $ban_elems
     }
-    # мосты/каскады (ALLOW_NETS, --allow) — на 443 мимо per-IP лимитов.
-    # Добавить на лету: nft add element inet node_protect trusted4 { X/N }
-    set trusted4 {
-        type ipv4_addr
-        flags interval
-        auto-merge
-        $trusted_elems
-    }
     chain input {
         type filter hook input priority 0; policy drop;
 
@@ -209,11 +185,6 @@ table inet node_protect {
         tcp dport $ssh_port $ssh_saddr $ssh_ip ct state new \\
             meter ssh_rate { $ssh_saddr limit rate over ${SSH_RATE}/minute } drop
         tcp dport $ssh_port $ssh_saddr $ssh_ip accept
-
-        # мост — один IP за всеми своими юзерами: 2048 соединений и 200 SYN/с ему мало,
-        # лимиты ниже резали бы его целиком (connect timed out на той стороне). counter — для проверки.
-        ip saddr @trusted4 tcp dport 443 counter accept
-        ip saddr @trusted4 udp dport 443 counter accept
 
         # 443 — публичный вход. Per-IP лимит одновременных соединений и SYN-rate.
         # (ct count вне meter считал бы ВСЕ соединения порта разом — душил бы ноду целиком)
@@ -379,15 +350,6 @@ $ssh_note
 ⚠ guard (rr guard on) ставит NOTRACK на 443/80: conn443 (ct count) при включённом guard не действует,
   SYN-флуд закрывает guard; SYN-rate (syn443) считается по флагу SYN и работает и под NOTRACK.
 
---- МОСТЫ / КАСКАДЫ (другая нода ходит сюда цепочкой) ---
-  Мост — один IP за всеми юзерами своей ноды: тысячи соединений и пачки SYN. Per-IP лимиты 443
-  (2048 соединений, ${SYN_RATE} SYN/с) режут его целиком: на той ноде «connect: connection timed out»,
-  здесь «REALITY: … failed to read client hello». Такие IP — в set trusted4, мимо лимитов:
-    при генерации:        protect --allow <IP_моста> (повторяемо) или ALLOW_NETS="IP1 IP2"
-    на живом firewall:    sudo nft add element inet node_protect trusted4 { <IP_моста> }
-    проверить:            sudo nft list chain inet node_protect input | grep trusted4   # counter растёт
-  Если включён guard вариант 1 (--geo ru) и мост не из России — тот же IP в rr guard allow <IP>.
-
 Карта портов Remnawave-ноды: 443 (вход), 80 (ACME), NODE_PORT (панель->нода, только IP панели),
 61000/localhost и Caddy :9443/localhost наружу НЕ открываются.
 ⚠ remnanode в docker BRIDGE (порт через -p): фильтр NODE_PORT в input его не видит
@@ -404,10 +366,6 @@ protect_main() {
             --node-port) NODE_PORT="$2"; shift ;;
             --out)       PROTECT_OUT="$2"; shift ;;
             --ssh-from)  SSH_FROM="$2"; shift ;;
-            --allow)
-                ipv4_net "${2:-}" >/dev/null \
-                    || die "protect: --allow ждёт IPv4 или подсеть моста (напр. 203.0.113.7), получено: ${2:-}"
-                ALLOW_NETS="$ALLOW_NETS${ALLOW_NETS:+ }$2"; shift ;;
             *) die "protect: неизвестный аргумент $1" ;;
         esac
         shift

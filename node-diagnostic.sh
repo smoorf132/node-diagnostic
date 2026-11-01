@@ -47,10 +47,9 @@ node-diagnostic.sh v$ND_VERSION — модульный тулкит ноды (Re
                                  Тюнинг: sysctl/BBR/FD-лимиты/RPS-RFS-XPS/NIC/MSS/irqbalance/journald
                                  --all включает irqbalance+journald; --zram (zram-swap) — только явно
                                  --from-findings — только фиксы по находкам последней диагностики
-  protect  [--panel-ip IP] [--node-port N] [--ssh-from IP|CIDR] [--allow IP|CIDR]... [--out DIR]
+  protect  [--panel-ip IP] [--node-port N] [--ssh-from IP|CIDR] [--out DIR]
                                  Защита под Remnawave (firewall/SSH) — ГЕНЕРАЦИЯ, не применяет
                                  SSH по умолчанию: подсеть NetBird, если сессия через неё, иначе твой IP
-                                 --allow — мост/каскад (другая нода цепочкой): 443 мимо per-IP лимитов
   bbr3     [--status|--install|--dry-run|--yes]
                                  BBRv3 через XanMod-ядро (гейт контейнеров, без автоперезагрузки)
   rollback [--yes|--dry-run]     Откат наложенных оптимизаций (namespaced-артефакты)
@@ -214,20 +213,10 @@ menu_protect() {
         [ -z "$sf" ] || ipv4_net "$sf" >/dev/null && break
         echo -e "    ${Y}нужен IPv4 или подсеть${NC} ${DIM}(напр. ${nb:-100.92.0.0/16})${NC}"
     done
-    local br a bad
-    while true; do
-        printf "  Мосты: IP нод, которые ходят сюда цепочкой ${DIM}[через пробел; Enter — нет]${NC}: "
-        read -r br
-        bad=""
-        for a in $br; do ipv4_net "$a" >/dev/null || bad="$a"; done
-        [ -z "$bad" ] && break
-        echo -e "    ${Y}«$bad» — не IPv4 и не подсеть${NC}"
-    done
     local args=()
     [ -n "$pip" ] && args+=(--panel-ip "$pip")
     [ -n "$np" ]  && args+=(--node-port "$np")
     [ -n "$sf" ]  && args+=(--ssh-from "$sf")
-    for a in $br; do args+=(--allow "$a"); done
     run protect ${args[@]+"${args[@]}"}
 }
 
