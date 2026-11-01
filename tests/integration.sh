@@ -63,6 +63,17 @@ if command -v iptables >/dev/null 2>&1; then
     [ "$n_after" -eq 0 ] && ok "MSS-правила сняты" || bad "MSS-правила остались ($n_after)"
 fi
 
+echo "== clsact: чужие фильтры не сносятся =="
+ip link add ndt0 type dummy && ip link set ndt0 up
+clsact_ensure ndt0
+tc filter add dev ndt0 ingress pref 10 matchall action pass
+clsact_release ndt0
+tc qdisc show dev ndt0 | grep -q clsact && ok "clsact_release_keeps_foreign_filters" || bad "clsact снесён при живом фильтре"
+tc filter del dev ndt0 ingress pref 10
+clsact_release ndt0
+tc qdisc show dev ndt0 | grep -q clsact && bad "пустой clsact не убран" || ok "clsact_release убирает пустой qdisc"
+ip link del ndt0
+
 echo "== protect: генерация + nft -c =="
 out=$(mktemp -d)
 PROTECT_OUT="$out" bash modules/protect.sh --panel-ip 203.0.113.5 --node-port 2222 >/dev/null 2>&1

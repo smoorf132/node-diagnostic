@@ -73,10 +73,9 @@ _attach() {
         msg_err "bpftool prog loadall упал — смотри /tmp/nd-shaper-load.log (ядро без BPF/clsact?)"
         return 1
     fi
-    tc qdisc del dev "$iface" clsact 2>/dev/null || true
-    tc qdisc add dev "$iface" clsact 2>/dev/null || { msg_err "tc clsact не добавился на $iface"; return 1; }
-    tc filter add dev "$iface" egress  bpf direct-action pinned "$PIN_PROGS/$PROG_DOWN" 2>/dev/null || { msg_err "не прицепился DOWN-фильтр"; return 1; }
-    tc filter add dev "$iface" ingress bpf direct-action pinned "$PIN_PROGS/$PROG_UP"   2>/dev/null || { msg_err "не прицепился UP-фильтр"; return 1; }
+    clsact_ensure "$iface" || { msg_err "tc clsact не добавился на $iface"; return 1; }
+    tc filter replace dev "$iface" egress  pref "$ND_TC_PREF_SHAPER" bpf direct-action pinned "$PIN_PROGS/$PROG_DOWN" 2>/dev/null || { msg_err "не прицепился DOWN-фильтр"; return 1; }
+    tc filter replace dev "$iface" ingress pref "$ND_TC_PREF_SHAPER" bpf direct-action pinned "$PIN_PROGS/$PROG_UP"   2>/dev/null || { msg_err "не прицепился UP-фильтр"; return 1; }
     msg_ok "BPF-шейпер прицеплен к $iface (egress+ingress)"
 }
 
@@ -138,7 +137,11 @@ shape_off() {
     need_root || die "нужен root"
     local keep=0; [ "${1:-}" = "--keep-rules" ] && keep=1
     local iface; iface=$(_iface)
-    [ -n "$iface" ] && tc qdisc del dev "$iface" clsact 2>/dev/null || true
+    if [ -n "$iface" ]; then
+        tc filter del dev "$iface" egress  pref "$ND_TC_PREF_SHAPER" 2>/dev/null || true
+        tc filter del dev "$iface" ingress pref "$ND_TC_PREF_SHAPER" 2>/dev/null || true
+        clsact_release "$iface"
+    fi
     rm -rf "$PIN_ROOT" 2>/dev/null || true
     if have systemctl && systemctl list-unit-files 2>/dev/null | grep -q "^$SHAPER_UNIT.service"; then
         systemctl disable "$SHAPER_UNIT.service" >/dev/null 2>&1 || true

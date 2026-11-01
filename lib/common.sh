@@ -355,6 +355,29 @@ cpu_psabi_level() {
 # ────────────────────────────────────────────────────────────────────
 default_iface() { ip route show default 2>/dev/null | awk '/default/{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}'; }
 
+# tc-приоритеты (pref) на общем clsact: guard (XDP/tc) и шейпер живут рядом, не сносят друг друга
+# shellcheck disable=SC2034  # используется модулями
+ND_TC_PREF_GUARD=10
+# shellcheck disable=SC2034
+ND_TC_PREF_SHAPER=49200
+
+# clsact есть или создан (rc 0)
+clsact_ensure() {
+    local iface="$1"
+    tc qdisc show dev "$iface" 2>/dev/null | grep -q clsact && return 0
+    tc qdisc add dev "$iface" clsact 2>/dev/null
+}
+
+# убрать clsact, только если на ingress и egress не осталось фильтров (rc 0 всегда)
+clsact_release() {
+    local iface="$1"
+    if [ -z "$(tc filter show dev "$iface" ingress 2>/dev/null)" ] \
+       && [ -z "$(tc filter show dev "$iface" egress 2>/dev/null)" ]; then
+        tc qdisc del dev "$iface" clsact 2>/dev/null || true
+    fi
+    return 0
+}
+
 detect_ssh_port() {
     local p
     p=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
