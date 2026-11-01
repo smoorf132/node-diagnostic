@@ -42,6 +42,7 @@ GUARD_CASES=(geo_unavailable_refuses ssh_port_refused variant1_geo_drop xdp_mode
 TMP=""
 KEY=""
 SRV_PID=""
+MPTCP_WHY=""   # mptcp_echo_check: причины провала
 SHAPE_TOUCHED=0
 
 in_srv() { nsenter --net="/var/run/netns/$SRV_NS" "$@"; }
@@ -499,13 +500,14 @@ have_mptcp() {   # have_mptcp КЕЙС — rc 1 (SKIP + ::warning::), если �
 }
 
 # MPTCP-listener (так слушает xray на Go ≥ 1.24): kfunc его отвергает, поэтому XDP cookie не выдаёт,
-# а отдаёт SYN ядру — эхо v4 и v6 идёт обычным путём. Печатает причины провала (пусто — в порядке);
-# в конце на :443 снова обычный dual-stack
-mptcp_echo_why() {
+# а отдаёт SYN ядру — эхо v4 и v6 идёт обычным путём. Причины провала — в MPTCP_WHY (пусто — в порядке);
+# в конце на :443 снова обычный dual-stack. Не звать через $(…): srv_start в подоболочке теряет SRV_PID,
+# и следующий srv_stop не гасит эхо-сервер
+mptcp_echo_check() {
     local s0 s1 out why=""
     in_srv sysctl -qw net.mptcp.enabled=1
     if ! srv_start 6 mptcp; then
-        echo "MPTCP-listener [::]:$PORT не поднялся: $(tail -n 3 "$TMP/echo.log" | tr '\n' ' ')"
+        MPTCP_WHY="MPTCP-listener [::]:$PORT не поднялся: $(tail -n 3 "$TMP/echo.log" | tr '\n' ' ')"
         srv_start 6
         return
     fi
@@ -517,12 +519,14 @@ mptcp_echo_why() {
     [ "$(delta cookie_sent "$s0" "$s1")" = 0 ] || why="$why cookie_sent +$(delta cookie_sent "$s0" "$s1");"
     [ "$(delta assign_err "$s0" "$s1")" = 0 ] || why="$why assign_err +$(delta assign_err "$s0" "$s1");"
     srv_start 6 || why="$why dual-stack [::]:$PORT не вернулся;"
-    [ -z "$why" ] || echo "$why [$s1]"
+    MPTCP_WHY=$why
+    [ -z "$why" ] || MPTCP_WHY="$why [$s1]"
 }
 
 case_mptcp_listener_no_cookie() {
     have_mptcp mptcp_listener_no_cookie || return
-    verdict "mptcp_listener_no_cookie (SYN к MPTCP-listener'у — ядру, эхо v4/v6)" "$(mptcp_echo_why)"
+    mptcp_echo_check
+    verdict "mptcp_listener_no_cookie (SYN к MPTCP-listener'у — ядру, эхо v4/v6)" "$MPTCP_WHY"
 }
 
 # порт без listener'а: SYN уходит ядру, и клиент сразу получает RST (Connection refused), а не
@@ -876,7 +880,8 @@ case_variant2_mptcp_listener() {
     printf '%s\n' "$out" | grep -q "MPTCP.*порт $PORT" || why="$why в status нет строки MPTCP;"
     grep -qx -- -DND_GUARD_MPTCP "$GUARD_DIR/nd-guard-xdp.bpf.o.flags" 2>/dev/null \
         || why="$why XDP собран без -DND_GUARD_MPTCP;"
-    why="$why$(mptcp_echo_why)"
+    mptcp_echo_check
+    why="$why$MPTCP_WHY"
     verdict "variant2_mptcp_listener (on/status предупреждают, SYN — ядру, эхо v4/v6)" "$why"
 }
 
