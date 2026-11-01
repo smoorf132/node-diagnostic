@@ -3,3 +3,4 @@
 node-diagnostic-summary-*.txt
 node-diagnostic-*.log
 .DS_Store
+__pycache__/
