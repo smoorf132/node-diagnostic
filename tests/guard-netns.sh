@@ -9,7 +9,7 @@
 # Устройство (новый режим — функция mode_<имя>; переиспользуется всё, кроме raw_*):
 #   net_up/net_down, srv_start 4|6, cli_echo, held_ss — сеть, эхо-сервер на :443 в gsrv, клиент в gcli;
 #   stats/st/delta — счётчики guard_ctrl.py stats по $MAPS (карты guard: XDP пинит, tc переиспользует);
-#   set_cookies/state_reset (ключ $KEY), bad_ack — управление режимом и «чужой» ACK;
+#   set_cookies/state_until (ключ $KEY), bad_ack — управление режимом и «чужой» ACK;
 #   case_* (список COOKIE_CASES, запуск — run_cookie_cases) — кейсы, каждый печатает ok/bad.
 # Команды в netns идут через nsenter --net (in_srv/in_cli), а не `ip netns exec`: тот перемонтирует
 # /sys, и bpffs с pin'ами (/sys/fs/bpf) внутри не виден.
@@ -218,12 +218,15 @@ delta() { echo $(( $(st "$1" "$3") - $(st "$1" "$2") )); }   # delta NAME ДО �
 # set_cookies off|auto|always [порог SYN/с] — cfg с ключом $KEY, гео выкл.
 set_cookies() { ctrl set-cfg --geo 0 --cookies "$1" --syn-threshold "${2:-10000}" --key-file "$KEY"; }
 
-# guard_state_map[0] = 0: окна SYN нет, attack_until_ns = 0 («атаки не было»)
-state_reset() {
-    local z=()
-    for _ in $(seq 24); do z+=(00); done
-    "$BPFTOOL" map update pinned "$MAPS/guard_state_map" key hex 00 00 00 00 value hex "${z[@]}"
+# state_until NS — guard_state_map[0] = {окна SYN нет, attack_until_ns = NS} (0 — «атаки не было»)
+state_until() {
+    local v=()
+    read -ra v < <(python3 -c 'import struct, sys
+print(" ".join("%02x" % b for b in struct.pack("=QQQ", 0, 0, int(sys.argv[1]))))' "$1")
+    "$BPFTOOL" map update pinned "$MAPS/guard_state_map" key hex 00 00 00 00 value hex "${v[@]}"
 }
+
+mono_ns() { ctrl state | sed -n 's/.*now_ns=\([0-9]*\).*/\1/p'; }   # CLOCK_MONOTONIC, как у BPF
 
 # bad_ack — голый ACK со случайным ack_seq из gcli; rc 0 — ядро сервера ответило RST
 bad_ack() { in_cli python3 "$TMP/badack.py" "$CLI4" "$SRV4"; }
@@ -392,7 +395,8 @@ case_bad_cookie_ack_fails_open() {
 }
 
 # (сверх брифа) ранние выходы tc по режиму cookies: off и auto вне атаки — ACK не трогается
-# (cookie_bad не растёт, RST от ядра есть); auto под атакой (порог 0) — cookie-путь работает.
+# (cookie_bad не растёт, RST от ядра есть); auto под атакой (порог 0) — cookie-путь работает;
+# auto через 1 с после атаки — tc ещё проверяет cookie (граница attack_until + 2·2^36).
 # «Вне атаки» = now > attack_until + 2·2^36 нс; при attack_until = 0 это требует CLOCK_MONOTONIC
 # > ~137 с: недостающие ≤ 60 с кейс выжидает (свежий CI runner), иначе часть не проверяется
 # (видно в выводе).
@@ -407,8 +411,17 @@ case_cookie_modes() {
     s0=$(cookie_echo "$SRV4")
     [ -z "$s0" ] || why="$why auto под атакой: $s0;"
 
-    { set_cookies auto >/dev/null && state_reset >/dev/null; } || why="$why сброс в auto без атаки;"
-    now=$(ctrl state | sed -n 's/.*now_ns=\([0-9]*\).*/\1/p')
+    # атака кончилась 1 с назад: XDP cookie уже не выдаёт, но выданные живы 2 слота — tc проверяет
+    set_cookies auto >/dev/null || why="$why set-cfg auto;"
+    now=$(mono_ns)
+    now=${now:-0}
+    state_until $(( now > 1000000000 ? now - 1000000000 : 0 )) >/dev/null || why="$why state;"
+    s0=$(stats); bad_ack; rc=$?; s1=$(stats)
+    [ "$(delta cookie_bad "$s0" "$s1")" -ge 1 ] || why="$why auto сразу после атаки: tc не проверял cookie;"
+    [ "$rc" = 0 ] || why="$why auto сразу после атаки: нет RST;"
+
+    state_until 0 >/dev/null || why="$why сброс state;"
+    now=$(mono_ns)
     now=${now:-0}
     if [ "$now" -le "$need" ] && [ $(( need - now )) -le 60000000000 ]; then
         wait_s=$(( (need - now) / 1000000000 + 1 ))
@@ -427,7 +440,7 @@ case_cookie_modes() {
 
     set_cookies always >/dev/null || why="$why возврат always;"
     if [ -z "$why" ]; then
-        ok "cookie_modes (off, auto под атакой, $idle)"
+        ok "cookie_modes (off, auto под атакой, auto сразу после атаки, $idle)"
     else
         bad "cookie_modes: $why [$s1]"
     fi
