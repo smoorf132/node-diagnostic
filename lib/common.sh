@@ -479,11 +479,13 @@ ND_TC_PREF_GUARD=10
 # shellcheck disable=SC2034
 ND_TC_PREF_SHAPER=49200
 
-# clsact есть или создан (rc 0)
+# clsact есть или создан (rc 0). Юниты guard и шейпера стартуют на boot параллельно: оба не видят
+# clsact и оба делают add — проигравший получает EEXIST, хотя clsact уже есть. Это тоже успех
 clsact_ensure() {
     local iface="$1"
     tc qdisc show dev "$iface" 2>/dev/null | grep -q clsact && return 0
-    tc qdisc add dev "$iface" clsact 2>/dev/null
+    tc qdisc add dev "$iface" clsact 2>/dev/null && return 0
+    tc qdisc show dev "$iface" 2>/dev/null | grep -q clsact
 }
 
 # убрать clsact, только если на ingress и egress не осталось фильтров (rc 0 всегда)

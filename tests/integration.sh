@@ -74,6 +74,26 @@ clsact_release ndt0
 tc qdisc show dev ndt0 | grep -q clsact && bad "пустой clsact не убран" || ok "clsact_release убирает пустой qdisc"
 ip link del ndt0
 
+echo "== clsact_ensure: повтор и гонка юнитов на boot =="
+ip link add ndt2 type dummy && ip link set ndt2 up
+clsact_ensure ndt2; r1=$?
+clsact_ensure ndt2; r2=$?
+[ "$r1 $r2" = "0 0" ] && ok "clsact_ensure ×2 → rc 0 и 0" || bad "clsact_ensure ×2 → rc $r1 и $r2"
+# гонка: соседний юнит добавил clsact между нашим show и add — add получает EEXIST.
+# Первый `tc qdisc show` подменён пустым ответом («ещё нет»), остальное — настоящий tc.
+# Флаг — файл: show идёт в конвейере (подоболочке), переменная оттуда не вернётся
+_race_flag=$(mktemp)
+rc=$(
+    tc() {
+        if [ "$1 $2" = "qdisc show" ] && [ -e "$_race_flag" ]; then rm -f "$_race_flag"; return 0; fi
+        command tc "$@"
+    }
+    clsact_ensure ndt2; echo $? )
+rm -f "$_race_flag"
+[ "$rc" = 0 ] && ok "clsact_ensure: EEXIST при живом clsact — успех" || bad "clsact_ensure в гонке → rc $rc"
+tc qdisc del dev ndt2 clsact 2>/dev/null
+ip link del ndt2
+
 echo "== tc_filter_put: повторный attach не плодит дубли =="
 ip link add ndt1 type dummy && ip link set ndt1 up
 clsact_ensure ndt1
