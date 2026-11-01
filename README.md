@@ -56,7 +56,7 @@ modules/
   nd-shaper.bpf.c           BPF-программа шейпера (clsact + EDT)
   shape_ctrl.py             программирование BPF-карт через bpftool
   guard.sh                  защита от DDoS (оркестратор): on/off/status/allow/reattach
-  nd-guard-xdp.bpf.c        XDP: гео, rate-limit, SYN-cookies
+  nd-guard-xdp.bpf.c        XDP: гео, SYN-ACK с cookie (порог SYN/с для режима auto)
   nd-guard-tc.bpf.c         tc: проверка cookie в ACK, bpf_sk_assign_tcp_reqsk
   nd-guard.h, nd-guard-cookie.h   общие структуры и cookie
   guard_ctrl.py             программирование BPF-карт guard через bpftool
@@ -202,14 +202,18 @@ sudo rr guard off              # выключить и убрать всё
 
 Оба варианта ставят NOTRACK на 443/80 TCP+UDP (conntrack не заполняется флудом). SYN-cookies в XDP по умолчанию `auto`: включаются при > 10000 SYN/с и держатся 60 с после атаки; `--cookies always|off` меняет поведение. Остальные команды: `reattach` (вернуть после ребута/ручного detach), `update-geo` (обновить список), `help`. Меню: `[12]`.
 
-- **Dead-man.** После `on` guard сам откатывается через 5 минут, пока не выполнен `rr guard confirm`. SSH не затрагивается никогда.
+- **Dead-man.** После `on` guard сам откатывается через 5 минут, пока не выполнен `rr guard confirm`. Перезагрузка до подтверждения тоже откатывает guard: таймер dead-man её не переживает, поэтому на boot `reattach` видит метку «не подтверждён» и выполняет `guard off` вместо восстановления. SSH не затрагивается никогда: порт SSH в `--ports` — отказ.
 - **Ядро.** XDP-cookies требуют ядро **≥ 6.9** с `bpf_sk_assign_tcp_reqsk` в BTF (например XanMod через `rr bbr3 --install`). На более старом ядре guard откатывается на NOTRACK + гео + штатные syncookies ядра и сообщает об этом. Для XDP нужен BTF ядра (`/sys/kernel/btf/vmlinux`): без него применяется только NOTRACK, а вариант 1 отказывается. Сам guard требует ядро **≥ 5.10**.
+- **bpftool.** Нужен bpftool на libbpf ≥ 1.0; guard и `shape` находят его сами: PATH, пакет `bpftool` (Debian), `linux-tools` Ubuntu (с ядром XanMod — мимо нерабочей обёртки `/usr/sbin/bpftool`), иначе статический bpftool v7.8.1 из релиза libbpf/bpftool (sha256 закреплён) в `/usr/local/lib/node-diagnostic/bpftool`. Не загрузился tc-объект — cookies выключаются, XDP остаётся для гео.
+- **Интерфейс.** Только Ethernet: XDP и tc разбирают Ethernet-заголовок, поэтому на tun/wg/ppp (`link/none`) guard отказывается.
 - **Кого режет вариант 1.** Пользователей за границей. RKN-пробы он не останавливает: они приходят с российских адресов.
 - **Allowlist.** CDN-фронтинг (xhttp через Cloudflare), каскады и админы за границей без `rr guard allow IP|CIDR` будут отрезаны вариантом 1.
-- **ACME.** Продление certbot по HTTP-01 покрыто хуками: на время продления гео на :80 снимается. Другие ACME-клиенты (например Caddy с auto-ACME на selfsteal-нодах: HTTP-01 на 80 или TLS-ALPN-01 на 443) вариантом 1 **не покрыты** — их запросы будут отрезаны гео.
-- **LXC/veth.** На veth-интерфейсах (контейнеры LXC/Proxmox) cookie-путь работает через generic XDP: нативный XDP_TX на veth не доходит до стороны хоста.
+- **ACME.** Продление certbot по HTTP-01 покрыто хуками: на время продления гео на :80 снимается. Первый выпуск через `rr certs` методом HTTP-01 зовёт те же хуки сам. Другие ACME-клиенты (например Caddy с auto-ACME на selfsteal-нодах: HTTP-01 на 80 или TLS-ALPN-01 на 443) вариантом 1 **не покрыты** — их запросы будут отрезаны гео.
+- **LXC/veth.** На veth-интерфейсах (контейнеры LXC/Proxmox) cookie-путь работает через generic XDP: нативный XDP_TX на veth не доходит до стороны хоста. Цена: generic XDP висит всё время, пока cookies включены (и в `auto` вне атаки тоже), и линеаризует GRO-пакеты всего входящего трафика интерфейса — пропускная способность падает. Если это заметно, `--cookies off` вернёт native XDP (останется гео) или снимет XDP совсем (вариант 2).
+- **XDP_TX.** Если драйвер принимает XDP, но молча теряет XDP_TX, в `auto` под атакой (в `always` — всегда) новые соединения не устанавливаются. `guard status` предупредит, когда cookie-ответов ушло ≥ 100, а ни одно соединение по ним не завершилось, и покажет команду, которая выключит cookies, сохранив вариант (`rr guard on --geo ru --cookies off`).
+- **PMTU и ICMP.** ICMP-ошибки (frag-needed, packet-too-big) о потоках на портах guard тоже идут мимо conntrack. Иначе записи потока для них нет, они попадают в `ct state invalid`, а `ct state invalid drop` в `protect` и в `before*.rules` ufw стоит раньше разрешения ICMP: клиенты за путями с меньшим MTU (IPv6-туннели) зависали бы.
 - **Docker.** Docker bridge с опубликованными 80/443 несовместим, guard отказывается. С `network_mode: host` всё работает.
-- **Гео-источники.** RIPEstat + db-ip country lite; обновляется еженедельным таймером, список проходит sanity-проверку, без списка гео не включается (иначе дропнулось бы всё).
+- **Гео-источники.** RIPEstat + db-ip country lite; обновляется еженедельным таймером, список проходит sanity-проверку, без списка гео не включается (иначе дропнулось бы всё). Реальный RU — около 12 тыс. v4- и 9 тыс. v6-префиксов; geo-карта XDP вмещает 131072 на семейство, список больше половины ёмкости не принимается.
 - **protect.** `conn443` (`ct count`) при включённом guard не действует; SYN-rate считается по флагу SYN и продолжает работать.
 
 Гео-данные: IP to Country Lite by [DB-IP](https://db-ip.com), лицензия CC BY 4.0.
@@ -296,7 +300,7 @@ sudo bash node-diagnostic.sh ssh-port 2222
 sudo bash node-diagnostic.sh rollback            # снять sysctl drop-in, systemd-юниты, limits, MSS clamp
 sudo bash node-diagnostic.sh rollback --dry-run  # показать, что снял бы
 ```
-Не входит: ядро XanMod (`apt purge 'linux-xanmod*' && update-grub && reboot`), firewall/sshd (generate-only — откат в их `APPLY.txt`), CrowdSec (`apt purge crowdsec crowdsec-firewall-bouncer-nftables`) eBPF-шейпер (`shape off`) и guard (`guard off`).
+Не входит: ядро XanMod (`apt purge 'linux-xanmod*' && update-grub && reboot`), firewall/sshd (generate-only — откат в их `APPLY.txt`), CrowdSec (`apt purge crowdsec crowdsec-firewall-bouncer-nftables`), eBPF-шейпер (`shape off`) и guard (`guard off`).
 
 ## Артефакты
 
@@ -315,9 +319,9 @@ sudo bash node-diagnostic.sh rollback --dry-run  # показать, что сн
   - `install node`, `certs` — Debian 11+ / Ubuntu 22.04+ с systemd (Docker, certbot из apt).
   - `bbr3` — **только Debian/Ubuntu** (XanMod = deb-репозиторий) и **только bare-metal/KVM x86_64** (не контейнер).
   - `shape` — ядро Linux **≥5.4** (EDT/clsact) + `clang`/`bpftool`/`libbpf-dev`; не в контейнере.
-  - `guard` — ядро Linux **≥5.10** + BTF, `clang`/`bpftool`/`libbpf-dev` (ставятся сами); XDP-cookies — ядро **≥6.9**; Docker bridge с опубликованными 80/443 несовместим.
+  - `guard` — ядро Linux **≥5.10** + BTF, Ethernet-интерфейс, `clang`/`bpftool` (libbpf ≥ 1.0)/`libbpf-dev` (ставятся сами, bpftool — из пакета, linux-tools или статический); XDP-cookies — ядро **≥6.9**; Docker bridge с опубликованными 80/443 несовместим.
 
-CI гоняет: shellcheck (`--severity=warning`), компиляцию BPF-шейпера (`clang -target bpf`), smoke на Ubuntu-runner/22.04/24.04/Debian 12/Alpine 3.19 и integration (реальное `optimize`→verify→rollback→`protect`/`nft -c`) в privileged-контейнерах Ubuntu 24.04 + Debian 12.
+CI гоняет: shellcheck (`--severity=warning`), компиляцию BPF-шейпера и guard (`clang -target bpf`), smoke на Ubuntu-runner/22.04/24.04/Debian 12/Alpine 3.19, integration (реальное `optimize`→verify→rollback→`protect`/`nft -c`) в privileged-контейнерах Ubuntu 24.04 + Debian 12, guard на ядре runner'а (`bpftool prog run`, netns-стенд с cookie-рукопожатием) и загрузку guard bpftool и тулчейном Debian 12 / Ubuntu 22.04 (`ensure_bpftool`).
 
 ## Лицензия
 
