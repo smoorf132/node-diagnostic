@@ -31,6 +31,10 @@ jobs:
           readelf -S /tmp/nd-shaper.bpf.o | grep -q 'classifier/down'
           readelf -S /tmp/nd-shaper.bpf.o | grep -q 'classifier/up'
           echo "BPF compiled OK (classifier/down + classifier/up)"
+      - name: host-тест cookie
+        run: |
+          cc -O2 -Wall -Werror -I modules -o /tmp/gct tests/guard_cookie_test.c
+          /tmp/gct
 
   smoke-ubuntu:
     runs-on: ubuntu-latest
