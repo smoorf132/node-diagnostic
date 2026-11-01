@@ -129,26 +129,144 @@ ui_divider() {   # ui_divider "ТЕКСТ" — линия с центриров�
 have()      { command -v "$1" >/dev/null 2>&1; }
 need_root() { [ "$(id -u)" -eq 0 ]; }
 
-# Установить пакет, если команды нет (root + пакетный менеджер; тихо, лок-таймаут).
-# ensure_pkg <cmd> <apt_pkg> <dnf_pkg> <apk_pkg> — return 0, если команда доступна после.
+# Поставить пакет без проверки команды (root + пакетный менеджер; тихо, лок-таймаут).
+# pkg_install <apt_pkg> <dnf_pkg> <apk_pkg> — rc пакетного менеджера (1 — нет root/менеджера).
 # </dev/null + noninteractive: иначе debconf с унаследованным TTY съедает ввод юзера.
 # apt-get update гоняем максимум раз за процесс (флаг _ND_APT_UPDATED).
-ensure_pkg() {
-    have "$1" && return 0
+pkg_install() {
     need_root || return 1
     if   have apt-get; then
         [ -z "${_ND_APT_UPDATED:-}" ] && {
             apt-get -o DPkg::Lock::Timeout=60 update -qq >/dev/null 2>&1 </dev/null || true
             _ND_APT_UPDATED=1
         }
-        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=60 install -y -qq "$2" >/dev/null 2>&1 </dev/null || true
-    elif have dnf; then dnf install -y -q "$3" >/dev/null 2>&1 </dev/null || true
-    elif have yum; then yum install -y -q "$3" >/dev/null 2>&1 </dev/null || true
+        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=60 install -y -qq "$1" >/dev/null 2>&1 </dev/null
+    elif have dnf; then dnf install -y -q "$2" >/dev/null 2>&1 </dev/null
+    elif have yum; then yum install -y -q "$2" >/dev/null 2>&1 </dev/null
     elif have apk; then
         [ -z "${_ND_APK_UPDATED:-}" ] && { apk update -q >/dev/null 2>&1 </dev/null || true; _ND_APK_UPDATED=1; }
-        apk add --quiet "$4" >/dev/null 2>&1 </dev/null || true
+        apk add --quiet "$3" >/dev/null 2>&1 </dev/null
+    else
+        return 1
     fi
+}
+
+# Установить пакет, если команды нет. ensure_pkg <cmd> <apt_pkg> <dnf_pkg> <apk_pkg> —
+# return 0, если команда доступна после.
+ensure_pkg() {
+    have "$1" && return 0
+    need_root || return 1
+    pkg_install "$2" "$3" "$4"
     have "$1"
+}
+
+# ── bpftool (guard, shape) ───────────────────────────────────────────
+# Нужен bpftool, который запускается и собран с libbpf ≥ 1.0: старее не разбирает __weak kfunc и
+# глобальные подпрограммы BPF-объектов guard (bpftool из linux-tools 5.15 — libbpf 0.5). Обёртка
+# Ubuntu /usr/sbin/bpftool без linux-tools-$(uname -r) (ядро XanMod) не запускается вовсе, в Debian
+# пакет называется bpftool. Последний шаг — статический bpftool из релиза libbpf/bpftool: его же
+# ставит tests/guard-deps.sh (константы ниже — общие; sha256 закреплён здесь, а не скачивается).
+ND_BPFTOOL_TAG=v7.8.1
+ND_BPFTOOL_URL="https://github.com/libbpf/bpftool/releases/download/$ND_BPFTOOL_TAG"
+ND_BPFTOOL_SHA256_AMD64=112026bbdf48d0d00ccfc4926e59878d47943f97c197f959f110abe29c898ddc
+ND_BPFTOOL_SHA256_ARM64=678cc6fdc545f6baf9fc80bbca3ab4cb0efcd3f4d814c6fada00ca0987a4c6b0
+ND_BPFTOOL_LOCAL="${ND_BPFTOOL_LOCAL:-/usr/local/lib/node-diagnostic/bpftool}"
+
+# bpftool_usable PATH|ИМЯ — rc 0: запускается и сообщает «using libbpf v1.x» и новее
+# (у bpftool на libbpf 0.x этой строки в `bpftool version` нет вовсе)
+bpftool_usable() {
+    local v
+    [ -n "$1" ] || return 1
+    v=$("$1" version 2>/dev/null) || return 1
+    printf '%s\n' "$v" | grep -qE '^using libbpf v[1-9][0-9]*\.'
+}
+
+# bpftool_find — без установок (reattach на boot, status): $BPFTOOL, bpftool в PATH, статический
+# ND_BPFTOOL_LOCAL, затем linux-tools Ubuntu — новейший /usr/lib/linux-tools{/*,-*}/bpftool мимо
+# обёртки (bpftool от версии ядра не зависит). rc 0 → BPFTOOL (export).
+bpftool_find() {
+    local c lt=()
+    for c in /usr/lib/linux-tools/*/bpftool /usr/lib/linux-tools-*/bpftool; do
+        [ -x "$c" ] && lt+=("$c")
+    done
+    if [ "${#lt[@]}" -gt 0 ]; then   # версия — имя каталога: 6.8.0-45-generic, linux-tools-6.8.0-45
+        mapfile -t lt < <(printf '%s\n' "${lt[@]}" \
+            | awk -F/ '{ v = $(NF - 1); sub(/^linux-tools-/, "", v); print v "\t" $0 }' \
+            | sort -t "$(printf '\t')" -k1,1rV 2>/dev/null | cut -f2-)
+    fi
+    for c in "${BPFTOOL:-}" "$(command -v bpftool 2>/dev/null)" "$ND_BPFTOOL_LOCAL" ${lt[@]+"${lt[@]}"}; do
+        bpftool_usable "$c" || continue
+        BPFTOOL=$c
+        export BPFTOOL
+        return 0
+    done
+    return 1
+}
+
+# bpftool_static_install DEST [TGZ] — статический bpftool ND_BPFTOOL_TAG в DEST. Архив скачивается
+# (GitHub, затем прокси GH_PREFIXES — подмену отсекает закреплённый sha256) или берётся готовый TGZ.
+# Сумма не сошлась — архив удаляется, rc 1.
+bpftool_static_install() {
+    local dest="$1" tgz="${2:-}" arch sum tmp p rc
+    case "$(uname -m)" in
+        x86_64) arch=amd64 sum=$ND_BPFTOOL_SHA256_AMD64 ;;
+        aarch64|arm64) arch=arm64 sum=$ND_BPFTOOL_SHA256_ARM64 ;;
+        *) return 1 ;;
+    esac
+    have sha256sum && have tar || return 1
+    tmp=$(mktemp -d) || return 1
+    if [ -z "$tgz" ]; then
+        tgz="$tmp/bpftool.tar.gz"
+        for p in "${GH_PREFIXES[@]}"; do
+            download_file "$p$ND_BPFTOOL_URL/bpftool-$ND_BPFTOOL_TAG-$arch.tar.gz" "$tgz" \
+                && [ "$(sha256sum "$tgz" | cut -d' ' -f1)" = "$sum" ] && break
+            rm -f "$tgz"
+        done
+    fi
+    if [ ! -s "$tgz" ] || [ "$(sha256sum "$tgz" | cut -d' ' -f1)" != "$sum" ]; then
+        rm -f "$tgz"
+        rm -rf "$tmp"
+        return 1
+    fi
+    tar -xzf "$tgz" -C "$tmp" bpftool && mkdir -p "$(dirname "$dest")" \
+        && install -m 0755 "$tmp/bpftool" "$dest.tmp" && mv -f "$dest.tmp" "$dest"
+    rc=$?
+    rm -rf "$tmp"
+    return "$rc"
+}
+
+# ensure_bpftool — рабочий bpftool (R14): 1) bpftool_find; 2) пакет bpftool (Debian, RHEL, Alpine);
+# 3) apt: linux-tools-common, -$(uname -r), -generic и снова bpftool_find (новейший из linux-tools);
+# 4) статический в ND_BPFTOOL_LOCAL. rc 0 → BPFTOOL (export), ND_BPFTOOL_VIA = found|pkg|linux-tools|
+# static; rc 1 — рабочего нет (ND_BPFTOOL_VIA=none).
+# shellcheck disable=SC2034  # ND_BPFTOOL_VIA читают guard.sh и tests/guard-distro-bpftool.sh
+ensure_bpftool() {
+    local p
+    ND_BPFTOOL_VIA=found
+    bpftool_find && return 0
+    ND_BPFTOOL_VIA=none
+    need_root || return 1
+    pkg_install bpftool bpftool bpftool
+    hash -r
+    ND_BPFTOOL_VIA=pkg
+    bpftool_find && return 0
+    if have apt-get; then
+        for p in linux-tools-common "linux-tools-$(uname -r)" linux-tools-generic; do
+            pkg_install "$p" "" ""
+        done
+        hash -r
+        ND_BPFTOOL_VIA=linux-tools
+        bpftool_find && return 0
+    fi
+    ND_BPFTOOL_VIA=static
+    if bpftool_static_install "$ND_BPFTOOL_LOCAL" && bpftool_usable "$ND_BPFTOOL_LOCAL"; then
+        BPFTOOL=$ND_BPFTOOL_LOCAL
+        export BPFTOOL
+        return 0
+    fi
+    rm -f "$ND_BPFTOOL_LOCAL"
+    ND_BPFTOOL_VIA=none
+    return 1
 }
 
 # Спросить да/нет (по умолчанию НЕТ). confirm "Текст?" — return 0 при y/yes.

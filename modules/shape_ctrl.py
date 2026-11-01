@@ -12,6 +12,7 @@ ABI карт (см. nd-shaper.bpf.c):
 """
 import argparse
 import ipaddress
+import os
 import socket
 import struct
 import subprocess
@@ -42,7 +43,8 @@ def _pinned(pin_dir: str, name: str) -> str:
 
 
 def _bpftool(args: list, check: bool = True) -> tuple:
-    r = subprocess.run(["bpftool", *args], capture_output=True, text=True)
+    # путь к bpftool — env BPFTOOL (shape.sh: ensure_bpftool / bpftool_find, R14)
+    r = subprocess.run([os.environ.get("BPFTOOL", "bpftool"), *args], capture_output=True, text=True)
     if check and r.returncode != 0:
         sys.stderr.write(f"bpftool {' '.join(args)} → {r.stderr.strip()}\n")
         sys.exit(1)

@@ -29,7 +29,7 @@ source "$_guard_self/../lib/common.sh" 2>/dev/null || { echo "guard: нет lib/
 GUARD_DIR="${GUARD_DIR:-/var/lib/node-diagnostic/guard}"   # D14: переживает reboot (не /run)
 GUARD_PIN="${GUARD_PIN:-/sys/fs/bpf/nd-guard}"
 BPFTOOL="${BPFTOOL:-bpftool}"
-export BPFTOOL                                  # guard_ctrl.py берёт путь к bpftool отсюда
+export BPFTOOL   # guard_ctrl.py берёт путь отсюда; рабочий bpftool — bpftool_find/ensure_bpftool (R14)
 GUARD_CONF="$GUARD_DIR/guard.conf"
 GUARD_KEY="$GUARD_DIR/key"
 GUARD_GEO_CACHE="$GUARD_DIR/geo"                # принятый гео-список: geo4.txt, geo6.txt, geo.meta
@@ -126,8 +126,6 @@ _guard_has_kfunc() {
 _guard_timeout() { if have timeout; then timeout 15 "$@"; else "$@"; fi; }
 # XDP-объект — глобальные функции с ctx-аргументом: без BTF ядра верификатор его не примет
 _guard_btf_ok() { [ -r /sys/kernel/btf/vmlinux ]; }
-# обёртка Ubuntu /usr/sbin/bpftool без linux-tools-$(uname -r) есть, но не работает
-_guard_bpftool_ok() { "$BPFTOOL" version >/dev/null 2>&1; }
 _guard_systemd() { [ "${GUARD_NO_SYSTEMD:-0}" != 1 ] && have systemctl && [ -d /run/systemd/system ]; }
 _guard_ctrl() { python3 "$GUARD_CTRL" --pin-dir "$GUARD_PIN/maps" "$@"; }
 _guard_active() { [ -e "$GUARD_PIN/progs/$GUARD_XDP_PROG" ]; }   # XDP загружена, карты на месте
@@ -688,14 +686,13 @@ _guard_tools() {
     fi
     ensure_pkg clang clang clang clang >/dev/null 2>&1
     ensure_pkg python3 python3 python3 python3 >/dev/null 2>&1
-    ensure_pkg bpftool linux-tools-common bpftool bpftool >/dev/null 2>&1
-    # ensure_pkg ставит пакет, только если команды нет; здесь она есть, но не работает (обёртка Ubuntu
-    # без linux-tools-$(uname -r)) или это вовсе не команда (заголовки) — подставляем заведомо чужое имя
-    _guard_bpftool_ok || ensure_pkg nd-guard-none "linux-tools-$(uname -r)" bpftool bpftool >/dev/null 2>&1
-    _guard_bpftool_ok || ensure_pkg nd-guard-none linux-tools-generic bpftool bpftool >/dev/null 2>&1
-    [ -e /usr/include/bpf/bpf_helpers.h ] || ensure_pkg nd-guard-none libbpf-dev libbpf-devel libbpf-dev >/dev/null 2>&1
+    # R14: PATH → пакет bpftool → linux-tools Ubuntu → статический; libbpf ≥ 1.0 (lib/common.sh)
+    if ensure_bpftool >/dev/null 2>&1; then
+        [ "$ND_BPFTOOL_VIA" = found ] || msg_info "bpftool: $BPFTOOL ($ND_BPFTOOL_VIA)"
+    fi
+    [ -e /usr/include/bpf/bpf_helpers.h ] || pkg_install libbpf-dev libbpf-devel libbpf-dev >/dev/null 2>&1
     have clang || miss="$miss clang"
-    _guard_bpftool_ok || miss="$miss bpftool"
+    bpftool_usable "$BPFTOOL" || miss="$miss bpftool (libbpf ≥ 1.0)"
     have python3 || miss="$miss python3"
     [ -e /usr/include/bpf/bpf_helpers.h ] || miss="$miss libbpf-dev"
     if [ -n "$miss" ]; then
@@ -885,8 +882,8 @@ guard_reattach() {   # systemd на boot: шаги 11–17 по guard.conf и г
     G_GEO_RT=$G_GEO
     if ! _guard_btf_ok; then
         msg_warn "ядро без BTF — XDP и tc не ставлю"
-    elif ! _guard_bpftool_ok || ! have python3; then
-        msg_warn "нет bpftool или python3 — XDP и tc не ставлю"
+    elif ! bpftool_find || ! have python3; then
+        msg_warn "нет рабочего bpftool (libbpf ≥ 1.0) или python3 — XDP и tc не ставлю"
     elif c=$(_guard_xdp_foreign "$G_IFACE"); then
         msg_warn "на $G_IFACE чужая XDP-программа $c — XDP guard не ставлю"
     else
@@ -1100,6 +1097,8 @@ EOF
 guard_main() {
     local cmd="${1:-}"
     [ $# -gt 0 ] && shift
+    # рабочий bpftool без установок (статический ND_BPFTOOL_LOCAL — не в PATH); on ставит сам
+    case "$cmd" in "" | help | -h | --help) ;; *) bpftool_find >/dev/null 2>&1 ;; esac
     case "$cmd" in
     on) guard_on "$@" ;;
     off) guard_off "$@" ;;

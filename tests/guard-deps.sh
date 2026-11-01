@@ -2,12 +2,14 @@
 # Зависимости BPF-тестов guard (tests/guard_xdp_test.py, tests/guard-netns.sh).
 # Идемпотентно: ставится только то, чего нет (в образе nd-guard-dev — ничего).
 #   clang libbpf-dev linux-libc-dev gcc-multilib iproute2 nftables conntrack python3 ethtool
-#   + статический bpftool (libbpf/bpftool release) в /usr/local/bin, если рабочего нет
+#   + статический bpftool (libbpf/bpftool release) в /usr/local/bin, если рабочего (libbpf ≥ 1.0) нет —
+#     версия, URL и sha256 — общие с ensure_bpftool (lib/common.sh: ND_BPFTOOL_*)
 #   + bpffs на /sys/fs/bpf
 # Запуск от root; на CI: sudo --preserve-env=GH_TOKEN bash tests/guard-deps.sh
 set -eu
-
-BPFTOOL_TAG="${BPFTOOL_TAG:-v7.8.1}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "$ROOT/lib/common.sh"
 
 say() { printf 'guard-deps: %s\n' "$*"; }
 die() { printf 'guard-deps: ОШИБКА: %s\n' "$*" >&2; exit 1; }
@@ -42,26 +44,22 @@ if [ "${#missing[@]}" -gt 0 ]; then
 	apt-get install -y -qq --no-install-recommends "${missing[@]}" >/dev/null
 fi
 
-# bpftool: обёртка Ubuntu /usr/sbin/bpftool без linux-tools-$(uname -r) не работает
-if bpftool version >/dev/null 2>&1; then
-	:
-else
-	say "ставлю статический bpftool $BPFTOOL_TAG"
+# bpftool: обёртка Ubuntu /usr/sbin/bpftool без linux-tools-$(uname -r) не работает, на libbpf 0.x —
+# не годится; тесты зовут bpftool из PATH — статический ставится в /usr/local/bin
+if ! bpftool_usable bpftool; then
+	say "ставлю статический bpftool $ND_BPFTOOL_TAG"
 	tmp=$(mktemp -d)
 	trap 'rm -rf "$tmp"' EXIT
-	tgz="bpftool-$BPFTOOL_TAG-amd64.tar.gz"
-	if command -v gh >/dev/null 2>&1 && [ -n "${GH_TOKEN:-}" ]; then
-		gh release download "$BPFTOOL_TAG" -R libbpf/bpftool -p '*amd64.tar.gz*' -D "$tmp"
-	else
-		url="https://github.com/libbpf/bpftool/releases/download/$BPFTOOL_TAG"
-		curl -fsSL -o "$tmp/$tgz" "$url/$tgz"
-		curl -fsSL -o "$tmp/$tgz.sha256sum" "$url/$tgz.sha256sum"
+	tgz=""
+	# gh (CI, GH_TOKEN) — архив из релиза; без gh архив качает bpftool_static_install. sha256 сверяется всегда
+	if command -v gh >/dev/null 2>&1 && [ -n "${GH_TOKEN:-}" ] && [ "$(uname -m)" = x86_64 ]; then
+		gh release download "$ND_BPFTOOL_TAG" -R libbpf/bpftool -p "bpftool-$ND_BPFTOOL_TAG-amd64.tar.gz" -D "$tmp" \
+			&& tgz="$tmp/bpftool-$ND_BPFTOOL_TAG-amd64.tar.gz"
 	fi
-	(cd "$tmp" && sha256sum -c --quiet "$tgz.sha256sum") || die "контрольная сумма $tgz не сошлась"
-	tar -xzf "$tmp/$tgz" -C "$tmp"
-	install -m 0755 "$tmp/bpftool" /usr/local/bin/bpftool
+	bpftool_static_install /usr/local/bin/bpftool ${tgz:+"$tgz"} \
+		|| die "статический bpftool $ND_BPFTOOL_TAG не поставлен (не скачался или sha256 не сошёлся)"
 	hash -r
-	bpftool version >/dev/null 2>&1 || die "bpftool не запускается"
+	bpftool_usable bpftool || die "bpftool не запускается"
 fi
 
 if ! grep -qs ' /sys/fs/bpf bpf ' /proc/mounts; then

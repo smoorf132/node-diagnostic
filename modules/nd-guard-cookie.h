@@ -25,8 +25,26 @@ struct nd_cookie_opts {
 	__u8 wscale_ok, snd_wscale, sack_ok;
 };
 
-static const __u16 nd_msstab4[8] = {536, 1220, 1300, 1360, 1400, 1440, 1452, 1460};
-static const __u16 nd_msstab6[8] = {1220, 1280, 1340, 1380, 1400, 1420, 1432, 1440};
+/* Таблицы MSS по индексу 0..7 — по 16 бит в двух 64-битных константах (immediate, не .rodata):
+ *   v4 {536, 1220, 1300, 1360, 1400, 1440, 1452, 1460}, v6 {1220, 1280, 1340, 1380, 1400, 1420, 1432, 1440}.
+ * static const-массив clang 14 (Debian 12, Ubuntu 22.04) кладёт в .rodata.cst16, а в BTF пишет
+ * DATASEC .rodata — libbpf отвергает такой объект («Invalid size for section .rodata»). */
+#define ND_MSS4_LO 0x0550051404c40218ULL
+#define ND_MSS4_HI 0x05b405ac05a00578ULL
+#define ND_MSS6_LO 0x0564053c050004c4ULL
+#define ND_MSS6_HI 0x05a00598058c0578ULL
+
+static __always_inline __u16 nd_mss_tab(__u32 i, int v6)
+{
+	__u64 w;
+
+	i &= 7;
+	if (v6)
+		w = i < 4 ? ND_MSS6_LO : ND_MSS6_HI;
+	else
+		w = i < 4 ? ND_MSS4_LO : ND_MSS4_HI;
+	return (__u16)(w >> ((i & 3) * 16));
+}
 
 #define ND_ROTL64(x, b) (((x) << (b)) | ((x) >> (64 - (b))))
 
@@ -75,7 +93,7 @@ static __always_inline __u8 nd_mss_idx(__u16 client_mss, int v6)
 
 	ND_UNROLL
 	for (i = 1; i < 8; i++) {
-		__u16 t = v6 ? nd_msstab6[i] : nd_msstab4[i];
+		__u16 t = nd_mss_tab(i, v6);
 
 		if (t <= client_mss)
 			idx = (__u8)i;
@@ -133,7 +151,7 @@ static __always_inline int nd_cookie_check(const __u64 key[2], const __u32 saddr
 		__u64 h = nd_cookie_hash(key, saddr, daddr, sport, dport, cli_isn, slot, ob);
 
 		if ((__u32)(h >> 40) == want) {
-			out->mss = v6 ? nd_msstab6[idx & 7] : nd_msstab4[idx & 7];
+			out->mss = nd_mss_tab(idx, v6);
 			out->wscale_ok = ws != ND_COOKIE_WS_NONE;
 			out->snd_wscale = out->wscale_ok ? ws : 0;
 			out->sack_ok = (ob >> 4) & 1;

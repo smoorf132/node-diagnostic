@@ -98,6 +98,20 @@ static void test_mss_idx(void)
 	assert(nd_mss_idx(1300, 1) == 1);
 }
 
+/* таблицы MSS упакованы в константы (без .rodata — clang 14): значения как в D4 */
+static void test_mss_tab(void)
+{
+	static const __u16 v4[8] = {536, 1220, 1300, 1360, 1400, 1440, 1452, 1460};
+	static const __u16 v6[8] = {1220, 1280, 1340, 1380, 1400, 1420, 1432, 1440};
+	__u32 i;
+
+	for (i = 0; i < 8; i++) {
+		assert(nd_mss_tab(i, 0) == v4[i]);
+		assert(nd_mss_tab(i, 1) == v6[i]);
+		assert(nd_mss_tab(i + 8, 0) == v4[i]);   /* индекс по модулю 8 */
+	}
+}
+
 int main(void)
 {
 	test_siphash_vector48();
@@ -107,6 +121,7 @@ int main(void)
 	test_tamper();
 	test_ws_none();
 	test_mss_idx();
+	test_mss_tab();
 	puts("COOKIE OK");
 	return 0;
 }

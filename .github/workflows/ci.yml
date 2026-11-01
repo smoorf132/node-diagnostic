@@ -12,7 +12,7 @@ jobs:
       - name: install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: shellcheck (severity=warning)
-        run: shellcheck --severity=warning --shell=bash node-diagnostic.sh install.sh lib/common.sh lib/dns.sh modules/*.sh tests/smoke.sh tests/sshport-it.sh tests/guard-deps.sh tests/guard-netns.sh
+        run: shellcheck --severity=warning --shell=bash node-diagnostic.sh install.sh lib/common.sh lib/dns.sh modules/*.sh tests/smoke.sh tests/sshport-it.sh tests/integration.sh tests/guard-deps.sh tests/guard-netns.sh tests/guard-distro-bpftool.sh
 
   # компиляция eBPF-шейпера (nd-shaper.bpf.c) — чтобы правки BPF-программы
   # не ломались молча; сам attach проверяется только на живой ноде
@@ -47,6 +47,9 @@ jobs:
           test -s /tmp/nd-guard-tc.bpf.o
           readelf -S /tmp/nd-guard-tc.bpf.o | grep -qE '\] tc '
           echo "BPF compiled OK (tc)"
+      - name: guard — без .rodata (clang 14 + libbpf отвергают .rodata.cst16 при DATASEC .rodata)
+        run: |
+          ! readelf -S /tmp/nd-guard-xdp.bpf.o /tmp/nd-guard-tc.bpf.o | grep -q rodata
       - name: host-тест cookie
         run: |
           cc -O2 -Wall -Werror -I modules -o /tmp/gct tests/guard_cookie_test.c
@@ -87,6 +90,33 @@ jobs:
           sudo ND_GUARD_REQUIRE_KFUNC=1 bash tests/guard-netns.sh raw
       - name: netns-стенд, режим guard (modules/guard.sh)
         run: sudo ND_GUARD_REQUIRE_KFUNC=1 bash tests/guard-netns.sh guard
+
+  # R14: bpftool и тулчейн дистрибутива, без статического bpftool из tests/guard-deps.sh (её здесь
+  # нет): ensure_bpftool сам ставит пакет bpftool (Debian) или проходит linux-tools Ubuntu мимо
+  # нерабочей обёртки (5.15 = libbpf 0.5 не годится) до статического; guard.sh грузит им оба объекта
+  guard-distro-bpftool:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: "debian:12"
+            pre: ""
+            expect: "pkg"
+          - image: "ubuntu:22.04"
+            pre: "linux-tools-common"
+            expect: "linux-tools static"
+    steps:
+      - uses: actions/checkout@v4
+      - name: ensure_bpftool + загрузка guard в ${{ matrix.image }}
+        run: |
+          docker run --rm --privileged -e ND_BPFTOOL_EXPECT="${{ matrix.expect }}" -v "$PWD:/w" -w /w ${{ matrix.image }} bash -c '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends clang libbpf-dev linux-libc-dev gcc-multilib \
+              iproute2 python3 ca-certificates curl ${{ matrix.pre }} >/dev/null
+            bash tests/guard-distro-bpftool.sh'
 
   smoke-ubuntu:
     runs-on: ubuntu-latest

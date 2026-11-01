@@ -24,6 +24,10 @@ PIN_MAPS="$PIN_ROOT/maps"
 SHAPER_UNIT="node-diagnostic-shaper"
 PROG_DOWN="nd_shape_down"
 PROG_UP="nd_shape_up"
+# shape_ctrl.py берёт путь из env; рабочий bpftool без установок (on/reattach ставят сами)
+BPFTOOL="${BPFTOOL:-bpftool}"
+export BPFTOOL
+case "${1:-}" in "" | help | -h | --help) ;; *) bpftool_find >/dev/null 2>&1 ;; esac
 
 _iface() { default_iface; }
 # «шейпер реально прицеплен» = пиннута программа (каталог мог остаться от провала)
@@ -36,13 +40,12 @@ _kernel_ge_54() {
 
 _ensure_tools() {
     ensure_pkg clang clang clang clang >/dev/null 2>&1 || true
-    ensure_pkg bpftool "linux-tools-common" bpftool bpftool >/dev/null 2>&1 || true
-    # bpftool на Ubuntu иногда в linux-tools-$(uname -r) / linux-tools-generic
-    have bpftool || ensure_pkg bpftool "linux-tools-$(uname -r)" bpftool bpftool >/dev/null 2>&1 || true
-    have bpftool || ensure_pkg bpftool "linux-tools-generic" bpftool bpftool >/dev/null 2>&1 || true
+    # R14: PATH → пакет bpftool (Debian) → linux-tools Ubuntu (XanMod — мимо обёртки) → статический
+    ensure_bpftool >/dev/null 2>&1 || true
     ensure_pkg python3 python3 python3 python3 >/dev/null 2>&1 || true
     local miss=""
-    for t in clang bpftool python3 tc; do have "$t" || miss="$miss $t"; done
+    for t in clang python3 tc; do have "$t" || miss="$miss $t"; done
+    bpftool_usable "$BPFTOOL" || miss="$miss bpftool"
     [ -n "$miss" ] && { msg_err "не хватает:$miss (поставь clang/bpftool(linux-tools)/python3/iproute2 + libbpf-dev/linux-headers)"; return 1; }
     return 0
 }
@@ -69,7 +72,7 @@ _attach() {
     # чистый повторный attach
     rm -rf "$PIN_ROOT" 2>/dev/null || true
     mkdir -p "$PIN_PROGS" "$PIN_MAPS"
-    if ! bpftool prog loadall "$BPF_OBJ" "$PIN_PROGS" type classifier pinmaps "$PIN_MAPS" 2>/tmp/nd-shaper-load.log; then
+    if ! "$BPFTOOL" prog loadall "$BPF_OBJ" "$PIN_PROGS" type classifier pinmaps "$PIN_MAPS" 2>/tmp/nd-shaper-load.log; then
         msg_err "bpftool prog loadall упал — смотри /tmp/nd-shaper-load.log (ядро без BPF/clsact?)"
         return 1
     fi
