@@ -140,6 +140,7 @@ Firewall на удалённой ноде может отрезать SSH, по�
 
 Генерируется:
 - `firewall.nft` / `firewall-ufw.sh` — карта портов ноды: **443** (VLESS/Reality + QUIC/HY2) и **80** (ACME/Caddy) всем; **NODE_PORT** (control-API панель→нода) — только с IP панели; **SSH** — с твоего IP или из подсети NetBird (см. ниже); ICMP не режется полностью (нужен для PMTU), только per-IP флуд; per-IP connlimit/SYN-rate; всё прочее — drop. `61000`/localhost и Caddy `:9443`/localhost наружу не открываются. В `firewall.nft` есть перманентный бан подсетей: set `banned4` из `BAN_NETS` (по умолчанию `185.224.228.0/22 195.209.120.0/22 212.192.156.0/23 212.192.158.0/24 194.165.22.0/23`). Drop стоит раньше `established` в input и в forward, поэтому рвутся и уже открытые сессии, и трафик в docker-bridge. Свой список задаётся через `BAN_NETS="a/N b/N"`, `BAN_NETS=""` отключает бан. На применённом firewall подсеть добавляется так: `nft add element inet node_protect banned4 { X/N }`.
+- **Мосты и каскады** — set `trusted4` в `firewall.nft`. Нода-мост ходит сюда с одного IP за всеми своими пользователями: у неё тысячи соединений и SYN идут пачками. Per-IP лимиты 443 (2048 соединений, 200 SYN/с) отрезали бы её целиком: на мосту в логе `connect: connection timed out`, здесь `REALITY: … failed to read client hello`. Адреса из `--allow IP|CIDR` (флаг повторяемый, в меню — отдельный вопрос) и `ALLOW_NETS="IP1 IP2"` идут на 443 TCP/UDP мимо лимитов, со счётчиком. Бан сильнее: его drop стоит раньше. На применённом firewall: `nft add element inet node_protect trusted4 { X }`. При guard варианта 1 зарубежный мост нужно добавить ещё и в `rr guard allow`.
 - `sshd-hardening.conf` — key-only, `PermitRootLogin prohibit-password` и т.д. (модуль проверяет наличие `authorized_keys` и предупреждает о риске лок-аута).
 - `sysctl` DDoS-хардненинг идёт через `optimize` (syncookies/anti-spoof).
 - Анти-брут SSH здесь не генерируется: CrowdSec ставится через `install crowdsec`, шаг описан в `APPLY.txt`.
@@ -148,6 +149,7 @@ Firewall на удалённой ноде может отрезать SSH, по�
 sudo bash node-diagnostic.sh protect --panel-ip <IP_панели> --node-port <NODE_PORT>
 # → /root/node-diagnostic-protect/  (открыть APPLY.txt)
 sudo bash node-diagnostic.sh protect --panel-ip <IP_панели> --ssh-from 100.92.0.0/16   # SSH только из NetBird
+sudo bash node-diagnostic.sh protect --panel-ip <IP_панели> --allow <IP_ноды-моста>     # мост мимо per-IP лимитов
 ```
 
 Откуда пускать SSH:

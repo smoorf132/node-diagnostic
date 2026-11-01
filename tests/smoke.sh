@@ -52,6 +52,31 @@ if ! grep -q 'elements = { *}' "$nob/firewall.nft" 2>/dev/null && grep -q 'set b
 else
     bad "protect: BAN_NETS пустой / с мусором"
 fi
+# мосты/каскады: set trusted4 обходит per-IP лимиты 443 (TCP и UDP); бан сильнее — его drop раньше
+if awk '/set trusted4/,/}/' "$out/firewall.nft" 2>/dev/null | grep -q 'type ipv4_addr' \
+   && ! awk '/set trusted4/,/}/' "$out/firewall.nft" | grep -q 'elements' \
+   && grep -q 'ip saddr @trusted4 udp dport 443 counter accept' "$out/firewall.nft" \
+   && awk '/@banned4 counter drop/ && !b {b=NR} /ip saddr @trusted4 tcp dport 443 counter accept/ {t=NR}
+           /meter conn443_4/ {c=NR} END {exit !(b && t && c && b < t && t < c)}' "$out/firewall.nft"; then
+    ok "protect: trusted4 пустой, между banned4 и лимитами 443"
+else
+    bad "protect: нет trusted4 или он не перед лимитами 443"
+fi
+alo=$(mktemp -d)
+ALLOW_NETS="185.151.243.231 bogus" bash modules/protect.sh --panel-ip 203.0.113.5 --node-port 2222 \
+    --allow 10.1.2.3/8 --out "$alo" >/dev/null 2>&1
+if awk '/set trusted4/,/}/' "$alo/firewall.nft" 2>/dev/null | grep -q 'elements = { 185.151.243.231/32, 10.0.0.0/8 }' \
+   && grep -q 'nft add element inet node_protect trusted4' "$alo/APPLY.txt" 2>/dev/null; then
+    ok "protect: ALLOW_NETS + --allow → trusted4, мусор отброшен, APPLY с командой на лету"
+else
+    bad "protect: ALLOW_NETS / --allow не попали в trusted4"
+fi
+if command -v nft >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+    sed 's/<YOUR_SSH_IP>/198.51.100.2/g' "$alo/firewall.nft" > "$alo/fw.nft"
+    nft -c -f "$alo/fw.nft" >/dev/null 2>&1 && ok "nft -c (trusted4 с адресами)" || bad "nft -c (trusted4 с адресами)"
+fi
+bash modules/protect.sh --allow bogus --out "$alo/x" >/dev/null 2>&1 && bad "--allow мусор принят" || ok "--allow отвергает мусор"
+bash node-diagnostic.sh help 2>/dev/null | grep -q -- '--allow IP|CIDR' && ok "help: protect --allow" || bad "help: protect --allow"
 # синтаксис nft (если есть nft) — подставляем плейсхолдеры реальными значениями
 if command -v nft >/dev/null 2>&1; then
     sed -e 's/<PANEL_IP>/198.51.100.1/g' -e 's/<YOUR_SSH_IP>/198.51.100.2/g' \
