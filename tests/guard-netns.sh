@@ -36,7 +36,7 @@ FOREIGN4=10.200.0.200 FOREIGN6=fd00:200::200
 GUARD_CASES=(geo_unavailable_refuses ssh_port_refused variant1_geo_drop xdp_mode_veth allowlist_bypasses_geo
              notrack_no_conntrack_entries icmp_errors_not_invalid variant2_cookies_always
              tc_load_fail_degrades reapply_no_stacking
-             shaper_survives_guard certbot_hooks_toggle_geo_80 reattach_restores_from_disk
+             shaper_survives_guard shaper_legacy_filters_removed certbot_hooks_toggle_geo_80 reattach_restores_from_disk
              reattach_unconfirmed_rolls_back off_cleans_everything)
 TMP=""
 KEY=""
@@ -874,6 +874,41 @@ case_shaper_survives_guard() {
     out=$(cookie_echo "$SRV4")
     [ -z "$out" ] || why="$why cookie-путь после shape off: $out;"
     verdict "shaper_survives_guard (guard off → pref 49200 есть; shape off → pref 10 есть, cookie-эхо ок)" "$why"
+}
+
+# F6: обновление с версии шейпера без pref — её фильтры (авто-pref 49152…) на той же программе.
+# shape on оставляет ровно один свой фильтр на направление (pref 49200), shape off — ни одного;
+# чужой фильтр (matchall pref 20) и pref 10 guard не задеваются
+shaper_n() { in_srv tc filter show dev "$SRV_IF" "$1" | grep -cE 'handle .*nd_shape_(up|down)'; }
+shaper_legacy() {   # фильтры «прежней версии»: без pref, на текущих pin'ах
+    in_srv tc filter add dev "$SRV_IF" ingress bpf direct-action pinned /sys/fs/bpf/nd-shaper/progs/nd_shape_up \
+        && in_srv tc filter add dev "$SRV_IF" egress bpf direct-action pinned /sys/fs/bpf/nd-shaper/progs/nd_shape_down
+}
+case_shaper_legacy_filters_removed() {
+    local out g10=0 why=""
+    if [ -e /sys/fs/bpf/nd-shaper ] || [ -e /etc/systemd/system/node-diagnostic-shaper.service ]; then
+        skip "shaper_legacy_filters_removed — на хосте уже есть шейпер (не трогаю)"
+        return
+    fi
+    tc_has 10 && g10=1
+    SHAPE_TOUCHED=1
+    if ! out=$(shape on); then bad "shaper_legacy_filters_removed: shape on: $(tail3 "$out")"; return; fi
+    in_srv tc filter add dev "$SRV_IF" ingress pref 20 matchall action pass || why="чужой matchall не встал;"
+    shaper_legacy || why="$why фильтры без pref не встали;"
+    [ "$(shaper_n ingress) $(shaper_n egress)" = "2 2" ] || why="$why до shape on своих фильтров не 2+2;"
+    out=$(shape on) || why="$why shape on №2: $(tail3 "$out");"
+    [ "$(shaper_n ingress) $(shaper_n egress)" = "1 1" ] \
+        || why="$why после shape on своих фильтров $(shaper_n ingress)+$(shaper_n egress), а не 1+1;"
+    tc_has 49200 || why="$why нет pref 49200;"
+    shaper_legacy || why="$why фильтры без pref №2 не встали;"
+    out=$(shape off) || why="$why shape off: $(tail3 "$out");"
+    SHAPE_TOUCHED=0
+    [ "$(shaper_n ingress) $(shaper_n egress)" = "0 0" ] \
+        || why="$why после shape off своих фильтров $(shaper_n ingress)+$(shaper_n egress);"
+    tc_has 20 || why="$why чужой pref 20 снят;"
+    [ "$g10" = 0 ] || tc_has 10 || why="$why pref 10 guard снят;"
+    in_srv tc filter del dev "$SRV_IF" ingress pref 20 2>/dev/null
+    verdict "shaper_legacy_filters_removed (on: 1+1 на pref 49200; off: 0; pref 20 и guard pref 10 на месте)" "$why"
 }
 
 # Review Focus 4 / D7: certbot pre-хук снимает гео с порта 80, post — возвращает; 443 не трогается

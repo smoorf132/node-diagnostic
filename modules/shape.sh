@@ -65,6 +65,33 @@ _compile() {
     msg_ok "собрано: $BPF_OBJ"
 }
 
+# IFACE DIR → «pref handle» фильтров шейпера на любом pref: программа nd_shape_up|down (имя pin'а
+# «nd_shape_up:[*fsobj]» или «name nd_shape_up»). Прежняя версия ставила их без pref — авто 49152…
+_shaper_filters() {
+    tc filter show dev "$1" "$2" 2>/dev/null | awk -v up="$PROG_UP" -v down="$PROG_DOWN" '
+        / handle / {
+            p = ""; h = ""; ours = 0
+            for (i = 1; i <= NF; i++) {
+                if ($i == "pref" && i < NF) p = $(i + 1)
+                if ($i == "handle" && i < NF) h = $(i + 1)
+                if ($i == up || $i == down || index($i, up ":") == 1 || index($i, down ":") == 1) ours = 1
+            }
+            if (ours && p != "" && h != "") print p, h
+        }'
+}
+
+# IFACE — снять все свои фильтры обоих направлений по pref+handle: ни guard (pref 10), ни чужие
+# фильтры (в т.ч. на том же pref) не задеваются
+_shaper_filters_purge() {
+    local d p h
+    for d in ingress egress; do
+        while read -r p h; do
+            tc filter del dev "$1" "$d" pref "$p" handle "$h" bpf 2>/dev/null || true
+        done < <(_shaper_filters "$1" "$d")
+    done
+    return 0
+}
+
 _attach() {
     local iface; iface=$(_iface)
     [ -n "$iface" ] || { msg_err "не определён интерфейс (нет iproute2?)"; return 1; }
@@ -77,6 +104,8 @@ _attach() {
         return 1
     fi
     clsact_ensure "$iface" || { msg_err "tc clsact не добавился на $iface"; return 1; }
+    # обновление с версии без pref: её фильтры (авто-pref) шейпили бы второй раз старыми картами
+    _shaper_filters_purge "$iface"
     tc_filter_put "$iface" egress  "$ND_TC_PREF_SHAPER" bpf direct-action pinned "$PIN_PROGS/$PROG_DOWN" 2>/dev/null || { msg_err "не прицепился DOWN-фильтр"; return 1; }
     tc_filter_put "$iface" ingress "$ND_TC_PREF_SHAPER" bpf direct-action pinned "$PIN_PROGS/$PROG_UP"   2>/dev/null || { msg_err "не прицепился UP-фильтр"; return 1; }
     msg_ok "BPF-шейпер прицеплен к $iface (egress+ingress)"
@@ -143,6 +172,7 @@ shape_off() {
     if [ -n "$iface" ]; then
         tc filter del dev "$iface" egress  pref "$ND_TC_PREF_SHAPER" 2>/dev/null || true
         tc filter del dev "$iface" ingress pref "$ND_TC_PREF_SHAPER" 2>/dev/null || true
+        _shaper_filters_purge "$iface"   # и оставшиеся от версии без pref (авто 49152…)
         clsact_release "$iface"
     fi
     rm -rf "$PIN_ROOT" 2>/dev/null || true
