@@ -502,6 +502,35 @@ class GuardXdpTest(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertGreater(int(m.group(1)), int(m.group(2)))
 
+    def state(self):
+        m = re.fullmatch(r"attack_until_ns=(\d+) now_ns=(\d+)", self.ctrl("state"))
+        self.assertIsNotNone(m)
+        return int(m.group(1)), int(m.group(2))
+
+    def set_attack_until(self, ns):
+        r = run([BPFTOOL, "map", "update", "pinned", MAPS + "/guard_state_map", "key", "hex",
+                 "00", "00", "00", "00", "value", "hex",
+                 *["%02x" % b for b in struct.pack("=QQQ", 0, 0, ns)]])
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_auto_attack_until_moves_by_whole_seconds(self):
+        # M2: под флудом attack_until_ns пишется, только если сдвигается вперёд на ≥ 1 с
+        # (иначе запись на каждый SYN гоняет строку кэша между CPU); hold — 60 с
+        self.set_cfg(cookies="auto", threshold=0)
+        hold = 60 * 10 ** 9
+        _, now = self.state()
+        near = now + hold - 2 * 10 ** 8          # новое значение ушло бы вперёд на < 1 с
+        self.set_attack_until(near)
+        self.assertEqual(self.send(syn(RU4))[0], XDP_TX)
+        self.assertEqual(self.state()[0], near, "attack_until переписан, хотя сдвиг < 1 с")
+        _, now = self.state()
+        far = now + hold - 5 * 10 ** 9           # сдвиг ≈ 5 с — пишется
+        self.set_attack_until(far)
+        self.assertEqual(self.send(syn(RU4))[0], XDP_TX)
+        until, now = self.state()
+        self.assertGreater(until, far + 10 ** 9)
+        self.assertLessEqual(until, now + hold)
+
     # ── guard_ctrl: синхронизация гео ──
 
     def test_geo_sync_add_then_delete(self):

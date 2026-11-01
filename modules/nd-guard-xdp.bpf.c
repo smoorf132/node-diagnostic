@@ -180,12 +180,14 @@ __noinline __u64 nd_syn_opts(struct xdp_md *ctx, __u32 v6, __u32 optlen)
 }
 
 /* Окно SYN 1 с + режим cookies. XADD без fetch (ядро < 5.12, -mcpu=v1): счётчик читается
- * после инкремента — то же n = fetch_add + 1, при гонке CPU — не меньше. */
+ * после инкремента — то же n = fetch_add + 1, при гонке CPU — не меньше.
+ * attack_until_ns под флудом пишется, только если сдвигается вперёд хотя бы на 1 с: запись на
+ * каждый SYN гоняла бы общую строку кэша между CPU. Удержание короче hold_sec меньше чем на 1 с. */
 static __always_inline int syn_wants_cookie(const struct guard_cfg *cfg, __u64 now)
 {
 	__u32 zero = 0;
 	struct guard_state *st = bpf_map_lookup_elem(&guard_state_map, &zero);
-	__u64 n;
+	__u64 n, until;
 
 	if (!st)
 		return cfg->cookie_mode == COOKIE_ALWAYS;
@@ -195,8 +197,11 @@ static __always_inline int syn_wants_cookie(const struct guard_cfg *cfg, __u64 n
 	}
 	__sync_fetch_and_add(&st->win_syn, 1);
 	n = st->win_syn;
-	if (cfg->cookie_mode == COOKIE_AUTO && n > cfg->syn_threshold)
-		st->attack_until_ns = now + (__u64)cfg->hold_sec * GUARD_NSEC;
+	if (cfg->cookie_mode == COOKIE_AUTO && n > cfg->syn_threshold) {
+		until = now + (__u64)cfg->hold_sec * GUARD_NSEC;
+		if (until >= st->attack_until_ns + GUARD_NSEC)
+			st->attack_until_ns = until;
+	}
 	if (cfg->cookie_mode == COOKIE_ALWAYS)
 		return 1;
 	return cfg->cookie_mode == COOKIE_AUTO && now < st->attack_until_ns;
