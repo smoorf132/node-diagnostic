@@ -37,7 +37,7 @@ GUARD_CASES=(geo_unavailable_refuses variant1_geo_drop xdp_mode_veth allowlist_b
              notrack_no_conntrack_entries variant2_cookies_always
              tc_load_fail_degrades reapply_no_stacking
              shaper_survives_guard certbot_hooks_toggle_geo_80 reattach_restores_from_disk
-             off_cleans_everything)
+             reattach_unconfirmed_rolls_back off_cleans_everything)
 TMP=""
 KEY=""
 SRV_PID=""
@@ -805,17 +805,22 @@ case_certbot_hooks_toggle_geo_80() {
     verdict "certbot_hooks_toggle_geo_80 (pre: 80 → $p1, post: 80 → $p2)" "$why"
 }
 
-# reboot: XDP/tc сняты, pin'ы и NOTRACK пропали, сеть «недоступна» — reattach поднимает всё по
-# guard.conf и гео-кешу (без скачиваний)
-case_reattach_restores_from_disk() {
-    local out why=""
-    if ! out=$(g_on --geo ru); then bad "reattach_restores_from_disk: on: $(tail3 "$out")"; return; fi
+# имитация reboot: XDP/tc сняты, pin'ы и NOTRACK пропали (GUARD_DIR на диске — остался); rc 1 — не вышло
+reboot_sim() {
     in_srv ip link set dev "$SRV_IF" xdpdrv off 2>/dev/null
     in_srv ip link set dev "$SRV_IF" xdpgeneric off 2>/dev/null
     in_srv tc filter del dev "$SRV_IF" ingress pref 10 2>/dev/null
     in_srv nft delete table inet nd_guard 2>/dev/null
     rm -rf "$PIN"
-    if [ -n "$(srv_xdp)" ] || tc_has 10 || nft_has; then bad "reattach_restores_from_disk: имитация reboot не удалась"; return; fi
+    [ -z "$(srv_xdp)" ] && ! tc_has 10 && ! nft_has
+}
+
+# reboot: XDP/tc сняты, pin'ы и NOTRACK пропали, сеть «недоступна» — reattach поднимает всё по
+# guard.conf и гео-кешу (без скачиваний)
+case_reattach_restores_from_disk() {
+    local out why=""
+    if ! out=$(g_on --geo ru); then bad "reattach_restores_from_disk: on: $(tail3 "$out")"; return; fi
+    if ! reboot_sim; then bad "reattach_restores_from_disk: имитация reboot не удалась"; return; fi
     out=$(GUARD_GEO_RIPE_URL=file:///nonexistent guard reattach) || why="reattach rc≠0: $(tail3 "$out");"
     [ -n "$(srv_xdp)" ] || why="$why нет XDP;"
     why="$why$(xdp_mode_why "$(cookie_xdp_mode)")"   # reattach выбирает режим так же, как on (R11)
@@ -824,6 +829,37 @@ case_reattach_restores_from_disk() {
     out=$(cli_from "$CLI4" "$SRV4") || why="$why RU v4 не прошёл ($out);"
     cli_from "$FOREIGN4" "$SRV4" >/dev/null && why="$why чужой v4 прошёл — гео не из кеша;"
     verdict "reattach_restores_from_disk (XDP $(cookie_xdp_mode), tc, NOTRACK и гео по кешу)" "$why"
+}
+
+# F3/D10: on без подтверждения оставляет метку unconfirmed (dead-man — таймер systemd-run, reboot его
+# не переживает; GUARD_NO_SYSTEMD=1 → GUARD_FORCE_UNCONFIRMED=1). Reboot до подтверждения: reattach
+# не поднимает guard, а снимает целиком, как dead-man (guard off), rc 0. guard confirm и on --confirm
+# метку снимают — тогда reattach восстанавливает
+case_reattach_unconfirmed_rolls_back() {
+    local out rc mark="$GUARD_DIR/unconfirmed" why=""
+    if ! out=$(GUARD_FORCE_UNCONFIRMED=1 guard on --geo ru --iface "$SRV_IF"); then
+        bad "reattach_unconfirmed_rolls_back: on: $(tail3 "$out")"
+        return
+    fi
+    [ -e "$mark" ] || why="on без --confirm не оставил метку;"
+    if ! reboot_sim; then bad "reattach_unconfirmed_rolls_back: имитация reboot не удалась"; return; fi
+    out=$(GUARD_GEO_RIPE_URL=file:///nonexistent guard reattach)
+    rc=$?
+    [ "$rc" = 0 ] || why="$why reattach rc $rc;"
+    printf '%s\n' "$out" | grep -q 'не был подтверждён до перезагрузки' || why="$why нет сообщения об откате [$(tail3 "$out")];"
+    why="$why$(gone)"
+    [ ! -e "$GUARD_DIR/guard.conf" ] || why="$why guard.conf остался;"
+    [ ! -e "$mark" ] || why="$why метка осталась;"
+    # confirm снимает метку → reboot восстанавливает; on --confirm метку не ставит
+    out=$(GUARD_FORCE_UNCONFIRMED=1 guard on --geo ru --iface "$SRV_IF") || why="$why on №2: $(tail3 "$out");"
+    out=$(guard confirm) || why="$why confirm: $(tail3 "$out");"
+    [ ! -e "$mark" ] || why="$why guard confirm не снял метку;"
+    reboot_sim || why="$why имитация reboot №2;"
+    out=$(GUARD_GEO_RIPE_URL=file:///nonexistent guard reattach) || why="$why reattach после confirm: $(tail3 "$out");"
+    [ -n "$(srv_xdp)" ] || why="$why после confirm reattach не вернул XDP;"
+    out=$(GUARD_FORCE_UNCONFIRMED=1 g_on --geo ru) || why="$why on --confirm: $(tail3 "$out");"
+    [ ! -e "$mark" ] || why="$why on --confirm оставил метку;"
+    verdict "reattach_unconfirmed_rolls_back (без подтверждения reboot → guard off, rc 0; confirm → reattach восстанавливает)" "$why"
 }
 
 # off --keep-config снимает рантайм, но оставляет guard.conf; off — и его. Ключ, гео-кеш и

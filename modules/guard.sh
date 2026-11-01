@@ -12,14 +12,14 @@
 #   guard reattach                     # systemd на boot: из GUARD_DIR, без скачиваний
 #   guard allow CIDR | unallow CIDR    # обход гео и cookies (+ GUARD_DIR/allow.list)
 #   guard update-geo                   # таймер: обновить гео-список
-#   guard confirm                      # снять dead-man
+#   guard confirm                      # снять dead-man и метку «не подтверждён» (иначе reboot откатит)
 #   guard hook pre|post                # certbot: снять/вернуть гео на 80
 # rc: 0 — ок, 1 — ошибка выполнения, 2 — неверные аргументы.
 #
 # Карты трогает только guard_ctrl.py; гео-список собирает guard_geo.py из файлов, которые качает
 # этот модуль. Env для тестов: GUARD_DIR, GUARD_PIN, GUARD_NO_SYSTEMD=1 (без юнитов, таймера,
-# dead-man и хуков), GUARD_FORCE_KFUNC=0|1, GUARD_GEO_RIPE_URL, GUARD_GEO_DBIP_URL,
-# GUARD_GEO_MIN_V4_ADDRS, GUARD_GEO_MIN_V4_PREFIXES, GUARD_GEO_MIN_V6_PREFIXES (→ guard_geo.py).
+# dead-man и хуков), GUARD_FORCE_KFUNC=0|1, GUARD_FORCE_UNCONFIRMED=1 (метка без dead-man), GUARD_GEO_RIPE_URL,
+# GUARD_GEO_DBIP_URL, GUARD_GEO_MIN_V4_ADDRS, GUARD_GEO_MIN_V4_PREFIXES, GUARD_GEO_MIN_V6_PREFIXES (→ guard_geo.py).
 # Подключается через source (smoke): guard_main выполняется, только если файл запущен напрямую.
 set -u
 _guard_self="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -35,6 +35,7 @@ GUARD_KEY="$GUARD_DIR/key"
 GUARD_GEO_CACHE="$GUARD_DIR/geo"                # принятый гео-список: geo4.txt, geo6.txt, geo.meta
 GUARD_ALLOW="$GUARD_DIR/allow.list"
 GUARD_LOADED="$GUARD_DIR/geo-loaded"            # что лежит в geo-картах (geo-sync --loaded-dir)
+GUARD_UNCONFIRMED="$GUARD_DIR/unconfirmed"      # on без подтверждения: reattach на boot откатывает
 GUARD_STAGE="$GUARD_PIN-new"                    # загрузка до attach; bpffs не принимает «.» в имени
 GUARD_CTRL="$_guard_self/guard_ctrl.py"
 GUARD_GEO_PY="$_guard_self/guard_geo.py"
@@ -628,12 +629,17 @@ HOOK
     return 0
 }
 
-_guard_units_remove() {   # off без --keep-config
+_guard_units_remove() {   # off без --keep-config; boot — из ExecStart самого юнита guard (reattach)
     local d=/etc/systemd/system
     if _guard_systemd; then
         systemctl disable --now "$GUARD_GEO_UNIT.timer" >/dev/null 2>&1
-        # stop запустит ExecStop (off --keep-config) — рантайм уже снят, он ничего не найдёт
-        systemctl disable --now "$GUARD_UNIT.service" >/dev/null 2>&1
+        if [ "${1:-}" = boot ]; then
+            # stop своего юнита из его же ExecStart ждал бы сам себя — только disable
+            systemctl disable "$GUARD_UNIT.service" >/dev/null 2>&1
+        else
+            # stop запустит ExecStop (off --keep-config) — рантайм уже снят, он ничего не найдёт
+            systemctl disable --now "$GUARD_UNIT.service" >/dev/null 2>&1
+        fi
         rm -f "$d/$GUARD_UNIT.service" "$d/$GUARD_GEO_UNIT.service" "$d/$GUARD_GEO_UNIT.timer"
         systemctl daemon-reload >/dev/null 2>&1
     fi
@@ -643,6 +649,12 @@ _guard_units_remove() {   # off без --keep-config
 }
 
 _guard_deadman_armed() { _guard_systemd && systemctl is-active --quiet "$GUARD_DEADMAN.timer"; }
+
+# F3/D10: таймер dead-man (systemd-run) reboot не переживает, а юнит guard включён — без метки
+# перезагрузка в окне dead-man сделала бы неподтверждённый guard постоянным. Метка — в GUARD_DIR
+# (переживает reboot); снимают её подтверждение (confirm, «y», on --confirm) и полный off.
+_guard_unconfirmed_set() { mkdir -p "$GUARD_DIR" && : >"$GUARD_UNCONFIRMED"; }
+_guard_unconfirmed_clear() { rm -f "$GUARD_UNCONFIRMED"; }
 
 _guard_deadman_stop() {
     _guard_systemd || return 0
@@ -870,17 +882,28 @@ guard_on() {
         fi
     fi
     _guard_apply on                                                            # 11–17
+    # F3: метка «не подтверждён» — до юнитов (18): reboot до подтверждения откатит guard в reattach.
+    # GUARD_FORCE_UNCONFIRMED=1 — как с dead-man, но без systemd (netns-стенд)
+    if [ "$G_CONFIRM" != 1 ] && { _guard_systemd || [ "${GUARD_FORCE_UNCONFIRMED:-0}" = 1 ]; }; then
+        _guard_unconfirmed_set
+    fi
     _guard_units_install                                                       # 18
     if [ "$G_CONFIRM" = 1 ]; then                                              # 19
         _guard_deadman_stop
-    elif _guard_deadman_arm && [ -t 0 ] && [ -t 1 ]; then
-        echo
-        if confirm "Клиенты подключаются?"; then
-            _guard_deadman_stop
-            msg_ok "подтверждено — dead-man снят"
-        else
-            msg_warn "dead-man остаётся: через $((GUARD_DEADMAN_SEC / 60)) мин guard выключится. Оставить: guard confirm, снять сейчас: guard off"
+        _guard_unconfirmed_clear
+    elif _guard_deadman_arm; then
+        if [ -t 0 ] && [ -t 1 ]; then
+            echo
+            if confirm "Клиенты подключаются?"; then
+                _guard_deadman_stop
+                _guard_unconfirmed_clear
+                msg_ok "подтверждено — dead-man снят"
+            else
+                msg_warn "dead-man остаётся: через $((GUARD_DEADMAN_SEC / 60)) мин guard выключится, перезагрузка до подтверждения тоже откатит его. Оставить: guard confirm, снять сейчас: guard off"
+            fi
         fi
+    elif [ "${GUARD_FORCE_UNCONFIRMED:-0}" != 1 ]; then
+        _guard_unconfirmed_clear   # dead-man не взвёлся (предупреждение уже было): метка — только при нём
     fi
     record_fix "guard on (geo=$G_GEO, cookies=$G_EFF, xdp=$G_XDP_MODE)"       # 20
     echo
@@ -891,6 +914,14 @@ guard_reattach() {   # systemd на boot: шаги 11–17 по guard.conf и г
     local c
     need_root || die "нужен root"
     [ $# -eq 0 ] || _guard_badarg "reattach: лишние аргументы"
+    if [ -e "$GUARD_UNCONFIRMED" ]; then   # F3: reboot в окне dead-man — откат, как сделал бы он сам
+        ui_head "Guard: reattach" "откат"
+        msg_warn "guard не был подтверждён до перезагрузки — откатываю (как dead-man: guard off)"
+        _guard_down 0 boot
+        record_fix "guard off (не подтверждён до перезагрузки)"
+        msg_ok "guard снят; включить снова: guard on, затем guard confirm"
+        return 0
+    fi
     _guard_defaults
     _guard_conf_load || die "нет или битый $GUARD_CONF — guard не включался (guard on)"
     ip link show dev "$G_IFACE" >/dev/null 2>&1 || die "нет интерфейса $G_IFACE"
@@ -915,6 +946,21 @@ guard_reattach() {   # systemd на boot: шаги 11–17 по guard.conf и г
     msg_ok "guard восстановлен: вариант $(_guard_variant) · cookies $G_EFF · XDP $G_XDP_MODE · $G_IFACE"
 }
 
+# KEEP(0|1) [boot] — рантайм и dead-man снять; KEEP=0 — ещё юниты, хуки, guard.conf и метку F3.
+# off --keep-config (ExecStop юнита на shutdown) метку не трогает: иначе reboot в окне dead-man
+# стирал бы её до reattach. boot — вызов из ExecStart юнита (reattach): свой юнит не останавливать
+_guard_down() {
+    _guard_defaults
+    _guard_conf_load || true
+    _guard_runtime_down
+    _guard_deadman_stop
+    if [ "$1" = 0 ]; then
+        _guard_units_remove "${2:-}"
+        rm -f "$GUARD_CONF"
+        _guard_unconfirmed_clear
+    fi
+}
+
 guard_off() {
     local keep=0
     need_root || die "нужен root"
@@ -924,14 +970,7 @@ guard_off() {
     *) _guard_badarg "off: неизвестный аргумент '$1' (--keep-config)" ;;
     esac
     [ $# -le 1 ] || _guard_badarg "off: лишние аргументы"
-    _guard_defaults
-    _guard_conf_load || true
-    _guard_runtime_down
-    _guard_deadman_stop
-    if [ "$keep" = 0 ]; then
-        _guard_units_remove
-        rm -f "$GUARD_CONF"
-    fi
+    _guard_down "$keep"
     record_fix "guard off$([ "$keep" = 1 ] && echo " --keep-config")"
     if [ "$keep" = 1 ]; then
         msg_ok "guard снят (конфиг и юниты сохранены — guard reattach вернёт)"
@@ -999,9 +1038,14 @@ guard_update_geo() {   # таймер: новый список принят → 
 guard_confirm() {
     need_root || die "нужен root"
     [ $# -eq 0 ] || _guard_badarg "confirm: лишние аргументы"
+    local had=0
+    [ -e "$GUARD_UNCONFIRMED" ] && had=1
+    _guard_unconfirmed_clear
     if _guard_deadman_armed; then
         _guard_deadman_stop
         msg_ok "dead-man снят — guard остаётся включённым"
+    elif [ "$had" = 1 ]; then
+        msg_ok "подтверждено — guard переживёт перезагрузку"
     else
         msg_info "dead-man не взведён"
     fi
@@ -1089,7 +1133,11 @@ guard_status() {
         box_kv "" "$(echo "$s" | cut -d' ' -f4-6)"
         box_kv "" "$(echo "$s" | cut -d' ' -f7-)"
     fi
-    _guard_deadman_armed && box_kv "Dead-man" "взведён — подтвердить: guard confirm"
+    if _guard_deadman_armed; then
+        box_kv "Dead-man" "взведён — подтвердить: guard confirm"
+    elif [ -e "$GUARD_UNCONFIRMED" ]; then
+        box_kv "Dead-man" "не подтверждён: reboot откатит — guard confirm"
+    fi
     box_bottom
     return 0
 }
