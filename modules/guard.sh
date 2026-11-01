@@ -420,19 +420,22 @@ _guard_compile() {   # → GUARD_DIR/nd-guard-{xdp,tc}.bpf.o; пропуск, е
 
 # WITH_TC → объекты в $GUARD_STAGE (живые pin'ы не тронуты до attach): XDP пинит карты, tc
 # переиспользует 4 общие по имени. Повторный on не копит программы: живой каталог заменяется целиком.
+# prog load с явным pin-путём (в каждом объекте одна программа), а не loadall: старый bpftool
+# пинил loadall по секции (progs/xdp), и attach по progs/nd_guard_xdp не находил программу.
+# rc 0 — всё загружено; 1 — XDP не загрузилась; 2 — XDP есть, tc-объект не загрузился (cookies — нет)
 _guard_load() {
     local m reuse=() log="$GUARD_DIR/load.log"
     grep -qs ' /sys/fs/bpf bpf ' /proc/mounts || mount -t bpf bpf /sys/fs/bpf 2>/dev/null
     rm -rf "$GUARD_STAGE" "$GUARD_LOADED.new"
-    mkdir -p "$GUARD_STAGE" || return 1
-    "$BPFTOOL" prog loadall "$GUARD_DIR/nd-guard-xdp.bpf.o" "$GUARD_STAGE/progs" type xdp \
+    mkdir -p "$GUARD_STAGE/progs" || return 1
+    "$BPFTOOL" prog load "$GUARD_DIR/nd-guard-xdp.bpf.o" "$GUARD_STAGE/progs/$GUARD_XDP_PROG" type xdp \
         pinmaps "$GUARD_STAGE/maps" >"$log" 2>&1 || return 1
     [ "$1" = 1 ] || return 0
     for m in guard_cfg_map guard_state_map guard_ports_map guard_stats_map; do
         reuse+=(map name "$m" pinned "$GUARD_STAGE/maps/$m")
     done
-    "$BPFTOOL" prog loadall "$GUARD_DIR/nd-guard-tc.bpf.o" "$GUARD_STAGE/progs" type classifier \
-        "${reuse[@]}" >>"$log" 2>&1
+    "$BPFTOOL" prog load "$GUARD_DIR/nd-guard-tc.bpf.o" "$GUARD_STAGE/progs/$GUARD_TC_PROG" type classifier \
+        "${reuse[@]}" >>"$log" 2>&1 || return 2
 }
 
 _guard_stage_commit() {   # прицеплено из $GUARD_STAGE → он становится $GUARD_PIN
@@ -731,7 +734,7 @@ _guard_sysctls() {
 # NOTRACK всё равно ставится). Вход: G_* (аргументы/конфиг), G_GEO_RT, G_EFF, G_KFUNC, G_XDP_OK.
 # Выход: G_XDP_MODE, G_GRO_HW_RESTORE, G_EFF; guard.conf записан.
 _guard_apply() {
-    local strict=0 need=0 tc=0 old_if="" old_gro=0 why=""
+    local strict=0 need=0 tc=0 old_if="" old_gro=0 why="" lrc
     [ "$1" = on ] && [ "$G_GEO_RT" = ru ] && strict=1
     _guard_need_xdp "$G_GEO_RT" "$G_EFF" "$G_KFUNC" && need=1
     [ "$need" = 1 ] && [ "$G_EFF" != off ] && tc=1
@@ -752,10 +755,23 @@ _guard_apply() {
             why="ключ $GUARD_KEY не создан"
         elif ! _guard_compile; then
             why="BPF не собрался"
-        elif ! _guard_load "$tc"; then
-            why="BPF не загрузился ($(tail -n 1 "$GUARD_DIR/load.log"))"
-        elif ! _guard_maps "$GUARD_STAGE/maps" "$GUARD_LOADED.new"; then
-            why="карты guard не настроились"
+        else
+            _guard_load "$tc"
+            lrc=$?
+            if [ "$lrc" = 2 ]; then
+                # как отказ tc attach (D9): cookies выключены, XDP остаётся для гео; без гео XDP без дела
+                msg_warn "tc-объект не загрузился ($(tail -n 1 "$GUARD_DIR/load.log")) — XDP-cookies выключаю, работают syncookies ядра"
+                tc=0 G_EFF=off
+                if ! _guard_need_xdp "$G_GEO_RT" "$G_EFF" "$G_KFUNC"; then
+                    _guard_stage_drop
+                    need=0
+                fi
+            fi
+            if [ "$lrc" = 1 ]; then
+                why="BPF не загрузился ($(tail -n 1 "$GUARD_DIR/load.log"))"
+            elif [ "$need" = 1 ] && ! _guard_maps "$GUARD_STAGE/maps" "$GUARD_LOADED.new"; then
+                why="карты guard не настроились"
+            fi
         fi
         if [ -n "$why" ]; then
             _guard_stage_drop

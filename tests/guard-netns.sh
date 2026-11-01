@@ -34,7 +34,8 @@ COOKIE_CASES=(cookie_handshake_v4 cookie_handshake_v6 dualstack_listener_v4_cook
 # режим guard: «чужие» (не из гео-фикстуры 10.200.0.0/25, fd00:200::/120) адреса клиента
 FOREIGN4=10.200.0.200 FOREIGN6=fd00:200::200
 GUARD_CASES=(geo_unavailable_refuses variant1_geo_drop xdp_mode_veth allowlist_bypasses_geo
-             notrack_no_conntrack_entries variant2_cookies_always reapply_no_stacking
+             notrack_no_conntrack_entries variant2_cookies_always
+             tc_load_fail_degrades reapply_no_stacking
              shaper_survives_guard certbot_hooks_toggle_geo_80 reattach_restores_from_disk
              off_cleans_everything)
 TMP=""
@@ -707,6 +708,35 @@ case_variant2_cookies_always() {
     [ "$(st assign_err "$s1")" = 0 ] || why="$why assign_err=$(st assign_err "$s1");"
     [ -z "$why" ] || why="$why [$s1]"
     verdict "variant2_cookies_always (RU и чужие v4/v6, cookie_ok +$(delta cookie_ok "$s0" "$s1"), XDP generic)" "$why"
+}
+
+# F2: tc-объект не загрузился (битый .o новее исходников — _guard_compile его не пересобирает) — как
+# отказ tc attach (D9): вариант 1 не отказывает, а ставит XDP для гео без cookies (drv, без pref 10);
+# вариант 2 без гео — только NOTRACK. Потом .o удаляется — следующий on соберёт его заново
+case_tc_load_fail_degrades() {
+    local out obj="$GUARD_DIR/nd-guard-tc.bpf.o" why=""
+    need_kfunc tc_load_fail_degrades || return
+    printf 'не ELF\n' >"$obj"
+    if out=$(g_on --geo ru --cookies always); then
+        printf '%s\n' "$out" | grep -q 'tc-объект не загрузился' || why="нет предупреждения о tc-объекте;"
+        why="$why$(xdp_mode_why drv)"
+        tc_has 10 && why="$why есть tc pref 10;"
+        grep -qx 'COOKIES=always' "$GUARD_DIR/guard.conf" 2>/dev/null || why="$why guard.conf не помнит cookies always;"
+        out=$(cli_from "$CLI4" "$SRV4") || why="$why RU v4 ($out);"
+        cli_from "$FOREIGN4" "$SRV4" >/dev/null && why="$why чужой v4 прошёл — гео не работает;"
+    else
+        why="вариант 1 отказал: $(tail3 "$out");"
+    fi
+    if out=$(g_on --cookies always); then
+        [ -z "$(srv_xdp)" ] || why="$why вариант 2: XDP висит без дела;"
+        tc_has 10 && why="$why вариант 2: есть tc pref 10;"
+        nft_has || why="$why вариант 2: нет NOTRACK;"
+        pin_empty || why="$why вариант 2: pin'ы не пусты;"
+    else
+        why="$why вариант 2 отказал: $(tail3 "$out");"
+    fi
+    rm -f "$obj"
+    verdict "tc_load_fail_degrades (вариант 1: XDP drv для гео без cookies; вариант 2: только NOTRACK)" "$why"
 }
 
 # повторный on не плодит программ и pin'ов; on без работы для XDP (гео и cookies выкл.) снимает их
