@@ -378,6 +378,14 @@ clsact_release() {
     return 0
 }
 
+# поставить свой tc-фильтр на pref идемпотентно: cls_bpf replace без handle плодит дубли,
+# поэтому сначала снимаем pref, затем add. tc_filter_put IFACE ingress|egress PREF <аргументы tc filter>
+tc_filter_put() {
+    local iface="$1" dir="$2" pref="$3"; shift 3
+    tc filter del dev "$iface" "$dir" pref "$pref" 2>/dev/null || true
+    tc filter add dev "$iface" "$dir" pref "$pref" "$@"
+}
+
 detect_ssh_port() {
     local p
     p=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')

@@ -74,6 +74,16 @@ clsact_release ndt0
 tc qdisc show dev ndt0 | grep -q clsact && bad "пустой clsact не убран" || ok "clsact_release убирает пустой qdisc"
 ip link del ndt0
 
+echo "== tc_filter_put: повторный attach не плодит дубли =="
+ip link add ndt1 type dummy && ip link set ndt1 up
+clsact_ensure ndt1
+tc_filter_put ndt1 ingress "$ND_TC_PREF_SHAPER" matchall action pass
+tc_filter_put ndt1 ingress "$ND_TC_PREF_SHAPER" matchall action pass
+n=$(tc filter show dev ndt1 ingress pref "$ND_TC_PREF_SHAPER" | grep -c 'matchall.*handle')
+[ "$n" = "1" ] && ok "tc_filter_put идемпотентен (1 фильтр)" || bad "tc_filter_put: фильтров $n вместо 1"
+tc filter del dev ndt1 ingress pref "$ND_TC_PREF_SHAPER"; clsact_release ndt1
+ip link del ndt1
+
 echo "== protect: генерация + nft -c =="
 out=$(mktemp -d)
 PROTECT_OUT="$out" bash modules/protect.sh --panel-ip 203.0.113.5 --node-port 2222 >/dev/null 2>&1

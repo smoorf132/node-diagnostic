@@ -74,8 +74,8 @@ _attach() {
         return 1
     fi
     clsact_ensure "$iface" || { msg_err "tc clsact не добавился на $iface"; return 1; }
-    tc filter replace dev "$iface" egress  pref "$ND_TC_PREF_SHAPER" bpf direct-action pinned "$PIN_PROGS/$PROG_DOWN" 2>/dev/null || { msg_err "не прицепился DOWN-фильтр"; return 1; }
-    tc filter replace dev "$iface" ingress pref "$ND_TC_PREF_SHAPER" bpf direct-action pinned "$PIN_PROGS/$PROG_UP"   2>/dev/null || { msg_err "не прицепился UP-фильтр"; return 1; }
+    tc_filter_put "$iface" egress  "$ND_TC_PREF_SHAPER" bpf direct-action pinned "$PIN_PROGS/$PROG_DOWN" 2>/dev/null || { msg_err "не прицепился DOWN-фильтр"; return 1; }
+    tc_filter_put "$iface" ingress "$ND_TC_PREF_SHAPER" bpf direct-action pinned "$PIN_PROGS/$PROG_UP"   2>/dev/null || { msg_err "не прицепился UP-фильтр"; return 1; }
     msg_ok "BPF-шейпер прицеплен к $iface (egress+ingress)"
 }
 

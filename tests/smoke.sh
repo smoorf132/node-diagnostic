@@ -227,7 +227,8 @@ bash modules/shape.sh help >/dev/null 2>&1 && ok "shape help" || bad "shape help
 bash modules/shape.sh bogus >/dev/null 2>&1; [ "$?" = "2" ] && ok "shape отвергает мусор (rc=2)" || bad "shape bogus rc"
 python3 -c 'import ast; ast.parse(open("modules/shape_ctrl.py").read())' 2>/dev/null && ok "shape_ctrl.py синтаксис" || bad "shape_ctrl.py syntax"
 if ! grep -q 'qdisc del dev "$iface" clsact' modules/shape.sh \
-   && [ "$(grep -c 'pref "$ND_TC_PREF_SHAPER"' modules/shape.sh)" -ge 4 ]; then
+   && [ "$(grep -c 'pref "$ND_TC_PREF_SHAPER"' modules/shape.sh)" -ge 2 ] \
+   && [ "$(grep -c 'tc_filter_put .*"$ND_TC_PREF_SHAPER"' modules/shape.sh)" -ge 2 ]; then
     ok "shape: свои фильтры по pref, clsact не сносится"
 else bad "shape: сносит clsact целиком"; fi
 
