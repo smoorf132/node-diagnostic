@@ -312,31 +312,50 @@ _guard_xdp_detach() {   # IF — снять только свою програм
 _guard_gro_hw() { ethtool -k "$1" 2>/dev/null | awk '/^rx-gro-hw:/ { print ($3 == "[fixed]") ? "fixed" : $2; exit }'; }
 _guard_gro_hw_set() { ethtool -K "$1" rx-gro-hw "$2" >/dev/null 2>&1; }
 
+# R11: native XDP_TX на veth кладёт кадр в кольцо peer'а, но будит его (veth_xdp_flush), только если
+# у peer'а своя XDP-программа. Peer eth0 контейнера LXC/Proxmox — на хосте, туда не поставить:
+# SYN-ACK с cookie пропадали бы молча (чёрная дыра, не fail-open D9). XDP_DROP/XDP_PASS (гео) это не
+# задевает. DRIVER COOKIES(0|1) → drv|generic
+_guard_xdp_mode_plan() { if [ "$1" = veth ] && [ "$2" = 1 ]; then echo generic; else echo drv; fi; }
+
+_guard_iface_driver() {   # IF → драйвер из ethtool -i; без ethtool veth узнаётся по типу ссылки (ip -d)
+    local d
+    d=$(ethtool -i "$1" 2>/dev/null | awk '/^driver:/ { print $2; exit }')
+    if [ -z "$d" ] && ip -d -o link show dev "$1" 2>/dev/null | grep -q ' veth '; then d=veth; fi
+    echo "$d"
+}
+
 # D12: native (xdpdrv); не встал и rx-gro-hw включён (virtio) — выключить и снова native, запомнив
-# вернуть на off; иначе xdpgeneric с предупреждением. IF PROG → G_XDP_MODE, G_GRO_HW_RESTORE.
+# вернуть на off; иначе xdpgeneric с предупреждением. R11: veth с cookie-путём — сразу generic.
+# IF PROG COOKIES(0|1) → G_XDP_MODE, G_GRO_HW_RESTORE.
 _guard_xdp_attach() {
-    local ifc="$1" prog="$2" log="$GUARD_DIR/xdp.log"
+    local ifc="$1" prog="$2" log="$GUARD_DIR/xdp.log" plan
+    plan=$(_guard_xdp_mode_plan "$(_guard_iface_driver "$ifc")" "$3")
     _guard_xdp_detach "$ifc"
     : >"$log"
-    if ip link set dev "$ifc" xdpdrv pinned "$prog" 2>>"$log"; then
-        G_XDP_MODE=drv
-        return 0
-    fi
-    if [ "$(_guard_gro_hw "$ifc")" = on ] && _guard_gro_hw_set "$ifc" off; then
+    if [ "$plan" = generic ]; then
+        msg_info "$ifc — veth: native XDP_TX не доходит до peer'а без его XDP-программы (peer на хосте), SYN-ACK с cookie терялись бы — XDP generic"
+    else
         if ip link set dev "$ifc" xdpdrv pinned "$prog" 2>>"$log"; then
-            G_XDP_MODE=drv G_GRO_HW_RESTORE=1
-            msg_info "rx-gro-hw на $ifc выключен ради native XDP (guard off вернёт)"
+            G_XDP_MODE=drv
             return 0
         fi
-        _guard_gro_hw_set "$ifc" on
+        if [ "$(_guard_gro_hw "$ifc")" = on ] && _guard_gro_hw_set "$ifc" off; then
+            if ip link set dev "$ifc" xdpdrv pinned "$prog" 2>>"$log"; then
+                G_XDP_MODE=drv G_GRO_HW_RESTORE=1
+                msg_info "rx-gro-hw на $ifc выключен ради native XDP (guard off вернёт)"
+                return 0
+            fi
+            _guard_gro_hw_set "$ifc" on
+        fi
     fi
-    if [ "$G_GRO_HW_RESTORE" = 1 ]; then   # выключали раньше, а native всё равно не встал
+    if [ "$G_GRO_HW_RESTORE" = 1 ]; then   # выключали раньше, а native сейчас не стоит
         _guard_gro_hw_set "$ifc" on
         G_GRO_HW_RESTORE=0
     fi
     if ip link set dev "$ifc" xdpgeneric pinned "$prog" 2>>"$log"; then
         G_XDP_MODE=generic
-        msg_warn "native XDP на $ifc не встал ($(tail -n 1 "$log")) — generic: работает, но медленнее"
+        [ "$plan" = drv ] && msg_warn "native XDP на $ifc не встал ($(tail -n 1 "$log")) — generic: работает, но медленнее"
         return 0
     fi
     G_XDP_MODE=none
@@ -770,7 +789,7 @@ _guard_apply() {
             _guard_set_cfg "$GUARD_STAGE/maps" || why="cookies в карте не выключились"
         fi
         [ "$tc" = 1 ] || _guard_tc_detach "$G_IFACE"
-        if [ -z "$why" ] && _guard_xdp_attach "$G_IFACE" "$GUARD_STAGE/progs/$GUARD_XDP_PROG"; then
+        if [ -z "$why" ] && _guard_xdp_attach "$G_IFACE" "$GUARD_STAGE/progs/$GUARD_XDP_PROG" "$tc"; then
             _guard_stage_commit
         else
             [ -n "$why" ] || why="XDP не прицепился к $G_IFACE ($(tail -n 1 "$GUARD_DIR/xdp.log" 2>/dev/null))"

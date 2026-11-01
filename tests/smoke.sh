@@ -274,6 +274,10 @@ _guard_need_xdp ru off 0 && _guard_need_xdp off auto 1 && ok "need_xdp" || bad "
   && ok "effective_cookies (без kfunc — off)" || bad "effective_cookies"
 GUARD_FORCE_KFUNC=1 _guard_has_kfunc && { GUARD_FORCE_KFUNC=0 _guard_has_kfunc 2>/dev/null; [ "$?" = 1 ]; } \
   && ok "has_kfunc: GUARD_FORCE_KFUNC" || bad "has_kfunc: GUARD_FORCE_KFUNC"
+# R11: на veth XDP_TX (cookie SYN-ACK) native не доходит до peer'а → с cookies generic; без cookies и не veth — drv
+[ "$(_guard_xdp_mode_plan veth 1 2>/dev/null)" = generic ] && [ "$(_guard_xdp_mode_plan veth 0)" = drv ] \
+  && [ "$(_guard_xdp_mode_plan virtio_net 1)" = drv ] && [ "$(_guard_xdp_mode_plan "" 1)" = drv ] \
+  && ok "xdp_mode_plan: veth+cookies → generic; veth без cookies, virtio_net → drv" || bad "xdp_mode_plan"
 gr=$(_guard_nft_render eth0 443,80 2>/dev/null)
 if command -v nft >/dev/null 2>&1; then
     if [ -n "$gr" ] && printf '%s\n' "$gr" | nft -c -f - >/dev/null 2>&1; then

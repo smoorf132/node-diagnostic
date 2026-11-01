@@ -33,7 +33,7 @@ COOKIE_CASES=(cookie_handshake_v4 cookie_handshake_v6 dualstack_listener_v4_cook
               cookie_ts_from_ack no_timestamps_keeps_wscale bad_cookie_ack_fails_open cookie_modes)
 # режим guard: «чужие» (не из гео-фикстуры 10.200.0.0/25, fd00:200::/120) адреса клиента
 FOREIGN4=10.200.0.200 FOREIGN6=fd00:200::200
-GUARD_CASES=(geo_unavailable_refuses variant1_geo_drop xdp_native_drv allowlist_bypasses_geo
+GUARD_CASES=(geo_unavailable_refuses variant1_geo_drop xdp_mode_veth allowlist_bypasses_geo
              notrack_no_conntrack_entries variant2_cookies_always reapply_no_stacking
              shaper_survives_guard certbot_hooks_toggle_geo_80 reattach_restores_from_disk
              off_cleans_everything)
@@ -549,20 +549,14 @@ guard_env() {
         >"$TMP/ripe.json"
 }
 
-# сеть + «чужие» адреса на gcli0. XDP_PASS на gcli0: XDP_TX native-XDP на veth кладёт кадр в кольцо
-# peer'а, но будит его NAPI (veth_xdp_flush), только если у peer своя XDP-программа; NAPI от GRO
-# этого не делает — SYN-ACK с cookie застревал бы в кольце. Так в стенде проверяется drv (D12), а
-# не generic. default route в gsrv — shape.sh берёт интерфейс из default_iface; ct-правило включает
-# conntrack в gsrv (R6: без него проверка NOTRACK была бы холостой)
+# сеть + «чужие» адреса на gcli0. На gcli0 своей XDP-программы нет — как у eth0 контейнера LXC, чей
+# peer на хосте: guard сам выбирает generic при cookies (R11). default route в gsrv — shape.sh берёт
+# интерфейс из default_iface; ct-правило включает conntrack в gsrv (R6: без него проверка NOTRACK
+# была бы холостой)
 guard_setup() {
-    printf '%s\n' '#include <linux/bpf.h>' '#include <bpf/bpf_helpers.h>' \
-        'SEC("xdp") int nd_peer_pass(struct xdp_md *ctx) { return XDP_PASS; }' \
-        'char _license[] SEC("license") = "GPL";' >"$TMP/peer-pass.bpf.c"
-    bpf_cc "$TMP/peer-pass.bpf.c" "$TMP/peer-pass.bpf.o" \
-        && net_up \
+    net_up \
         && in_cli ip addr add "$FOREIGN4/24" dev "$CLI_IF" \
         && in_cli ip addr add "$FOREIGN6/64" dev "$CLI_IF" nodad \
-        && in_cli ip link set dev "$CLI_IF" xdpdrv obj "$TMP/peer-pass.bpf.o" sec xdp \
         && in_srv ip route add default via "$CLI4" dev "$SRV_IF" \
         && in_srv nft -f - <<'EOF'
 table inet nd_test_ct {
@@ -585,6 +579,18 @@ srv_xdp_kind() { in_srv ip link show dev "$SRV_IF" | head -n 1 | grep -oE ' xdp[
 tc_has()   { in_srv tc filter show dev "$SRV_IF" ingress pref "$1" 2>/dev/null | grep -q handle; }
 nft_has()  { in_srv nft list table inet nd_guard >/dev/null 2>&1; }
 pin_empty() { [ -z "$(ls -A "$PIN" 2>/dev/null)" ] && [ ! -e "$PIN-new" ]; }
+# R11: XDP на veth gsrv0 — generic, если работает cookie-путь (tc), иначе drv. xdp_mode_why MODE:
+# пусто — guard.conf XDP_MODE и вид XDP в ip link (drv → «xdp», generic → «xdpgeneric») совпали
+xdp_mode_why() {
+    local c k want=xdp
+    [ "$1" = generic ] && want=xdpgeneric
+    c=$(sed -n 's/^XDP_MODE=//p' "$GUARD_DIR/guard.conf" 2>/dev/null)
+    k=$(srv_xdp_kind)
+    [ "$c" = "$1" ] || printf ' guard.conf XDP_MODE=%s, а не %s;' "${c:-?}" "$1"
+    [ "$k" = "$want" ] || printf ' ip link: %s, а не %s;' "${k:-нет XDP}" "$want"
+    return 0
+}
+cookie_xdp_mode() { if has_kfunc; then echo generic; else echo drv; fi; }   # режим при cookies ≠ off
 # записи conntrack на :443 (v4 и v6)
 ct_443() {
     { in_srv conntrack -L -p tcp --orig-port-dst "$PORT"; in_srv conntrack -L -f ipv6 -p tcp --orig-port-dst "$PORT"; } \
@@ -632,19 +638,26 @@ case_variant1_geo_drop() {
     if ! out=$(guard status) || ! printf '%s\n' "$out" | grep -q 'только Россия'; then
         why="$why status: нет «только Россия» [$(tail3 "$out")];"
     fi
-    verdict "variant1_geo_drop (RU v4/v6 эхо, чужие v4/v6 — таймаут, geo_drop +$(delta geo_drop "$s0" "$s1"))" "$why"
+    why="$why$(xdp_mode_why drv)"   # D12: только гео (DROP/PASS) — native и на veth
+    verdict "variant1_geo_drop (RU v4/v6 эхо, чужие v4/v6 — таймаут, geo_drop +$(delta geo_drop "$s0" "$s1"), XDP drv)" "$why"
 }
 
-# D12: native XDP первым (на veth встаёт всегда; XDP_TX доходит благодаря XDP_PASS на gcli0)
-case_xdp_native_drv() {
-    local k c
-    k=$(srv_xdp_kind)
-    c=$(sed -n 's/^XDP_MODE=//p' "$GUARD_DIR/guard.conf" 2>/dev/null)
-    if [ "$k" = xdp ] && [ "$c" = drv ]; then
-        ok "xdp_native_drv (ip link: xdp, guard.conf: XDP_MODE=drv)"
-    else
-        bad "xdp_native_drv: ip link '$k', guard.conf XDP_MODE='$c'"
+# R11/D12 на veth: с cookies (auto) — generic с объяснением (native XDP_TX не доходит до peer'а без
+# его XDP-программы — SYN-ACK с cookie пропадали бы молча); снова без cookies — обратно drv, одна
+# программа. Ядро без kfunc: cookies выключены — drv в обоих случаях
+case_xdp_mode_veth() {
+    local out m why=""
+    m=$(cookie_xdp_mode)
+    if ! out=$(g_on --geo ru); then bad "xdp_mode_veth: on --geo ru: $(tail3 "$out")"; return; fi
+    why="$(xdp_mode_why "$m")"
+    if [ "$m" = generic ] && ! printf '%s\n' "$out" | grep -q 'veth'; then
+        why="$why on не объяснил generic на veth [$(tail3 "$out")];"
     fi
+    out=$(cli_from "$CLI4" "$SRV4") || why="$why RU v4 при cookies auto ($out);"
+    if ! out=$(g_on --geo ru --cookies off); then bad "xdp_mode_veth: on --cookies off: $(tail3 "$out")"; return; fi
+    why="$why$(xdp_mode_why drv)"
+    [ "$(srv_xdp | wc -l)" = 1 ] || why="$why XDP-программ на $SRV_IF: $(srv_xdp | wc -l);"
+    verdict "xdp_mode_veth (cookies auto → XDP $m, cookies off → drv)" "$why"
 }
 
 # D8: allowlist обходит гео; запись в allow.list и обратно
@@ -683,6 +696,7 @@ case_variant2_cookies_always() {
     out=$(guard off) || why="off: $(tail3 "$out");"
     if ! out=$(g_on --cookies always); then bad "variant2_cookies_always: on: $(tail3 "$out")"; return; fi
     tc_has 10 || why="$why нет tc pref 10;"
+    why="$why$(xdp_mode_why generic)"   # R11: cookie-путь на veth — generic
     s0=$(stats)
     out=$(cli_from "$CLI4" "$SRV4") || why="$why RU v4 ($out);"
     out=$(cli_from "$FOREIGN4" "$SRV4") || why="$why чужой v4 ($out);"
@@ -692,7 +706,7 @@ case_variant2_cookies_always() {
     [ "$(delta geo_drop "$s0" "$s1")" = 0 ] || why="$why geo_drop вырос;"
     [ "$(st assign_err "$s1")" = 0 ] || why="$why assign_err=$(st assign_err "$s1");"
     [ -z "$why" ] || why="$why [$s1]"
-    verdict "variant2_cookies_always (RU и чужие v4/v6, cookie_ok +$(delta cookie_ok "$s0" "$s1"))" "$why"
+    verdict "variant2_cookies_always (RU и чужие v4/v6, cookie_ok +$(delta cookie_ok "$s0" "$s1"), XDP generic)" "$why"
 }
 
 # повторный on не плодит программ и pin'ов; on без работы для XDP (гео и cookies выкл.) снимает их
@@ -701,6 +715,7 @@ case_reapply_no_stacking() {
     has_kfunc && { ck=always want="nd_guard_tc nd_guard_xdp" ntc=1; }
     out=$(g_on --geo ru --cookies "$ck") && out=$(g_on --geo ru --cookies "$ck") || why="on ×2: $(tail3 "$out");"
     [ "$(srv_xdp | wc -l)" = 1 ] || why="$why XDP-программ на $SRV_IF: $(srv_xdp | wc -l);"
+    why="$why$(xdp_mode_why "$(cookie_xdp_mode)")"
     [ "$(in_srv tc filter show dev "$SRV_IF" ingress | grep -c 'handle.*nd_guard_tc')" = "$ntc" ] \
         || why="$why tc-фильтров nd_guard_tc не $ntc;"
     progs=$(ls "$PIN/progs" 2>/dev/null | tr '\n' ' ')
@@ -729,6 +744,7 @@ case_shaper_survives_guard() {
     if ! out=$(shape on) || ! tc_has 49200; then bad "shaper_survives_guard: shape on: $(tail3 "$out")"; return; fi
     out=$(g_on --cookies always) || why="$why on: $(tail3 "$out");"
     { tc_has 10 && tc_has 49200; } || why="$why guard on: нет pref 10 и 49200 вместе;"
+    why="$why$(xdp_mode_why generic)"
     out=$(guard off) || why="$why off: $(tail3 "$out");"
     tc_has 49200 || why="$why guard off снял pref 49200 шейпера;"
     tc_has 10 && why="$why guard off не снял pref 10;"
@@ -772,11 +788,12 @@ case_reattach_restores_from_disk() {
     if [ -n "$(srv_xdp)" ] || tc_has 10 || nft_has; then bad "reattach_restores_from_disk: имитация reboot не удалась"; return; fi
     out=$(GUARD_GEO_RIPE_URL=file:///nonexistent guard reattach) || why="reattach rc≠0: $(tail3 "$out");"
     [ -n "$(srv_xdp)" ] || why="$why нет XDP;"
+    why="$why$(xdp_mode_why "$(cookie_xdp_mode)")"   # reattach выбирает режим так же, как on (R11)
     nft_has || why="$why нет NOTRACK;"
     if has_kfunc; then tc_has 10 || why="$why нет tc pref 10;"; fi
     out=$(cli_from "$CLI4" "$SRV4") || why="$why RU v4 не прошёл ($out);"
     cli_from "$FOREIGN4" "$SRV4" >/dev/null && why="$why чужой v4 прошёл — гео не из кеша;"
-    verdict "reattach_restores_from_disk (XDP, tc, NOTRACK и гео по кешу)" "$why"
+    verdict "reattach_restores_from_disk (XDP $(cookie_xdp_mode), tc, NOTRACK и гео по кешу)" "$why"
 }
 
 # off --keep-config снимает рантайм, но оставляет guard.conf; off — и его. Ключ, гео-кеш и
@@ -816,7 +833,7 @@ mode_guard() {
     echo "== guard: стенд gsrv ⇄ gcli, modules/guard.sh --iface $SRV_IF =="
     guard_env
     if ! out=$(guard_setup 2>&1); then bad "стенд: $out"; return; fi
-    ok "стенд: чужие $FOREIGN4/$FOREIGN6 на $CLI_IF, XDP_PASS на $CLI_IF (peer native XDP_TX), ct-правило в $SRV_NS"
+    ok "стенд: чужие $FOREIGN4/$FOREIGN6 на $CLI_IF (без XDP на peer, как в LXC), ct-правило в $SRV_NS"
     if ! srv_start 6; then bad "эхо-сервер [::]:$PORT не поднялся: $(cat "$TMP/echo.log")"; return; fi
     if out=$(cli_from "$CLI4" "$SRV4") && out=$(cli_from "$CLI6" "$SRV6") && out=$(cli_from "$FOREIGN4" "$SRV4"); then
         ok "связность без guard (RU v4/v6, чужой v4)"

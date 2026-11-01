@@ -69,7 +69,7 @@ jobs:
           sudo python3 tests/guard_xdp_test.py -v
 
   # guard в netns-стенде (veth, XDP + tc): raw — объекты напрямую (generic XDP), cookie-рукопожатие
-  # через bpf_sk_assign_tcp_reqsk без conntrack; guard — modules/guard.sh целиком (native XDP, гео,
+  # через bpf_sk_assign_tcp_reqsk без conntrack; guard — modules/guard.sh целиком (режим XDP на veth, гео,
   # NOTRACK, allowlist, certbot-хуки, reattach, соседство с шейпером).
   # ND_GUARD_REQUIRE_KFUNC=1 — ядро runner'а без kfunc = провал, а не тихий SKIP
   guard-netns:
