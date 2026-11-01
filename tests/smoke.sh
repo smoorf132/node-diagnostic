@@ -244,5 +244,21 @@ else
     echo "  ~ python3 нет — пропускаю проверку JSON"
 fi
 
+echo "== guard: гео-список и чистые тесты guard_ctrl (без root) =="
+if command -v python3 >/dev/null 2>&1; then
+    if python3 -m unittest tests/test_guard_geo.py >/dev/null 2>&1; then
+        ok "guard_geo unittest"
+    else
+        bad "guard_geo unittest"
+    fi
+    if python3 -m unittest tests.guard_xdp_test.GuardCtrlPureTest >/dev/null 2>&1; then
+        ok "guard_ctrl чистые тесты"
+    else
+        bad "guard_ctrl чистые тесты"
+    fi
+else
+    echo "  ~ python3 нет — пропускаю guard-тесты"
+fi
+
 echo
 if [ "$fail" = "0" ]; then echo "SMOKE OK"; exit 0; else echo "SMOKE FAIL"; exit 1; fi
