@@ -321,7 +321,7 @@ sudo bash node-diagnostic.sh rollback --dry-run  # показать, что сн
   - `shape` — ядро Linux **≥5.4** (EDT/clsact) + `clang`/`bpftool`/`libbpf-dev`; не в контейнере.
   - `guard` — ядро Linux **≥5.10** + BTF, Ethernet-интерфейс, `clang`/`bpftool` (libbpf ≥ 1.0)/`libbpf-dev` (ставятся сами, bpftool — из пакета, linux-tools или статический); XDP-cookies — ядро **≥6.9** (Ubuntu 24.04 — HWE-ядро, 26.04+ — штатное); Docker bridge с опубликованными 80/443 несовместим.
 
-CI гоняет: shellcheck (`--severity=warning`), компиляцию BPF-шейпера и guard (`clang -target bpf`), smoke на Ubuntu-runner/22.04/24.04/Debian 12/Alpine 3.19, integration (реальное `optimize`→verify→rollback→`protect`/`nft -c`) в privileged-контейнерах Ubuntu 24.04 + Debian 12, guard на ядре runner'а (`bpftool prog run`, netns-стенд с cookie-рукопожатием) и загрузку guard bpftool и тулчейном Debian 12 / Ubuntu 22.04 (`ensure_bpftool`).
+CI гоняет: shellcheck (`--severity=warning`), компиляцию BPF-шейпера и guard (`clang -target bpf`), smoke на Ubuntu-runner/22.04/24.04/Debian 12/Alpine 3.19, integration (реальное `optimize`→verify→rollback→`protect`/`nft -c`) в privileged-контейнерах Ubuntu 24.04 + Debian 12, guard на ядре runner'а (`bpftool prog run`, netns-стенд с cookie-рукопожатием) и загрузку guard bpftool и тулчейном Ubuntu 24.04 / 26.04 (`ensure_bpftool`).
 
 ## Лицензия
 

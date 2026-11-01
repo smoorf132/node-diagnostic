@@ -92,8 +92,9 @@ jobs:
         run: sudo ND_GUARD_REQUIRE_KFUNC=1 bash tests/guard-netns.sh guard
 
   # R14: bpftool и тулчейн дистрибутива, без статического bpftool из tests/guard-deps.sh (её здесь
-  # нет): ensure_bpftool сам ставит пакет bpftool (Debian) или проходит linux-tools Ubuntu мимо
-  # нерабочей обёртки (5.15 = libbpf 0.5 не годится) до статического; guard.sh грузит им оба объекта
+  # нет). Ноды — Ubuntu 24.04+. В контейнере ядро runner'а (azure), linux-tools-$(uname -r) для него
+  # в noble нет — обёртка /usr/sbin/bpftool не работает, как на ноде с XanMod: 24.04 проходит дальше
+  # к linux-tools-generic (6.8, libbpf ≥ 1) или к статическому; в 26.04 есть пакет bpftool
   guard-distro-bpftool:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -101,12 +102,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: "debian:12"
-            pre: ""
-            expect: "pkg"
-          - image: "ubuntu:22.04"
+          - image: "ubuntu:24.04"
             pre: "linux-tools-common"
             expect: "linux-tools static"
+          - image: "ubuntu:26.04"
+            pre: "linux-tools-common"
+            expect: "pkg"
     steps:
       - uses: actions/checkout@v4
       - name: ensure_bpftool + загрузка guard в ${{ matrix.image }}

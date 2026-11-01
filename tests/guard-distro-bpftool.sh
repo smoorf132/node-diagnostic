@@ -2,7 +2,7 @@
 # tests/guard-distro-bpftool.sh — bpftool и тулчейн дистрибутива (R14), без статического bpftool
 # из tests/guard-deps.sh: ensure_bpftool (lib/common.sh) находит или ставит рабочий bpftool, а
 # _guard_compile + _guard_load (modules/guard.sh, через source) собирают и грузят им оба объекта.
-# CI: джоба guard-distro-bpftool, privileged-контейнер debian:12 / ubuntu:22.04 с clang, libbpf-dev,
+# CI: джоба guard-distro-bpftool, privileged-контейнер ubuntu:24.04 / ubuntu:26.04 с clang, libbpf-dev,
 # linux-libc-dev, gcc-multilib, iproute2, python3, curl. Запуск от root:
 #   ND_BPFTOOL_EXPECT="pkg" bash tests/guard-distro-bpftool.sh   # допустимые шаги через пробел
 # → последняя строка GUARD-DISTRO-BPFTOOL OK (rc 0), иначе … FAIL (rc 1).
