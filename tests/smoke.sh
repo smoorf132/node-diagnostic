@@ -304,5 +304,11 @@ bash modules/guard.sh bogus >/dev/null 2>&1; [ "$?" = 2 ] && ok "guard rc=2 на
 bash modules/guard.sh help >/dev/null 2>&1 && ok "guard help (rc 0)" || bad "guard help"
 bash modules/guard.sh status >/dev/null 2>&1 && ok "guard status (выключен) rc 0" || bad "guard status"
 
+bash node-diagnostic.sh help | grep -q 'guard' && ok "help: guard" || bad "help: guard"
+bash node-diagnostic.sh guard help >/dev/null 2>&1 && ok "dispatcher guard" || bad "dispatcher guard"
+[ "$(grep -c 'tcp flags & (fin|syn|rst|ack) == syn' "$out/firewall.nft")" = 2 ] \
+  && ! grep -B1 'meter syn443_' "$out/firewall.nft" | grep -q 'ct state new' \
+  && ok "protect: SYN-rate работает и под NOTRACK" || bad "protect: syn443 на ct state new"
+
 echo
 if [ "$fail" = "0" ]; then echo "SMOKE OK"; exit 0; else echo "SMOKE FAIL"; exit 1; fi

@@ -189,13 +189,15 @@ table inet node_protect {
         # 443 — публичный вход. Per-IP лимит одновременных соединений и SYN-rate.
         # (ct count вне meter считал бы ВСЕ соединения порта разом — душил бы ноду целиком)
         # Отдельные meter'ы для v4 и v6 — key ip saddr не матчит v6-пакеты, они бы обошли лимит.
+        # Под guard (NOTRACK на 443) ct не видит соединений: conn443 (ct count) не действует, а SYN-rate
+        # считается по флагу SYN, не по ct state new — SYN-флуд закрывает guard (rr guard on).
         tcp dport 443 ip saddr 0.0.0.0/0 ct state new \\
             meter conn443_4 { ip saddr ct count over $CONN_LIMIT } drop
         tcp dport 443 ip6 saddr ::/0 ct state new \\
             meter conn443_6 { ip6 saddr ct count over $CONN_LIMIT } drop
-        tcp dport 443 ip saddr 0.0.0.0/0 ct state new \\
+        tcp dport 443 ip saddr 0.0.0.0/0 tcp flags & (fin|syn|rst|ack) == syn \\
             meter syn443_4 { ip saddr limit rate over ${SYN_RATE}/second burst $((SYN_RATE*2)) packets } drop
-        tcp dport 443 ip6 saddr ::/0 ct state new \\
+        tcp dport 443 ip6 saddr ::/0 tcp flags & (fin|syn|rst|ack) == syn \\
             meter syn443_6 { ip6 saddr limit rate over ${SYN_RATE}/second burst $((SYN_RATE*2)) packets } drop
         tcp dport 443 accept
         udp dport 443 ip saddr 0.0.0.0/0 \\
@@ -344,6 +346,9 @@ $ssh_note
   firewall ufw:  sudo ufw disable
   CrowdSec:      sudo apt purge crowdsec crowdsec-firewall-bouncer-nftables   # dnf remove … на RHEL
   sshd:          sudo rm /etc/ssh/sshd_config.d/99-node-diagnostic.conf && sudo systemctl reload ssh
+
+⚠ guard (rr guard on) ставит NOTRACK на 443/80: conn443 (ct count) при включённом guard не действует,
+  SYN-флуд закрывает guard; SYN-rate (syn443) считается по флагу SYN и работает и под NOTRACK.
 
 Карта портов Remnawave-ноды: 443 (вход), 80 (ACME), NODE_PORT (панель->нода, только IP панели),
 61000/localhost и Caddy :9443/localhost наружу НЕ открываются.

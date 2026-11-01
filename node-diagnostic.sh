@@ -64,6 +64,8 @@ node-diagnostic.sh v$ND_VERSION — модульный тулкит ноды (Re
   ipv6     [menu|status|on|off]  Включить/выключить IPv6 (sysctl disable_ipv6)
   shape {on|off|status|rule …|wl IP}
                                  Per-IP шейпер полосы (eBPF/EDT) — лимит DL/UL на клиента
+  guard  {on [--geo ru]|off|status|reattach|allow IP|unallow IP|update-geo|confirm}
+                                 Защита от DDoS (XDP + tc + NOTRACK): вариант 1 — только Россия, вариант 2 — весь мир
   ssh-port [ПОРТ]                Смена SSH-порта без лок-аута (sshd + firewall, проверка входа, откат)
   menu                           Интерактивное меню (по умолчанию в TTY)
   help | --version
@@ -88,9 +90,10 @@ menu() {
         echo -e "    ${C}${BOLD}[9]${NC} SSH-порт           ${DIM}быстрая смена без лок-аута${NC}"
         echo -e "   ${C}${BOLD}[10]${NC} Сертификаты        ${DIM}продление/выпуск/свой${NC}"
         echo -e "   ${C}${BOLD}[11]${NC} IPv6               ${DIM}включить/выключить${NC}"
+        echo -e "   ${C}${BOLD}[12]${NC} Защита от DDoS     ${DIM}XDP: только Россия / весь мир${NC}"
         echo -e "    ${C}${BOLD}[0]${NC} Выход"
         echo
-        printf "  ${BOLD}Выбор${NC} ${DIM}[0-11]${NC}: "
+        printf "  ${BOLD}Выбор${NC} ${DIM}[0-12]${NC}: "
         local c; read -r c
         echo
         case "$c" in
@@ -105,6 +108,7 @@ menu() {
             9) run sshport ;;
             10) run certs menu ;;
             11) run ipv6 menu ;;
+            12) menu_guard ;;
             0|q|"") echo -e "  ${DIM}выход${NC}"; return 0 ;;
             *) echo -e "  ${Y}нет такого пункта${NC}" ;;
         esac
@@ -116,7 +120,7 @@ menu() {
 # Что тулкит наложил на систему + ключевое состояние сети (read-only)
 show_status() {
     echo
-    local cc qdisc cc_disp
+    local cc qdisc cc_disp g_disp
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)
     cc_disp="${cc:-?}"; [ -n "$qdisc" ] && cc_disp="$cc + $qdisc"
@@ -124,6 +128,10 @@ show_status() {
     box_kv "Версия" "$ND_VERSION"
     box_kv "Ядро" "$(uname -r)"
     box_kv "Congestion" "$cc_disp"
+    if [ -e /sys/fs/bpf/nd-guard/progs/nd_guard_xdp ]; then g_disp="включён (rr guard status)"
+    elif [ -e /var/lib/node-diagnostic/guard/guard.conf ]; then g_disp="выключен, конфиг сохранён (rr guard reattach)"
+    else g_disp="выключен"; fi
+    box_kv "Guard (DDoS)" "$g_disp"
     box_bottom
     echo
 
@@ -263,6 +271,27 @@ menu_shape() {
     esac
 }
 
+menu_guard() {
+    if [ ! -t 0 ]; then echo -e "  ${Y}guard доступен только в интерактивном режиме (в скриптах: rr guard on …)${NC}"; return 0; fi
+    echo -e "  ${BOLD}Защита от DDoS${NC} ${DIM}(XDP + tc + NOTRACK; через 5 минут откатится без guard confirm)${NC}"
+    echo -e "    ${C}${BOLD}[1]${NC} Вариант 1 — только Россия  ${DIM}guard on --geo ru${NC}"
+    echo -e "    ${C}${BOLD}[2]${NC} Вариант 2 — весь мир       ${DIM}guard on${NC}"
+    echo -e "    ${C}${BOLD}[3]${NC} Статус"
+    echo -e "    ${C}${BOLD}[4]${NC} Allowlist +                ${DIM}IP/CIDR мимо гео (CDN, каскады, админы)${NC}"
+    echo -e "    ${C}${BOLD}[5]${NC} Выключить"
+    echo -e "    ${C}${BOLD}[0]${NC} Назад"
+    printf "  ${BOLD}Выбор${NC} ${DIM}[0-5]${NC}: "; local c; read -r c; echo
+    case "$c" in
+        1) run guard on --geo ru ;;
+        2) run guard on ;;
+        3) run guard status ;;
+        4) local ip; printf "  IP или CIDR в allowlist: "; read -r ip; [ -n "$ip" ] && run guard allow "$ip" ;;
+        5) run guard off ;;
+        0|q|"") return 0 ;;
+        *) echo -e "  ${Y}нет такого пункта${NC}" ;;
+    esac
+}
+
 # ── диспетчер ────────────────────────────────────────────────────────
 cmd="${1:-}"; [ $# -gt 0 ] && shift || true
 case "$cmd" in
@@ -274,6 +303,7 @@ case "$cmd" in
     status|st)             show_status ;;
     install|setup)         run install "$@" ;;
     shape|shaper)          run shape "$@" ;;
+    guard|ddos)            run guard "$@" ;;
     ssh-port|sshport)      run sshport "$@" ;;
     certs|cert|ssl)        run certs "$@" ;;
     warp)                  run warp "$@" ;;

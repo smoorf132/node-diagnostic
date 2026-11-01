@@ -24,6 +24,7 @@
 | `optimize` | sysctl-тюнинг, BBR+cake, FD-лимиты, RPS/RFS/XPS, NIC, MSS clamp, irqbalance, journald, zram | да (namespaced drop-in) |
 | `protect`  | firewall под Remnawave, SSH-хардненинг, DDoS-хардненинг | **нет — только генерирует файлы** |
 | `shape`    | per-IP шейпер полосы (eBPF/EDT): лимит DL/UL на клиента, whitelist, dynamic-штраф | да (tc clsact + BPF, свой `off`) |
+| `guard`    | защита от DDoS: XDP-cookies + NOTRACK, вариант «только Россия» / «весь мир», allowlist, dead-man | да (XDP + tc + nft, свой `off`) |
 | `bbr3`     | ядро XanMod для TCP **BBRv3** (mainline даёт только v1) | да, но **без автоперезагрузки** |
 | `install`  | установка ноды Remnawave (nginx-selfsteal + сертификат) / WARP / NetBird / мониторинга / CrowdSec | да (по подтверждению) |
 | `certs`    | сертификаты: продление, выпуск (Cloudflare / Gcore / Bunny / HTTP-01), свой сертификат | да |
@@ -54,6 +55,12 @@ modules/
   shape.sh                  per-IP eBPF-шейпер (оркестратор)
   nd-shaper.bpf.c           BPF-программа шейпера (clsact + EDT)
   shape_ctrl.py             программирование BPF-карт через bpftool
+  guard.sh                  защита от DDoS (оркестратор): on/off/status/allow/reattach
+  nd-guard-xdp.bpf.c        XDP: гео, rate-limit, SYN-cookies
+  nd-guard-tc.bpf.c         tc: проверка cookie в ACK, bpf_sk_assign_tcp_reqsk
+  nd-guard.h, nd-guard-cookie.h   общие структуры и cookie
+  guard_ctrl.py             программирование BPF-карт guard через bpftool
+  guard_geo.py              гео-список RU: RIPEstat + db-ip, sanity-проверка
 ```
 
 ## Установка
@@ -93,6 +100,7 @@ sudo bash node-diagnostic.sh ipv6 off              # выключить IPv6
 sudo bash node-diagnostic.sh install monitoring    # WARP/NetBird/мониторинг/CrowdSec — так же
 sudo bash node-diagnostic.sh shape on              # включить eBPF-шейпер
 sudo bash node-diagnostic.sh shape rule 1 443 50 20   # порт 443: 50 Mbit DL / 20 UL на каждый IP
+sudo bash node-diagnostic.sh guard on --geo ru     # защита от DDoS, вариант 1 (затем guard confirm)
 sudo bash node-diagnostic.sh ssh-port 2222         # сменить SSH-порт (с проверкой входа и откатом)
 sudo bash node-diagnostic.sh rollback              # откат оптимизаций
 sudo bash node-diagnostic.sh status                # что наложено на систему, ядро, cc/qdisc
@@ -179,6 +187,33 @@ sudo bash node-diagnostic.sh shape off                     # снять
 
 Требует ядро Linux **≥5.4** (EDT/clsact) и `clang`/`bpftool`/`libbpf-dev` (ставятся сами). Порт из [DonMatteoVPN/Reshala-Remnawave-Bedolaga](https://github.com/DonMatteoVPN/Reshala-Remnawave-Bedolaga) (MIT). Снимается своим `shape off` (в `rollback` не входит).
 
+## `guard` — защита от DDoS (XDP + tc + NOTRACK)
+
+Два готовых режима для ноды на 443/80:
+
+```bash
+sudo rr guard on --geo ru      # вариант 1: только Россия — остальной мир режется в XDP
+sudo rr guard on               # вариант 2: весь мир — без гео
+sudo rr guard confirm          # подтвердить (иначе откат через 5 минут)
+sudo rr guard status           # состояние, счётчики, гео-список, dead-man
+sudo rr guard allow 203.0.113.0/24   # IP/CIDR мимо гео; unallow — убрать
+sudo rr guard off              # выключить и убрать всё
+```
+
+Оба варианта ставят NOTRACK на 443/80 TCP+UDP (conntrack не заполняется флудом). SYN-cookies в XDP по умолчанию `auto`: включаются при > 10000 SYN/с и держатся 60 с после атаки; `--cookies always|off` меняет поведение. Остальные команды: `reattach` (вернуть после ребута/ручного detach), `update-geo` (обновить список), `help`. Меню: `[12]`.
+
+- **Dead-man.** После `on` guard сам откатывается через 5 минут, пока не выполнен `rr guard confirm`. SSH не затрагивается никогда.
+- **Ядро.** XDP-cookies требуют ядро **≥ 6.9** с `bpf_sk_assign_tcp_reqsk` в BTF (например XanMod через `rr bbr3 --install`). На более старом ядре guard откатывается на NOTRACK + гео + штатные syncookies ядра и сообщает об этом. Для XDP нужен BTF ядра (`/sys/kernel/btf/vmlinux`): без него применяется только NOTRACK, а вариант 1 отказывается. Сам guard требует ядро **≥ 5.10**.
+- **Кого режет вариант 1.** Пользователей за границей. RKN-пробы он не останавливает: они приходят с российских адресов.
+- **Allowlist.** CDN-фронтинг (xhttp через Cloudflare), каскады и админы за границей без `rr guard allow IP|CIDR` будут отрезаны вариантом 1.
+- **ACME.** Продление certbot по HTTP-01 покрыто хуками: на время продления гео на :80 снимается. Другие ACME-клиенты (например Caddy с auto-ACME на selfsteal-нодах: HTTP-01 на 80 или TLS-ALPN-01 на 443) вариантом 1 **не покрыты** — их запросы будут отрезаны гео.
+- **LXC/veth.** На veth-интерфейсах (контейнеры LXC/Proxmox) cookie-путь работает через generic XDP: нативный XDP_TX на veth не доходит до стороны хоста.
+- **Docker.** Docker bridge с опубликованными 80/443 несовместим, guard отказывается. С `network_mode: host` всё работает.
+- **Гео-источники.** RIPEstat + db-ip country lite; обновляется еженедельным таймером, список проходит sanity-проверку, без списка гео не включается (иначе дропнулось бы всё).
+- **protect.** `conn443` (`ct count`) при включённом guard не действует; SYN-rate считается по флагу SYN и продолжает работать.
+
+Гео-данные: IP to Country Lite by [DB-IP](https://db-ip.com), лицензия CC BY 4.0.
+
 ## `install` — установка компонентов ноды
 
 Пункт меню **[7]** и команда `install`. Внешние установщики запускаются только после подтверждения (показ команды + `y/N`).
@@ -261,7 +296,7 @@ sudo bash node-diagnostic.sh ssh-port 2222
 sudo bash node-diagnostic.sh rollback            # снять sysctl drop-in, systemd-юниты, limits, MSS clamp
 sudo bash node-diagnostic.sh rollback --dry-run  # показать, что снял бы
 ```
-Не входит: ядро XanMod (`apt purge 'linux-xanmod*' && update-grub && reboot`), firewall/sshd (generate-only — откат в их `APPLY.txt`), CrowdSec (`apt purge crowdsec crowdsec-firewall-bouncer-nftables`) и eBPF-шейпер (`shape off`).
+Не входит: ядро XanMod (`apt purge 'linux-xanmod*' && update-grub && reboot`), firewall/sshd (generate-only — откат в их `APPLY.txt`), CrowdSec (`apt purge crowdsec crowdsec-firewall-bouncer-nftables`) eBPF-шейпер (`shape off`) и guard (`guard off`).
 
 ## Артефакты
 
@@ -280,6 +315,7 @@ sudo bash node-diagnostic.sh rollback --dry-run  # показать, что сн
   - `install node`, `certs` — Debian 11+ / Ubuntu 22.04+ с systemd (Docker, certbot из apt).
   - `bbr3` — **только Debian/Ubuntu** (XanMod = deb-репозиторий) и **только bare-metal/KVM x86_64** (не контейнер).
   - `shape` — ядро Linux **≥5.4** (EDT/clsact) + `clang`/`bpftool`/`libbpf-dev`; не в контейнере.
+  - `guard` — ядро Linux **≥5.10** + BTF, `clang`/`bpftool`/`libbpf-dev` (ставятся сами); XDP-cookies — ядро **≥6.9**; Docker bridge с опубликованными 80/443 несовместим.
 
 CI гоняет: shellcheck (`--severity=warning`), компиляцию BPF-шейпера (`clang -target bpf`), smoke на Ubuntu-runner/22.04/24.04/Debian 12/Alpine 3.19 и integration (реальное `optimize`→verify→rollback→`protect`/`nft -c`) в privileged-контейнерах Ubuntu 24.04 + Debian 12.
 
