@@ -330,6 +330,18 @@ _guard_xdp_tx_lost 100 0 2>/dev/null && ! _guard_xdp_tx_lost 99 0 && ! _guard_xd
 [ "$(_guard_cookies_off_cmd ru 443,80 eth0 eth0 2>/dev/null)" = "rr guard on --geo ru --cookies off" ] \
   && [ "$(_guard_cookies_off_cmd off 443 ens3 eth0)" = "rr guard on --ports 443 --iface ens3 --cookies off" ] \
   && ok "cookies_off_cmd: вариант, порты и интерфейс сохраняются" || bad "cookies_off_cmd"
+# D2: ядро без kfunc — на Ubuntu 24.04 сначала HWE (6.11+), XanMod — альтернатива; иначе — XanMod
+osr=$(mktemp -d)
+printf 'NAME="Ubuntu"\nVERSION_ID="24.04"\nID=ubuntu\n' >"$osr/u2404"
+printf 'NAME="Ubuntu"\nVERSION_ID="26.04"\nID=ubuntu\n' >"$osr/u2604"
+printf 'ID=debian\nVERSION_ID="12"\n' >"$osr/deb12"
+h24=$(_guard_kernel_hint "$osr/u2404" 2>/dev/null)
+case "$h24" in *"apt install --install-recommends linux-generic-hwe-24.04"*"reboot"*"rr bbr3 --install"*) k24=1 ;; *) k24=0 ;; esac
+[ "$k24" = 1 ] && [ "$(_guard_kernel_hint "$osr/u2604")" = "rr bbr3 --install (XanMod)" ] \
+  && [ "$(_guard_kernel_hint "$osr/deb12")" = "rr bbr3 --install (XanMod)" ] \
+  && [ "$(_guard_kernel_hint "$osr/нет")" = "rr bbr3 --install (XanMod)" ] \
+  && ok "kernel_hint: Ubuntu 24.04 → HWE, затем XanMod; 26.04, Debian, без os-release → XanMod" || bad "kernel_hint ($h24)"
+rm -rf "$osr"
 printf '%s\n' "$gr" | grep -q 'iifname "eth0" tcp dport { 443, 80 } notrack' && printf '%s\n' "$gr" | grep -q 'priority raw' \
   && ok "notrack tcp in, priority raw" || bad "notrack tcp in"
 # фейковый docker в PATH: опубликованный :443 → конфликт (печать имени); host-сеть и :8443->443 — нет

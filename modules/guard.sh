@@ -110,6 +110,20 @@ _guard_cookies_off_cmd() {
 # COOKIES HAS_KFUNC → режим cookies с учётом ядра: без kfunc — off
 _guard_effective_cookies() { if [ "$2" = 1 ]; then echo "$1"; else echo off; fi; }
 
+# [OS_RELEASE] → как получить ядро с kfunc bpf_sk_assign_tcp_reqsk (D2). Ubuntu 24.04: GA-ядро 6.8
+# без kfunc, HWE (6.11+) — с ним, поэтому сначала HWE, XanMod — альтернатива. Иначе — XanMod.
+# Файл не исполняется (sed), путь подменяется в smoke
+_guard_kernel_hint() {
+    local f="${1:-/etc/os-release}" id ver
+    id=$(sed -n 's/^ID=//p' "$f" 2>/dev/null | head -n 1 | tr -d "\"'")
+    ver=$(sed -n 's/^VERSION_ID=//p' "$f" 2>/dev/null | head -n 1 | tr -d "\"'")
+    if [ "$id" = ubuntu ] && [ "$ver" = 24.04 ]; then
+        echo "HWE-ядро Ubuntu 24.04: apt install --install-recommends linux-generic-hwe-24.04 и reboot (или XanMod: rr bbr3 --install)"
+    else
+        echo "rr bbr3 --install (XanMod)"
+    fi
+}
+
 # IFACE PORTS → ruleset NOTRACK; идиома protect.sh (table / delete table / table {}) — атомарная замена.
 # ICMP-ошибки на потоки guard (frag-needed, packet-too-big…) — тоже мимо conntrack: записи потока нет,
 # ошибка попала бы в ct state invalid, а его drop (protect, ufw before*.rules) стоит раньше accept ICMP —
@@ -916,7 +930,7 @@ guard_on() {
     G_KFUNC=0
     [ "$G_XDP_OK" = 1 ] && _guard_has_kfunc && G_KFUNC=1
     if [ "$G_COOKIES" != off ] && [ "$G_XDP_OK" = 1 ] && [ "$G_KFUNC" = 0 ]; then
-        msg_warn "ядро $(uname -r) без kfunc bpf_sk_assign_tcp_reqsk (нужно ≥ 6.9) — XDP-cookies выключены, SYN-флуд держат syncookies ядра. Свежее ядро: rr bbr3 --install (XanMod)"
+        msg_warn "ядро $(uname -r) без kfunc bpf_sk_assign_tcp_reqsk (нужно ≥ 6.9) — XDP-cookies выключены, SYN-флуд держат syncookies ядра. Свежее ядро: $(_guard_kernel_hint /etc/os-release)"
     fi
     _guard_sysctls                                                             # 9
     if [ "$G_GEO" = ru ]; then                                                 # 10
@@ -1114,7 +1128,7 @@ guard_hook() {   # certbot pre|post (D7): только вариант 1 и то�
 }
 
 guard_status() {
-    local conf=0 root=0 ifc xm="" tcon=0 nft=0 v s n att now txlost=0
+    local conf=0 root=0 ifc xm="" tcon=0 nft=0 v s n att now txlost=0 nokf=0
     [ $# -eq 0 ] || _guard_badarg "status: лишние аргументы"
     _guard_defaults
     need_root && root=1
@@ -1153,7 +1167,7 @@ guard_status() {
         v="не активны — работают syncookies ядра"
     fi
     box_kv "Cookies" "$v"
-    case "$v" in "ядро без kfunc"*) box_kv "" "XDP-cookies: ядро ≥ 6.9 — rr bbr3 --install" ;; esac
+    case "$v" in "ядро без kfunc"*) nokf=1; box_kv "" "XDP-cookies: нужно ядро ≥ 6.9 — см. ниже" ;; esac
     if [ "$root" = 1 ] && _guard_active && s=$(_guard_ctrl state 2>/dev/null); then
         att=$(echo "$s" | sed -n 's/.*attack_until_ns=\([0-9]*\).*/\1/p')
         now=$(echo "$s" | sed -n 's/.*now_ns=\([0-9]*\).*/\1/p')
@@ -1191,6 +1205,7 @@ guard_status() {
         box_kv "Dead-man" "не подтверждён: reboot откатит — guard confirm"
     fi
     box_bottom
+    [ "$nokf" = 1 ] && msg_info "ядро для XDP-cookies: $(_guard_kernel_hint /etc/os-release)"
     if [ "$txlost" = 1 ]; then   # F8/R13: только сигнал, без watchdog
         msg_warn "cookie-ответы уходят, но ни одно соединение не завершилось — похоже, драйвер теряет XDP_TX; выключи cookies: $(_guard_cookies_off_cmd "$G_GEO" "$G_PORTS" "$G_IFACE" "$(default_iface)") (вариант сохранится)"
     fi

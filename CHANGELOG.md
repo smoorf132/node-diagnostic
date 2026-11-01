@@ -50,6 +50,7 @@ WARP, IPv6 и команда `rr`. fail2ban заменён на CrowdSec; SSH м
 - **guard status** предупреждает, когда cookie-ответов ушло ≥ 100, а соединений по ним нет (драйвер теряет XDP_TX), и показывает команду `--cookies off` с тем же вариантом.
 - **guard: интерфейс без Ethernet-заголовка** (tun/wg/ppp, `link/none`) — отказ: XDP и tc его не разбирают, а status показывал бы «включён».
 - **guard: XDP под SYN-флудом** переписывал общий `attack_until_ns` на каждый SYN; теперь — только когда срок сдвигается на секунду и больше.
+- **guard: подсказка про ядро без kfunc.** На Ubuntu 24.04 `guard on` и `guard status` советуют сначала HWE-ядро (`apt install --install-recommends linux-generic-hwe-24.04` и reboot): штатное ядро 6.8 kfunc не имеет, HWE 6.11+ — имеет. XanMod (`rr bbr3 --install`) — альтернатива; на других системах подсказка прежняя.
 - **certs: первый выпуск HTTP-01** (`certonly --standalone`) при guard варианте 1 зовёт `guard hook pre`/`post` сам: renewal-хуки certbot на выпуске не срабатывают.
 - **shape: обновление с версии без `pref`.** Её фильтры (авто-pref 49152) не снимались: `shape off` оставлял шейпинг старыми картами, `shape on` шейпил дважды. Теперь свои фильтры снимаются на любом pref по имени программы; guard (pref 10) и чужие не задеваются.
 - **clsact_ensure**: юниты guard и шейпера на boot стартуют параллельно, и проигравший `tc qdisc add clsact` получал EEXIST. Теперь clsact, уже добавленный соседом, — успех.
