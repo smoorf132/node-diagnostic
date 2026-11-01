@@ -260,5 +260,45 @@ else
     echo "  ~ python3 нет — пропускаю guard-тесты"
 fi
 
+echo "== guard: чистые функции и диспетчер (source modules/guard.sh) =="
+# последним блоком: source подключает и lib/common.sh в этот shell
+# shellcheck source=../modules/guard.sh
+source modules/guard.sh 2>/dev/null || bad "source modules/guard.sh"
+_guard_port_ok 443 10000 && ! _guard_port_ok 20000 10000 && ok "_guard_port_ok" || bad "_guard_port_ok"
+[ "$(_guard_rcv_wscale 6291456)" = 7 ] && [ "$(_guard_rcv_wscale 134217728)" = 12 ] \
+  && [ "$(_guard_rcv_wscale 65535)" = 0 ] && [ "$(_guard_rcv_wscale 1099511627776)" = 14 ] && ok "rcv_wscale" || bad "rcv_wscale"
+# rc 1, а не «не 0»: иначе отсутствующая функция (rc 127) прошла бы
+_guard_need_xdp off auto 0 2>/dev/null; [ "$?" = 1 ] && ok "вариант 2 без kfunc — XDP не нужен" || bad "need_xdp off/auto/0"
+_guard_need_xdp ru off 0 && _guard_need_xdp off auto 1 && ok "need_xdp" || bad "need_xdp"
+[ "$(_guard_effective_cookies auto 0 2>/dev/null)" = off ] && [ "$(_guard_effective_cookies always 1)" = always ] \
+  && ok "effective_cookies (без kfunc — off)" || bad "effective_cookies"
+GUARD_FORCE_KFUNC=1 _guard_has_kfunc && { GUARD_FORCE_KFUNC=0 _guard_has_kfunc 2>/dev/null; [ "$?" = 1 ]; } \
+  && ok "has_kfunc: GUARD_FORCE_KFUNC" || bad "has_kfunc: GUARD_FORCE_KFUNC"
+gr=$(_guard_nft_render eth0 443,80 2>/dev/null)
+if command -v nft >/dev/null 2>&1; then
+    if [ -n "$gr" ] && printf '%s\n' "$gr" | nft -c -f - >/dev/null 2>&1; then
+        ok "nft render валиден"
+    elif [ "$(id -u)" -eq 0 ]; then
+        bad "nft render"
+    else
+        echo "  ~ nft -c (guard) не прошёл (без root netlink недоступен) — не блокирую"
+    fi
+fi
+printf '%s\n' "$gr" | grep -q 'udp sport { 443, 80 } notrack' && ok "notrack udp out" || bad "notrack udp out"
+printf '%s\n' "$gr" | grep -q 'iifname "eth0" tcp dport { 443, 80 } notrack' && printf '%s\n' "$gr" | grep -q 'priority raw' \
+  && ok "notrack tcp in, priority raw" || bad "notrack tcp in"
+# фейковый docker в PATH: опубликованный :443 → конфликт (печать имени); host-сеть и :8443->443 — нет
+fk=$(mktemp -d)
+printf '#!/bin/sh\necho "nginx 0.0.0.0:443->443/tcp, [::]:443->443/tcp"\n' >"$fk/docker"
+chmod +x "$fk/docker"
+dc=$(PATH="$fk:$PATH" _guard_docker_conflict 443,80 2>/dev/null) && [ "$dc" = nginx ] \
+  && ok "docker: опубликованный :443 → конфликт ($dc)" || bad "docker: конфликт не найден ($dc)"
+printf '#!/bin/sh\nprintf "remnanode \\nweb 0.0.0.0:8443->443/tcp\\n"\n' >"$fk/docker"
+PATH="$fk:$PATH" _guard_docker_conflict 443,80 >/dev/null 2>&1; [ "$?" = 1 ] \
+  && ok "docker: host-сеть и :8443->443 — не конфликт" || bad "docker: ложный конфликт"
+bash modules/guard.sh bogus >/dev/null 2>&1; [ "$?" = 2 ] && ok "guard rc=2 на мусор" || bad "guard bogus rc"
+bash modules/guard.sh help >/dev/null 2>&1 && ok "guard help (rc 0)" || bad "guard help"
+bash modules/guard.sh status >/dev/null 2>&1 && ok "guard status (выключен) rc 0" || bad "guard status"
+
 echo
 if [ "$fail" = "0" ]; then echo "SMOKE OK"; exit 0; else echo "SMOKE FAIL"; exit 1; fi

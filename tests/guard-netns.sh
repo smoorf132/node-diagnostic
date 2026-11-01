@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # tests/guard-netns.sh — guard в netns-стенде: gcli (клиент) ⇄ veth ⇄ gsrv (сервер; XDP + tc на gsrv0).
-#   raw — объекты BPF собираются и цепляются напрямую (bpftool / ip / tc), без guard.sh
-# Запуск от root: sudo bash tests/guard-deps.sh && sudo bash tests/guard-netns.sh raw
+#   raw   — объекты BPF собираются и цепляются напрямую (bpftool / ip / tc), без guard.sh
+#   guard — modules/guard.sh целиком (on/off/reattach/allow/hook), GUARD_NO_SYSTEMD=1, --iface gsrv0
+# Запуск от root: sudo bash tests/guard-deps.sh && sudo bash tests/guard-netns.sh raw|guard
 #   → последняя строка GUARD-NETNS OK (rc 0), иначе GUARD-NETNS FAIL (rc 1); неизвестный режим — rc 2.
 # Ядро без kfunc bpf_sk_assign_tcp_reqsk: cookie-кейсы — SKIP + ::warning:: (компиляция и загрузка
 # tc-объекта проверяются и тогда); ND_GUARD_REQUIRE_KFUNC=1 (CI) — вместо SKIP провал.
@@ -30,9 +31,16 @@ MAPS="$PIN/maps"
 BPFTOOL="${BPFTOOL:-bpftool}"
 COOKIE_CASES=(cookie_handshake_v4 cookie_handshake_v6 dualstack_listener_v4_cookie
               cookie_ts_from_ack no_timestamps_keeps_wscale bad_cookie_ack_fails_open cookie_modes)
+# режим guard: «чужие» (не из гео-фикстуры 10.200.0.0/25, fd00:200::/120) адреса клиента
+FOREIGN4=10.200.0.200 FOREIGN6=fd00:200::200
+GUARD_CASES=(geo_unavailable_refuses variant1_geo_drop xdp_native_drv allowlist_bypasses_geo
+             notrack_no_conntrack_entries variant2_cookies_always reapply_no_stacking
+             shaper_survives_guard certbot_hooks_toggle_geo_80 reattach_restores_from_disk
+             off_cleans_everything)
 TMP=""
 KEY=""
 SRV_PID=""
+SHAPE_TOUCHED=0
 
 in_srv() { nsenter --net="/var/run/netns/$SRV_NS" "$@"; }
 in_cli() { nsenter --net="/var/run/netns/$CLI_NS" "$@"; }
@@ -103,8 +111,10 @@ cli_echo() { in_cli python3 "$TMP/client.py" "$1" 2>&1; }
 
 cleanup() {
     srv_stop
+    # прерванный shaper_survives_guard: настоящий shape off, пока gsrv (его default route) жив
+    [ "$SHAPE_TOUCHED" = 1 ] && in_srv bash modules/shape.sh off >/dev/null 2>&1
     net_down
-    rm -rf "$PIN"
+    rm -rf "$PIN" "$PIN-new"
     [ -n "$TMP" ] && rm -rf "$TMP"
 }
 
@@ -133,13 +143,15 @@ while True:
     c, _ = s.accept()
     threading.Thread(target=serve, args=(c,), daemon=True).start()
 EOF
-    # client.py ADDR [HOLD] — эхо; с HOLD печатает "up <локальный порт>" и держит соединение HOLD с
+    # client.py ADDR [HOLD [SRC]] — эхо; с HOLD > 0 печатает "up <локальный порт>" и держит
+    # соединение HOLD с; SRC — адрес источника (по умолчанию выбирает ядро)
     cat >"$TMP/client.py" <<'EOF'
 import socket, sys, time
 addr = sys.argv[1]
 hold = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
+src = (sys.argv[3], 0) if len(sys.argv) > 3 else None
 try:
-    s = socket.create_connection((addr, 443), timeout=3)
+    s = socket.create_connection((addr, 443), timeout=3, source_address=src)
     s.sendall(b"ping")
     got = b""
     while len(got) < 4:
@@ -522,12 +534,307 @@ mode_raw() {
     run_cookie_cases
 }
 
+# ── режим guard: modules/guard.sh целиком ──
+# Окружение (guard_env): GUARD_NO_SYSTEMD=1 (без юнитов, dead-man и хуков), GUARD_DIR во временном
+# каталоге, GUARD_PIN=$PIN (карты — те же $MAPS, что читают stats/ctrl), гео-фикстура — RIPE JSON с
+# 10.200.0.0/25 и fd00:200::/120 по file://, db-ip недоступен (список собирается из одного источника),
+# пороги здравости снижены. guard.sh в gsrv — через in_srv (nsenter --net: pin'ы на bpffs видны).
+
+guard_env() {
+    export GUARD_DIR="$TMP/guard" GUARD_PIN="$PIN" GUARD_NO_SYSTEMD=1 \
+        ND_STATE_DIR="$TMP/state" FIX_LOG="$TMP/fix.log" \
+        GUARD_GEO_RIPE_URL="file://$TMP/ripe.json" GUARD_GEO_DBIP_URL=file:///nonexistent \
+        GUARD_GEO_MIN_V4_ADDRS=1 GUARD_GEO_MIN_V4_PREFIXES=1 GUARD_GEO_MIN_V6_PREFIXES=1
+    printf '%s\n' '{"data": {"resources": {"ipv4": ["10.200.0.0/25"], "ipv6": ["fd00:200::/120"]}}, "status": "ok"}' \
+        >"$TMP/ripe.json"
+}
+
+# сеть + «чужие» адреса на gcli0. XDP_PASS на gcli0: XDP_TX native-XDP на veth кладёт кадр в кольцо
+# peer'а, но будит его NAPI (veth_xdp_flush), только если у peer своя XDP-программа; NAPI от GRO
+# этого не делает — SYN-ACK с cookie застревал бы в кольце. Так в стенде проверяется drv (D12), а
+# не generic. default route в gsrv — shape.sh берёт интерфейс из default_iface; ct-правило включает
+# conntrack в gsrv (R6: без него проверка NOTRACK была бы холостой)
+guard_setup() {
+    printf '%s\n' '#include <linux/bpf.h>' '#include <bpf/bpf_helpers.h>' \
+        'SEC("xdp") int nd_peer_pass(struct xdp_md *ctx) { return XDP_PASS; }' \
+        'char _license[] SEC("license") = "GPL";' >"$TMP/peer-pass.bpf.c"
+    bpf_cc "$TMP/peer-pass.bpf.c" "$TMP/peer-pass.bpf.o" \
+        && net_up \
+        && in_cli ip addr add "$FOREIGN4/24" dev "$CLI_IF" \
+        && in_cli ip addr add "$FOREIGN6/64" dev "$CLI_IF" nodad \
+        && in_cli ip link set dev "$CLI_IF" xdpdrv obj "$TMP/peer-pass.bpf.o" sec xdp \
+        && in_srv ip route add default via "$CLI4" dev "$SRV_IF" \
+        && in_srv nft -f - <<'EOF'
+table inet nd_test_ct {
+	chain in {
+		type filter hook input priority filter; policy accept;
+		ct state established counter
+	}
+}
+EOF
+}
+
+guard() { in_srv bash modules/guard.sh "$@" 2>&1; }
+g_on()  { guard on "$@" --iface "$SRV_IF" --confirm; }
+shape() { in_srv bash modules/shape.sh "$@" 2>&1; }
+tail3() { printf '%s\n' "$1" | tail -n 3 | tr '\n' ' '; }
+
+cli_from() { in_cli python3 "$TMP/client.py" "$2" 0 "$1" 2>&1; }   # cli_from SRC DST — эхо с адреса SRC
+srv_xdp()  { in_srv ip -d link show dev "$SRV_IF" | grep -oE 'prog/xdp[a-z]* id [0-9]+ name [^ ]+'; }
+srv_xdp_kind() { in_srv ip link show dev "$SRV_IF" | head -n 1 | grep -oE ' xdp[a-z]* ' | tr -d ' '; }
+tc_has()   { in_srv tc filter show dev "$SRV_IF" ingress pref "$1" 2>/dev/null | grep -q handle; }
+nft_has()  { in_srv nft list table inet nd_guard >/dev/null 2>&1; }
+pin_empty() { [ -z "$(ls -A "$PIN" 2>/dev/null)" ] && [ ! -e "$PIN-new" ]; }
+# записи conntrack на :443 (v4 и v6)
+ct_443() {
+    { in_srv conntrack -L -p tcp --orig-port-dst "$PORT"; in_srv conntrack -L -f ipv6 -p tcp --orig-port-dst "$PORT"; } \
+        2>/dev/null | grep -c "dport=$PORT"
+}
+
+verdict() { if [ -z "$2" ]; then ok "$1"; else bad "${1%% (*}: $2"; fi; }   # verdict "кейс (детали)" ПРИЧИНЫ
+
+need_kfunc() {   # need_kfunc КЕЙС — rc 1 (SKIP, при ND_GUARD_REQUIRE_KFUNC=1 — провал), если ядро без kfunc
+    has_kfunc && return 0
+    if [ "${ND_GUARD_REQUIRE_KFUNC:-0}" = 1 ]; then
+        bad "$1: ядро $(uname -r) без bpf_sk_assign_tcp_reqsk, а ND_GUARD_REQUIRE_KFUNC=1"
+    else
+        skip "$1 — ядро без bpf_sk_assign_tcp_reqsk"
+    fi
+    return 1
+}
+
+# Review Focus 1: оба источника гео недоступны, кеша нет → отказ; ничего не прицеплено
+case_geo_unavailable_refuses() {
+    local out rc why=""
+    out=$(GUARD_GEO_RIPE_URL=file:///nonexistent g_on --geo ru)
+    rc=$?
+    [ "$rc" != 0 ] || why="rc 0;"
+    printf '%s\n' "$out" | grep -q 'гео-список не получен' || why="$why нет отказа «гео-список не получен»;"
+    [ -z "$(srv_xdp)" ] || why="$why на $SRV_IF висит XDP;"
+    nft_has && why="$why есть таблица nd_guard;"
+    tc_has 10 && why="$why есть tc pref 10;"
+    pin_empty || why="$why pin'ы в $PIN;"
+    [ -z "$why" ] || why="$why [$(tail3 "$out")]"
+    verdict "geo_unavailable_refuses (rc $rc, хост не тронут)" "$why"
+}
+
+# вариант 1: RU-клиент проходит, «чужой» — DROP в XDP (таймаут); v4 и v6, geo_drop растёт
+case_variant1_geo_drop() {
+    local out s0 s1 why=""
+    if ! out=$(g_on --geo ru --cookies off); then bad "variant1_geo_drop: guard on: $(tail3 "$out")"; return; fi
+    s0=$(stats)
+    out=$(cli_from "$CLI4" "$SRV4") || why="RU v4 не прошёл ($out);"
+    out=$(cli_from "$CLI6" "$SRV6") || why="$why RU v6 не прошёл ($out);"
+    cli_from "$FOREIGN4" "$SRV4" >/dev/null && why="$why чужой v4 прошёл;"
+    cli_from "$FOREIGN6" "$SRV6" >/dev/null && why="$why чужой v6 прошёл;"
+    s1=$(stats)
+    [ "$(delta geo_drop "$s0" "$s1")" -ge 2 ] || why="$why geo_drop не вырос [$s1];"
+    if ! out=$(guard status) || ! printf '%s\n' "$out" | grep -q 'только Россия'; then
+        why="$why status: нет «только Россия» [$(tail3 "$out")];"
+    fi
+    verdict "variant1_geo_drop (RU v4/v6 эхо, чужие v4/v6 — таймаут, geo_drop +$(delta geo_drop "$s0" "$s1"))" "$why"
+}
+
+# D12: native XDP первым (на veth встаёт всегда; XDP_TX доходит благодаря XDP_PASS на gcli0)
+case_xdp_native_drv() {
+    local k c
+    k=$(srv_xdp_kind)
+    c=$(sed -n 's/^XDP_MODE=//p' "$GUARD_DIR/guard.conf" 2>/dev/null)
+    if [ "$k" = xdp ] && [ "$c" = drv ]; then
+        ok "xdp_native_drv (ip link: xdp, guard.conf: XDP_MODE=drv)"
+    else
+        bad "xdp_native_drv: ip link '$k', guard.conf XDP_MODE='$c'"
+    fi
+}
+
+# D8: allowlist обходит гео; запись в allow.list и обратно
+case_allowlist_bypasses_geo() {
+    local out why=""
+    out=$(guard allow "$FOREIGN4") || why="allow: $(tail3 "$out");"
+    out=$(cli_from "$FOREIGN4" "$SRV4") || why="$why чужой v4 из allowlist не прошёл ($out);"
+    grep -qx "$FOREIGN4/32" "$GUARD_DIR/allow.list" 2>/dev/null || why="$why нет $FOREIGN4/32 в allow.list;"
+    out=$(guard unallow "$FOREIGN4") || why="$why unallow: $(tail3 "$out");"
+    cli_from "$FOREIGN4" "$SRV4" >/dev/null && why="$why после unallow чужой v4 прошёл;"
+    grep -qx "$FOREIGN4/32" "$GUARD_DIR/allow.list" 2>/dev/null && why="$why $FOREIGN4/32 остался в allow.list;"
+    verdict "allowlist_bypasses_geo (allow → проходит, unallow → таймаут)" "$why"
+}
+
+# R6: conntrack в gsrv включён ct-правилом (nd_test_ct); контроль — без guard записи на :443 есть
+case_notrack_no_conntrack_entries() {
+    local out n0 n1 why=""
+    out=$(guard off) || why="off: $(tail3 "$out");"
+    in_srv conntrack -F >/dev/null 2>&1
+    out=$(cli_from "$CLI4" "$SRV4") || why="$why эхо без guard ($out);"
+    n0=$(ct_443)
+    [ "$n0" -gt 0 ] || why="$why контроль: без guard записей на :$PORT нет — conntrack в gsrv не работает;"
+    out=$(g_on --geo ru --cookies off) || why="$why on: $(tail3 "$out");"
+    in_srv conntrack -F >/dev/null 2>&1
+    out=$(cli_from "$CLI4" "$SRV4") || why="$why эхо v4 с guard ($out);"
+    out=$(cli_from "$CLI6" "$SRV6") || why="$why эхо v6 с guard ($out);"
+    n1=$(ct_443)
+    [ "$n1" = 0 ] || why="$why с guard записей на :$PORT: $n1;"
+    verdict "notrack_no_conntrack_entries (без guard: $n0, с guard: $n1)" "$why"
+}
+
+# вариант 2, cookies always: и RU, и «чужие» проходят через cookie-путь (XDP → tc → kfunc)
+case_variant2_cookies_always() {
+    local out s0 s1 why=""
+    need_kfunc variant2_cookies_always || return
+    out=$(guard off) || why="off: $(tail3 "$out");"
+    if ! out=$(g_on --cookies always); then bad "variant2_cookies_always: on: $(tail3 "$out")"; return; fi
+    tc_has 10 || why="$why нет tc pref 10;"
+    s0=$(stats)
+    out=$(cli_from "$CLI4" "$SRV4") || why="$why RU v4 ($out);"
+    out=$(cli_from "$FOREIGN4" "$SRV4") || why="$why чужой v4 ($out);"
+    out=$(cli_from "$FOREIGN6" "$SRV6") || why="$why чужой v6 ($out);"
+    s1=$(stats)
+    [ "$(delta cookie_ok "$s0" "$s1")" -ge 3 ] || why="$why cookie_ok +$(delta cookie_ok "$s0" "$s1") < 3;"
+    [ "$(delta geo_drop "$s0" "$s1")" = 0 ] || why="$why geo_drop вырос;"
+    [ "$(st assign_err "$s1")" = 0 ] || why="$why assign_err=$(st assign_err "$s1");"
+    [ -z "$why" ] || why="$why [$s1]"
+    verdict "variant2_cookies_always (RU и чужие v4/v6, cookie_ok +$(delta cookie_ok "$s0" "$s1"))" "$why"
+}
+
+# повторный on не плодит программ и pin'ов; on без работы для XDP (гео и cookies выкл.) снимает их
+case_reapply_no_stacking() {
+    local out ck=off want="nd_guard_xdp" ntc=0 progs why=""
+    has_kfunc && { ck=always want="nd_guard_tc nd_guard_xdp" ntc=1; }
+    out=$(g_on --geo ru --cookies "$ck") && out=$(g_on --geo ru --cookies "$ck") || why="on ×2: $(tail3 "$out");"
+    [ "$(srv_xdp | wc -l)" = 1 ] || why="$why XDP-программ на $SRV_IF: $(srv_xdp | wc -l);"
+    [ "$(in_srv tc filter show dev "$SRV_IF" ingress | grep -c 'handle.*nd_guard_tc')" = "$ntc" ] \
+        || why="$why tc-фильтров nd_guard_tc не $ntc;"
+    progs=$(ls "$PIN/progs" 2>/dev/null | tr '\n' ' ')
+    [ "$progs" = "$want " ] || why="$why pin'ы программ: '$progs';"
+    [ ! -e "$PIN-new" ] || why="$why остался $PIN-new;"
+    out=$(g_on --cookies off) || why="$why on --cookies off: $(tail3 "$out");"
+    [ -z "$(srv_xdp)" ] || why="$why после on --cookies off XDP висит;"
+    tc_has 10 && why="$why после on --cookies off есть pref 10;"
+    pin_empty || why="$why после on --cookies off pin'ы не пусты;"
+    nft_has || why="$why после on --cookies off нет NOTRACK;"
+    verdict "reapply_no_stacking (on ×2: 1 XDP, $ntc tc, pin'ы без дублей; без дела — XDP/tc сняты)" "$why"
+}
+
+# Review Focus 3 / D11: шейпер (pref 49200) и guard (pref 10) на одном clsact; выключение одного не
+# ломает другой. shape.sh настоящий (on/off): интерфейс — из default route gsrv, состояние — в
+# $ND_STATE_DIR; без systemd его юнит не ставится (на CI runner ставится и снимается shape off)
+case_shaper_survives_guard() {
+    local out why=""
+    need_kfunc shaper_survives_guard || return
+    if [ -e /sys/fs/bpf/nd-shaper ] || [ -e /etc/systemd/system/node-diagnostic-shaper.service ]; then
+        skip "shaper_survives_guard — на хосте уже есть шейпер (не трогаю)"
+        return
+    fi
+    out=$(guard off) || why="off: $(tail3 "$out");"
+    SHAPE_TOUCHED=1
+    if ! out=$(shape on) || ! tc_has 49200; then bad "shaper_survives_guard: shape on: $(tail3 "$out")"; return; fi
+    out=$(g_on --cookies always) || why="$why on: $(tail3 "$out");"
+    { tc_has 10 && tc_has 49200; } || why="$why guard on: нет pref 10 и 49200 вместе;"
+    out=$(guard off) || why="$why off: $(tail3 "$out");"
+    tc_has 49200 || why="$why guard off снял pref 49200 шейпера;"
+    tc_has 10 && why="$why guard off не снял pref 10;"
+    out=$(g_on --cookies always) || why="$why on №2: $(tail3 "$out");"
+    out=$(shape off) || why="$why shape off: $(tail3 "$out");"
+    SHAPE_TOUCHED=0
+    tc_has 10 || why="$why shape off снял pref 10 guard;"
+    tc_has 49200 && why="$why shape off не снял pref 49200;"
+    out=$(cookie_echo "$SRV4")
+    [ -z "$out" ] || why="$why cookie-путь после shape off: $out;"
+    verdict "shaper_survives_guard (guard off → pref 49200 есть; shape off → pref 10 есть, cookie-эхо ок)" "$why"
+}
+
+# Review Focus 4 / D7: certbot pre-хук снимает гео с порта 80, post — возвращает; 443 не трогается
+case_certbot_hooks_toggle_geo_80() {
+    local out p0 p1 p2 p443 why=""
+    if ! out=$(g_on --geo ru --cookies off); then bad "certbot_hooks_toggle_geo_80: on: $(tail3 "$out")"; return; fi
+    p0=$(ctrl get-port 80)
+    out=$(guard hook pre) || why="hook pre: $(tail3 "$out");"
+    p1=$(ctrl get-port 80)
+    p443=$(ctrl get-port 443)
+    out=$(guard hook post) || why="$why hook post: $(tail3 "$out");"
+    p2=$(ctrl get-port 80)
+    [ "$p0" = tcp,udp,geo ] || why="$why до хука 80: $p0;"
+    [ "$p1" = tcp,udp ] || why="$why после pre 80: $p1;"
+    [ "$p443" = tcp,udp,geo ] || why="$why pre задел 443: $p443;"
+    [ "$p2" = tcp,udp,geo ] || why="$why после post 80: $p2;"
+    verdict "certbot_hooks_toggle_geo_80 (pre: 80 → $p1, post: 80 → $p2)" "$why"
+}
+
+# reboot: XDP/tc сняты, pin'ы и NOTRACK пропали, сеть «недоступна» — reattach поднимает всё по
+# guard.conf и гео-кешу (без скачиваний)
+case_reattach_restores_from_disk() {
+    local out why=""
+    if ! out=$(g_on --geo ru); then bad "reattach_restores_from_disk: on: $(tail3 "$out")"; return; fi
+    in_srv ip link set dev "$SRV_IF" xdpdrv off 2>/dev/null
+    in_srv ip link set dev "$SRV_IF" xdpgeneric off 2>/dev/null
+    in_srv tc filter del dev "$SRV_IF" ingress pref 10 2>/dev/null
+    in_srv nft delete table inet nd_guard 2>/dev/null
+    rm -rf "$PIN"
+    if [ -n "$(srv_xdp)" ] || tc_has 10 || nft_has; then bad "reattach_restores_from_disk: имитация reboot не удалась"; return; fi
+    out=$(GUARD_GEO_RIPE_URL=file:///nonexistent guard reattach) || why="reattach rc≠0: $(tail3 "$out");"
+    [ -n "$(srv_xdp)" ] || why="$why нет XDP;"
+    nft_has || why="$why нет NOTRACK;"
+    if has_kfunc; then tc_has 10 || why="$why нет tc pref 10;"; fi
+    out=$(cli_from "$CLI4" "$SRV4") || why="$why RU v4 не прошёл ($out);"
+    cli_from "$FOREIGN4" "$SRV4" >/dev/null && why="$why чужой v4 прошёл — гео не из кеша;"
+    verdict "reattach_restores_from_disk (XDP, tc, NOTRACK и гео по кешу)" "$why"
+}
+
+# off --keep-config снимает рантайм, но оставляет guard.conf; off — и его. Ключ, гео-кеш и
+# allow.list остаются всегда. Ни XDP, ни tc pref 10, ни nd_guard, pin'ы пусты; status работает
+gone() {   # пусто — от guard в рантайме ничего не осталось
+    [ -z "$(srv_xdp)" ] || printf ' XDP висит;'
+    tc_has 10 && printf ' есть pref 10;'
+    nft_has && printf ' есть nd_guard;'
+    pin_empty || printf ' pin'"'"'ы не пусты;'
+    return 0
+}
+kept() {   # пусто — ключ, гео-кеш и allow.list на месте
+    [ -s "$GUARD_DIR/key" ] || printf ' нет key;'
+    [ -s "$GUARD_DIR/geo/geo4.txt" ] || printf ' нет гео-кеша;'
+    grep -qx 192.0.2.0/24 "$GUARD_DIR/allow.list" 2>/dev/null || printf ' нет allow.list;'
+    return 0
+}
+case_off_cleans_everything() {
+    local out why=""
+    out=$(guard allow 192.0.2.0/24) || why="allow: $(tail3 "$out");"
+    out=$(guard off --keep-config) || why="$why off --keep-config: $(tail3 "$out");"
+    why="$why$(gone)$(kept)"
+    [ -s "$GUARD_DIR/guard.conf" ] || why="$why off --keep-config удалил guard.conf;"
+    out=$(guard reattach) || why="$why reattach после off --keep-config: $(tail3 "$out");"
+    [ -n "$(srv_xdp)" ] || why="$why reattach не вернул XDP;"
+    out=$(guard off) || why="$why off: $(tail3 "$out");"
+    why="$why$(gone)$(kept)"
+    [ ! -e "$GUARD_DIR/guard.conf" ] || why="$why off оставил guard.conf;"
+    if ! out=$(guard status) || ! printf '%s\n' "$out" | grep -q 'выключен'; then
+        why="$why status после off [$(tail3 "$out")];"
+    fi
+    verdict "off_cleans_everything (--keep-config: конфиг есть; off: нет XDP/pref 10/nd_guard/pin'ов; key, гео, allow.list — на месте)" "$why"
+}
+
+mode_guard() {
+    local out c
+    echo "== guard: стенд gsrv ⇄ gcli, modules/guard.sh --iface $SRV_IF =="
+    guard_env
+    if ! out=$(guard_setup 2>&1); then bad "стенд: $out"; return; fi
+    ok "стенд: чужие $FOREIGN4/$FOREIGN6 на $CLI_IF, XDP_PASS на $CLI_IF (peer native XDP_TX), ct-правило в $SRV_NS"
+    if ! srv_start 6; then bad "эхо-сервер [::]:$PORT не поднялся: $(cat "$TMP/echo.log")"; return; fi
+    if out=$(cli_from "$CLI4" "$SRV4") && out=$(cli_from "$CLI6" "$SRV6") && out=$(cli_from "$FOREIGN4" "$SRV4"); then
+        ok "связность без guard (RU v4/v6, чужой v4)"
+    else
+        bad "связность без guard: $out"
+        return
+    fi
+    echo "== guard: кейсы (ядро $(uname -r)) =="
+    for c in "${GUARD_CASES[@]}"; do "case_$c"; done
+}
+
 # ── main ──
 
 case "${1:-}" in
-raw) ;;
+raw) tools=() ;;
+guard) tools=(nft conntrack ethtool curl) ;;   # curl: guard.sh качает гео-фикстуру по file://
 *)
-    echo "использование: $0 raw" >&2
+    echo "использование: $0 raw|guard" >&2
     exit 2
     ;;
 esac
@@ -535,7 +842,7 @@ if [ "$(id -u)" != 0 ]; then
     echo "guard-netns: нужен root" >&2
     exit 1
 fi
-for t in clang "$BPFTOOL" ip tc ss nsenter python3; do
+for t in clang "$BPFTOOL" ip tc ss nsenter python3 ${tools[@]+"${tools[@]}"}; do
     command -v "$t" >/dev/null 2>&1 || { echo "guard-netns: нет $t (tests/guard-deps.sh)" >&2; exit 1; }
 done
 grep -qs ' /sys/fs/bpf bpf ' /proc/mounts || { echo "guard-netns: bpffs не смонтирован на /sys/fs/bpf" >&2; exit 1; }
