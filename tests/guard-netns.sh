@@ -394,9 +394,10 @@ case_bad_cookie_ack_fails_open() {
 # (сверх брифа) ранние выходы tc по режиму cookies: off и auto вне атаки — ACK не трогается
 # (cookie_bad не растёт, RST от ядра есть); auto под атакой (порог 0) — cookie-путь работает.
 # «Вне атаки» = now > attack_until + 2·2^36 нс; при attack_until = 0 это требует CLOCK_MONOTONIC
-# > ~137 с — на свежезагруженной машине эта часть не проверяется (видно в выводе).
+# > ~137 с: недостающие ≤ 60 с кейс выжидает (свежий CI runner), иначе часть не проверяется
+# (видно в выводе).
 case_cookie_modes() {
-    local s0 s1 rc now why="" idle
+    local s0 s1 rc now wait_s=0 why="" idle need=$(( (2 << 36) + 3000000000 ))
     set_cookies off >/dev/null || why="set-cfg off;"
     s0=$(stats); bad_ack; rc=$?; s1=$(stats)
     [ "$(delta cookie_bad "$s0" "$s1")" = 0 ] || why="$why off: tc проверял cookie;"
@@ -408,13 +409,20 @@ case_cookie_modes() {
 
     { set_cookies auto >/dev/null && state_reset >/dev/null; } || why="$why сброс в auto без атаки;"
     now=$(ctrl state | sed -n 's/.*now_ns=\([0-9]*\).*/\1/p')
-    if [ "${now:-0}" -gt $(( (2 << 36) + 3000000000 )) ]; then
+    now=${now:-0}
+    if [ "$now" -le "$need" ] && [ $(( need - now )) -le 60000000000 ]; then
+        wait_s=$(( (need - now) / 1000000000 + 1 ))
+        sleep "$wait_s"
+        now=$(( now + wait_s * 1000000000 ))
+    fi
+    if [ "$now" -gt "$need" ]; then
         s0=$(stats); bad_ack; rc=$?; s1=$(stats)
         [ "$(delta cookie_bad "$s0" "$s1")" = 0 ] || why="$why auto вне атаки: tc проверял cookie;"
         [ "$rc" = 0 ] || why="$why auto вне атаки: нет RST;"
         idle="auto вне атаки"
+        [ "$wait_s" = 0 ] || idle="$idle, ждал ${wait_s} с"
     else
-        idle="auto вне атаки НЕ проверен: CLOCK_MONOTONIC ${now:-?} нс < 2·2^36 + 3 с"
+        idle="auto вне атаки НЕ проверен: CLOCK_MONOTONIC $now нс < 2·2^36 + 3 с"
     fi
 
     set_cookies always >/dev/null || why="$why возврат always;"
