@@ -33,7 +33,7 @@ COOKIE_CASES=(cookie_handshake_v4 cookie_handshake_v6 dualstack_listener_v4_cook
               cookie_ts_from_ack no_timestamps_keeps_wscale bad_cookie_ack_fails_open cookie_modes)
 # режим guard: «чужие» (не из гео-фикстуры 10.200.0.0/25, fd00:200::/120) адреса клиента
 FOREIGN4=10.200.0.200 FOREIGN6=fd00:200::200
-GUARD_CASES=(geo_unavailable_refuses variant1_geo_drop xdp_mode_veth allowlist_bypasses_geo
+GUARD_CASES=(geo_unavailable_refuses ssh_port_refused variant1_geo_drop xdp_mode_veth allowlist_bypasses_geo
              notrack_no_conntrack_entries variant2_cookies_always
              tc_load_fail_degrades reapply_no_stacking
              shaper_survives_guard certbot_hooks_toggle_geo_80 reattach_restores_from_disk
@@ -623,6 +623,21 @@ case_geo_unavailable_refuses() {
     pin_empty || why="$why pin'ы в $PIN;"
     [ -z "$why" ] || why="$why [$(tail3 "$out")]"
     verdict "geo_unavailable_refuses (rc $rc, хост не тронут)" "$why"
+}
+
+# F4/D10: порт SSH в --ports → rc 2 до любых изменений (SSH guard не трогает)
+case_ssh_port_refused() {
+    local out rc ssh why=""
+    ssh=$(in_srv bash -c 'source lib/common.sh; detect_ssh_port')
+    out=$(g_on --ports "443,$ssh")
+    rc=$?
+    [ "$rc" = 2 ] || why="rc $rc, а не 2;"
+    printf '%s\n' "$out" | grep -q "SSH на порту $ssh" || why="$why нет отказа «SSH на порту $ssh»;"
+    [ -z "$(srv_xdp)" ] || why="$why на $SRV_IF висит XDP;"
+    nft_has && why="$why есть таблица nd_guard;"
+    pin_empty || why="$why pin'ы в $PIN;"
+    [ -z "$why" ] || why="$why [$(tail3 "$out")]"
+    verdict "ssh_port_refused (--ports 443,$ssh → rc $rc, хост не тронут)" "$why"
 }
 
 # вариант 1: RU-клиент проходит, «чужой» — DROP в XDP (таймаут); v4 и v6, geo_drop растёт

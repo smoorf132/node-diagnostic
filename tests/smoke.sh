@@ -289,6 +289,15 @@ if command -v nft >/dev/null 2>&1; then
     fi
 fi
 printf '%s\n' "$gr" | grep -q 'udp sport { 443, 80 } notrack' && ok "notrack udp out" || bad "notrack udp out"
+# F4: порт SSH в --ports — отказ; печатается сам порт
+[ "$(_guard_ports_conflict_ssh 443,22 22 2>/dev/null)" = 22 ] && ! _guard_ports_conflict_ssh 443,80 22 \
+  && [ "$(_guard_ports_conflict_ssh 443,80 0443)" = 443 ] && ! _guard_ports_conflict_ssh 443,80 "" \
+  && ok "ports_conflict_ssh" || bad "ports_conflict_ssh"
+# M4: XDP/tc guard разбирают Ethernet — tun/wg (link/none) и ppp — отказ
+_guard_iface_ether '2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq state UP mode DEFAULT group default qlen 1000\    link/ether 52:54:00:12:34:56 brd ff:ff:ff:ff:ff:ff' 2>/dev/null \
+  && ! _guard_iface_ether '5: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\    link/none ' \
+  && ! _guard_iface_ether '7: ppp0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1492 qdisc fq state UNKNOWN qlen 3\    link/ppp ' \
+  && ok "iface_ether: link/ether — да; link/none, link/ppp — нет" || bad "iface_ether"
 printf '%s\n' "$gr" | grep -q 'iifname "eth0" tcp dport { 443, 80 } notrack' && printf '%s\n' "$gr" | grep -q 'priority raw' \
   && ok "notrack tcp in, priority raw" || bad "notrack tcp in"
 # фейковый docker в PATH: опубликованный :443 → конфликт (печать имени); host-сеть и :8443->443 — нет

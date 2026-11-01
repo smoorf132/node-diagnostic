@@ -58,6 +58,23 @@ _guard_port_ok() {
     [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -lt "$((10#$2))" ]
 }
 
+# «ip -o link show IF» → rc 0, если у интерфейса Ethernet-заголовок (link/ether): XDP и tc guard
+# разбирают Ethernet. tun/wg/ppp (link/none, link/ppp) guard молча пропускал бы, а status писал «вкл»
+_guard_iface_ether() { case "$1" in *" link/ether "*) return 0 ;; *) return 1 ;; esac; }
+
+# PORTS SSHPORTS → rc 0 и печать порта, если SSH (D10: guard его не трогает) попал в порты guard
+_guard_ports_conflict_ssh() {
+    local p s
+    for p in ${1//,/ }; do
+        case "$p" in '' | *[!0-9]*) continue ;; esac
+        for s in ${2//,/ }; do
+            case "$s" in '' | *[!0-9]*) continue ;; esac
+            [ "$((10#$p))" = "$((10#$s))" ] && { echo "$((10#$s))"; return 0; }
+        done
+    done
+    return 1
+}
+
 # BYTES → rcv_wscale, как в ядре (tcp_select_initial_window); вход — max(rmem_max, tcp_rmem[2])
 _guard_rcv_wscale() {
     local space=$1 ws=0
@@ -849,11 +866,18 @@ guard_on() {
     need_root || die "нужен root"                                              # 1
     _guard_defaults
     _guard_parse_on "$@"                                                       # 2
+    # D10: SSH guard не трогает — его порт под NOTRACK/гео/cookies не берём (до любых изменений)
+    if c=$(_guard_ports_conflict_ssh "$G_PORTS" "$(detect_ssh_port)"); then
+        _guard_badarg "SSH на порту $c — guard его не трогает, убери из --ports"
+    fi
     G_GEO_RT=$G_GEO
     _guard_kernel_ok || die "нужно ядро Linux ≥ 5.10; у тебя $(uname -r)"     # 3
     [ -n "$G_IFACE" ] || G_IFACE=$(default_iface)                             # 4
     [ -n "$G_IFACE" ] || die "не определён интерфейс (нет маршрута по умолчанию) — укажи --iface"
     ip link show dev "$G_IFACE" >/dev/null 2>&1 || die "нет интерфейса $G_IFACE"
+    if ! _guard_iface_ether "$(ip -o link show dev "$G_IFACE" 2>/dev/null)"; then
+        die "у $G_IFACE нет Ethernet-заголовка ($(ip -o link show dev "$G_IFACE" | grep -oE 'link/[a-z0-9]+' | head -n 1)): XDP и tc guard его не разберут — укажи --iface внешнего Ethernet-интерфейса"
+    fi
     low=$(awk '{print $1}' /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null)   # 5
     for p in ${G_PORTS//,/ }; do
         _guard_port_ok "$p" "${low:-32768}" || die "порт $p не ниже начала ip_local_port_range (${low:-?}): NOTRACK и гео задели бы ответы на исходящие соединения ноды — подними диапазон (optimize ставит 10000) или убери порт из --ports"
