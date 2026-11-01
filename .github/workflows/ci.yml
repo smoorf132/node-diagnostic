@@ -12,7 +12,7 @@ jobs:
       - name: install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: shellcheck (severity=warning)
-        run: shellcheck --severity=warning --shell=bash node-diagnostic.sh install.sh lib/common.sh lib/dns.sh modules/*.sh tests/smoke.sh tests/sshport-it.sh tests/guard-deps.sh
+        run: shellcheck --severity=warning --shell=bash node-diagnostic.sh install.sh lib/common.sh lib/dns.sh modules/*.sh tests/smoke.sh tests/sshport-it.sh tests/guard-deps.sh tests/guard-netns.sh
 
   # компиляция eBPF-шейпера (nd-shaper.bpf.c) — чтобы правки BPF-программы
   # не ломались молча; сам attach проверяется только на живой ноде
@@ -39,6 +39,14 @@ jobs:
           test -s /tmp/nd-guard-xdp.bpf.o
           readelf -S /tmp/nd-guard-xdp.bpf.o | grep -qE '\] xdp '
           echo "BPF compiled OK (xdp)"
+      - name: compile modules/nd-guard-tc.bpf.c (-target bpf)
+        run: |
+          inc=""
+          [ -d /usr/include/x86_64-linux-gnu ] && inc="-I/usr/include/x86_64-linux-gnu"
+          clang -O2 -g -Wall -target bpf $inc -c modules/nd-guard-tc.bpf.c -o /tmp/nd-guard-tc.bpf.o
+          test -s /tmp/nd-guard-tc.bpf.o
+          readelf -S /tmp/nd-guard-tc.bpf.o | grep -qE '\] tc '
+          echo "BPF compiled OK (tc)"
       - name: host-тест cookie
         run: |
           cc -O2 -Wall -Werror -I modules -o /tmp/gct tests/guard_cookie_test.c
@@ -58,6 +66,21 @@ jobs:
         run: |
           echo "kernel: $(uname -r)"
           sudo python3 tests/guard_xdp_test.py -v
+
+  # guard в netns-стенде (veth, generic XDP + tc): cookie-рукопожатие через bpf_sk_assign_tcp_reqsk
+  # без conntrack; ND_GUARD_REQUIRE_KFUNC=1 — ядро runner'а без kfunc = провал, а не тихий SKIP
+  guard-netns:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps (clang, libbpf, статический bpftool)
+        run: sudo --preserve-env=GH_TOKEN bash tests/guard-deps.sh
+      - name: netns-стенд, режим raw
+        run: |
+          echo "kernel: $(uname -r)"
+          sudo ND_GUARD_REQUIRE_KFUNC=1 bash tests/guard-netns.sh raw
 
   smoke-ubuntu:
     runs-on: ubuntu-latest
