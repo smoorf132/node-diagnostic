@@ -136,6 +136,28 @@ bash modules/ipv6.sh status >/dev/null 2>&1; rc=$?
 [ "$rc" -le 1 ] && ok "ipv6 status (rc=$rc)" || bad "ipv6 status crash (rc=$rc)"
 bash node-diagnostic.sh help 2>/dev/null | grep -q 'certs' && ok "help: certs/warp/ipv6" || bad "help без certs"
 
+# M3: certs HTTP-01 standalone при guard вариант 1 — guard hook pre, certbot, hook post (и при
+# провале certbot); без GEO=ru — certbot без хуков. certbot и guard.sh — фейки, лог вызовов в $cg/log
+cg=$(mktemp -d)
+printf '#!/bin/sh\necho "certbot $*" >>"%s/log"\nexit "${CERTBOT_RC:-0}"\n' "$cg" >"$cg/certbot"
+chmod +x "$cg/certbot"
+printf 'echo "guard $*" >>"%s/log"\n' "$cg" >"$cg/guard.sh"
+mkdir -p "$cg/gd" && printf 'GEO=ru\nPORTS=443,80\n' >"$cg/gd/guard.conf"
+cs() {   # cs RC → «rc=N» certs_standalone_certbot с фейками
+    PATH="$cg:$PATH" ND_GUARD_SH="$cg/guard.sh" GUARD_DIR="$cg/gd" CERTBOT_RC=$1 bash -c \
+        'source lib/common.sh; source modules/certs.sh; certs_standalone_certbot certonly --standalone -d x >/dev/null; echo "rc=$?"' 2>/dev/null
+}
+r1=$(cs 1); l1=$(tr '\n' '|' <"$cg/log" 2>/dev/null); rm -f "$cg/log"
+printf 'GEO=off\n' >"$cg/gd/guard.conf"
+r2=$(cs 0); l2=$(tr '\n' '|' <"$cg/log" 2>/dev/null)
+if [ "$r1" = rc=1 ] && [ "$l1" = "guard hook pre|certbot certonly --standalone -d x|guard hook post|" ] \
+   && [ "$r2" = rc=0 ] && [ "$l2" = "certbot certonly --standalone -d x|" ] \
+   && grep -q 'certs_standalone_certbot certonly --standalone' modules/certs.sh; then
+    ok "certs: HTTP-01 standalone под guard вариант 1 — hook pre/post и при провале certbot"
+else
+    bad "certs: хуки guard вокруг standalone ($r1 [$l1]; $r2 [$l2])"
+fi
+
 echo "== нода: домены, покрытие сертификатом =="
 fn=$(bash -c 'source lib/common.sh; source modules/node.sh
     [ "$(extract_domain node.example.com)" = example.com ] || exit 1

@@ -123,6 +123,35 @@ certbot_dns_plugin() {   # <dns-xxx> <pip-пакет>
     return 1
 }
 
+# guard вариант 1 (гео RU) режет :80 для валидаторов Let's Encrypt (они не из РФ). Продление certbot
+# зовёт хуки renewal-hooks, а первый выпуск certonly --standalone — нет: хуки guard зовём сами.
+# ND_GUARD_SH — путь к guard.sh (для smoke); guard.conf — в GUARD_DIR, как у guard.sh
+_certs_guard_geo() {
+    [ -f "${ND_GUARD_SH:-$_certs_self/guard.sh}" ] \
+        && grep -qx 'GEO=ru' "${GUARD_DIR:-/var/lib/node-diagnostic/guard}/guard.conf" 2>/dev/null
+}
+_certs_guard_hook() { bash "${ND_GUARD_SH:-$_certs_self/guard.sh}" hook "$1" >/dev/null 2>&1 || true; }
+
+# certbot <аргументы> для HTTP-01 standalone: при guard GEO=ru — hook pre, certbot, hook post при
+# любом исходе (и при Ctrl-C/TERM). rc — certbot
+certs_standalone_certbot() {
+    local rc old
+    if ! _certs_guard_geo; then
+        certbot "$@"
+        return
+    fi
+    msg_info "guard (вариант 1): гео с порта 80 снято на время HTTP-01"
+    old=$(trap -p INT TERM)
+    _certs_guard_hook pre
+    trap '_certs_guard_hook post; exit 130' INT TERM
+    certbot "$@"
+    rc=$?
+    trap - INT TERM
+    [ -n "$old" ] && eval "$old"   # прежние обработчики вызывающего
+    _certs_guard_hook post
+    return "$rc"
+}
+
 # certbot certonly. Метод: 1 Cloudflare, 2 Gcore, 3 Bunny (DNS-01 wildcard), 4 HTTP-01.
 get_certificates() {   # <домен> <метод> [email]
     local domain=$1 method=$2 email=${3:-} base
@@ -179,7 +208,7 @@ get_certificates() {   # <домен> <метод> [email]
             fi
             busy=$(ss -Htlnp 'sport = :80' 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | sort -u | paste -sd, -)
             [ -n "$busy" ] && msg_warn "порт 80 занят ($busy) — HTTP-01 не пройдёт, пока он не свободен"
-            certbot certonly --standalone --http-01-port 80 -d "$domain" "${mail[@]}" "${common[@]}"
+            certs_standalone_certbot certonly --standalone --http-01-port 80 -d "$domain" "${mail[@]}" "${common[@]}"
             rc=$?
             [ "$nginx_up" = 1 ] && docker start "$NGINX_CONTAINER" >/dev/null 2>&1
             if [ "$rc" -ne 0 ]; then
