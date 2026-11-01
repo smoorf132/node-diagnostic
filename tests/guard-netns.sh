@@ -34,7 +34,7 @@ COOKIE_CASES=(cookie_handshake_v4 cookie_handshake_v6 dualstack_listener_v4_cook
 # режим guard: «чужие» (не из гео-фикстуры 10.200.0.0/25, fd00:200::/120) адреса клиента
 FOREIGN4=10.200.0.200 FOREIGN6=fd00:200::200
 GUARD_CASES=(geo_unavailable_refuses ssh_port_refused variant1_geo_drop xdp_mode_veth allowlist_bypasses_geo
-             notrack_no_conntrack_entries variant2_cookies_always
+             notrack_no_conntrack_entries icmp_errors_not_invalid variant2_cookies_always
              tc_load_fail_degrades reapply_no_stacking
              shaper_survives_guard certbot_hooks_toggle_geo_80 reattach_restores_from_disk
              reattach_unconfirmed_rolls_back off_cleans_everything)
@@ -205,6 +205,35 @@ while time.time() < end:
     if peer[0] == dst and sp == 443 and dp == sport and pkt[ihl + 13] & 0x04:
         sys.exit(0)
 sys.exit(2)
+EOF
+    # icmperr.py 4|6 SRC DST — ICMP-ошибка (v4 frag-needed, v6 packet-too-big, MTU 1400) о сегменте
+    # DST:443 → SRC:40000, будто ответ ноды не пролез; raw-сокетом из SRC. Чексумму ICMPv6 считает ядро
+    cat >"$TMP/icmperr.py" <<'EOF'
+import socket, struct, sys
+fam, src, dst = sys.argv[1:4]
+
+
+def csum(b):
+    s = sum(struct.unpack("!%dH" % (len(b) // 2), b))
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return ~s & 0xFFFF
+
+
+tcp8 = struct.pack("!HHI", 443, 40000, 1)
+if fam == "4":
+    inner = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 40, 0, 0x4000, 64, 6, 0,
+                        socket.inet_aton(dst), socket.inet_aton(src)) + tcp8
+    icmp = struct.pack("!BBHHH", 3, 4, 0, 0, 1400) + inner
+    icmp = icmp[:2] + struct.pack("!H", csum(icmp)) + icmp[4:]
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+else:
+    inner = struct.pack("!IHBB16s16s", 6 << 28, 20, 6, 64, socket.inet_pton(socket.AF_INET6, dst),
+                        socket.inet_pton(socket.AF_INET6, src)) + tcp8
+    icmp = struct.pack("!BBHI", 2, 0, 0, 1400) + inner
+    s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+s.bind((src, 0))
+s.sendto(icmp, (dst, 0))
 EOF
 }
 
@@ -703,6 +732,50 @@ case_notrack_no_conntrack_entries() {
     n1=$(ct_443)
     [ "$n1" = 0 ] || why="$why с guard записей на :$PORT: $n1;"
     verdict "notrack_no_conntrack_entries (без guard: $n0, с guard: $n1)" "$why"
+}
+
+# F5: ICMP-ошибка о потоке guard (node:443 → клиент) — у потока под NOTRACK нет записи conntrack,
+# и без guard-правила она попадала бы в ct state invalid (drop в protect/ufw раньше accept ICMP —
+# чёрная дыра PMTU). Контроль без guard: invalid; с guard: untracked, не invalid. Счётчики — в gsrv
+icmp_cnt() { in_srv nft list counter inet nd_test_icmp "$1" 2>/dev/null | sed -n 's/.*packets \([0-9]*\).*/\1/p'; }
+icmp_send() {   # → «inv4 unt4 inv6 unt6» — прирост счётчиков после frag-needed (v4) и packet-too-big (v6)
+    local c b=() a=()
+    for c in inv4 unt4 inv6 unt6; do b+=("$(icmp_cnt "$c")"); done
+    in_cli python3 "$TMP/icmperr.py" 4 "$CLI4" "$SRV4"
+    in_cli python3 "$TMP/icmperr.py" 6 "$CLI6" "$SRV6"
+    sleep 0.2
+    for c in inv4 unt4 inv6 unt6; do a+=("$(icmp_cnt "$c")"); done
+    echo "$((a[0] - b[0])) $((a[1] - b[1])) $((a[2] - b[2])) $((a[3] - b[3]))"
+}
+case_icmp_errors_not_invalid() {
+    local out d0 d1 why=""
+    if ! in_srv nft -f - <<'EOF'
+table inet nd_test_icmp {
+	counter inv4 {}
+	counter unt4 {}
+	counter inv6 {}
+	counter unt6 {}
+	chain in {
+		type filter hook input priority filter; policy accept;
+		icmp type destination-unreachable ct state invalid counter name inv4
+		icmp type destination-unreachable ct state untracked counter name unt4
+		icmpv6 type packet-too-big ct state invalid counter name inv6
+		icmpv6 type packet-too-big ct state untracked counter name unt6
+	}
+}
+EOF
+    then
+        bad "icmp_errors_not_invalid: тестовая таблица nft не встала"
+        return
+    fi
+    out=$(guard off) || why="off: $(tail3 "$out");"
+    d0=$(icmp_send)
+    [ "$d0" = "1 0 1 0" ] || why="$why контроль без guard: «inv4 unt4 inv6 unt6» = $d0, а не «1 0 1 0»;"
+    out=$(g_on --geo ru --cookies off) || why="$why on: $(tail3 "$out");"
+    d1=$(icmp_send)
+    [ "$d1" = "0 1 0 1" ] || why="$why с guard: «inv4 unt4 inv6 unt6» = $d1, а не «0 1 0 1»;"
+    in_srv nft delete table inet nd_test_icmp 2>/dev/null
+    verdict "icmp_errors_not_invalid (без guard — invalid: $d0; с guard — untracked: $d1)" "$why"
 }
 
 # вариант 2, cookies always: и RU, и «чужие» проходят через cookie-путь (XDP → tc → kfunc)

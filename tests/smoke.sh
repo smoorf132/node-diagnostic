@@ -289,6 +289,10 @@ if command -v nft >/dev/null 2>&1; then
     fi
 fi
 printf '%s\n' "$gr" | grep -q 'udp sport { 443, 80 } notrack' && ok "notrack udp out" || bad "notrack udp out"
+# F5: ICMP-ошибки о потоках guard — мимо conntrack (иначе ct state invalid → drop раньше accept ICMP)
+printf '%s\n' "$gr" | grep -qF 'iifname "eth0" icmp type { destination-unreachable, time-exceeded, parameter-problem } @th,224,16 { 443, 80 } notrack' \
+  && printf '%s\n' "$gr" | grep -qF 'iifname "eth0" icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } @th,384,16 { 443, 80 } notrack' \
+  && ok "notrack ICMP/ICMPv6-ошибок по внутреннему sport (PMTU)" || bad "нет notrack ICMP-ошибок"
 # F4: порт SSH в --ports — отказ; печатается сам порт
 [ "$(_guard_ports_conflict_ssh 443,22 22 2>/dev/null)" = 22 ] && ! _guard_ports_conflict_ssh 443,80 22 \
   && [ "$(_guard_ports_conflict_ssh 443,80 0443)" = 443 ] && ! _guard_ports_conflict_ssh 443,80 "" \

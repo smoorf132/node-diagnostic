@@ -92,7 +92,10 @@ _guard_need_xdp() { [ "$1" = ru ] || { [ "$2" != off ] && [ "$3" = 1 ]; }; }
 # COOKIES HAS_KFUNC → режим cookies с учётом ядра: без kfunc — off
 _guard_effective_cookies() { if [ "$2" = 1 ]; then echo "$1"; else echo off; fi; }
 
-# IFACE PORTS → ruleset NOTRACK; идиома protect.sh (table / delete table / table {}) — атомарная замена
+# IFACE PORTS → ruleset NOTRACK; идиома protect.sh (table / delete table / table {}) — атомарная замена.
+# ICMP-ошибки на потоки guard (frag-needed, packet-too-big…) — тоже мимо conntrack: записи потока нет,
+# ошибка попала бы в ct state invalid, а его drop (protect, ufw before*.rules) стоит раньше accept ICMP —
+# чёрная дыра PMTU. Внутренний sport — порт guard: ICMP 8 + IPv4 20 (IHL 5) = бит 224; ICMPv6 8 + 40 = 384
 _guard_nft_render() {
     local set="${2//,/, }"
     cat <<EOF
@@ -103,6 +106,8 @@ table inet nd_guard {
 		type filter hook prerouting priority raw; policy accept;
 		iifname "$1" tcp dport { $set } notrack
 		iifname "$1" udp dport { $set } notrack
+		iifname "$1" icmp type { destination-unreachable, time-exceeded, parameter-problem } @th,224,16 { $set } notrack
+		iifname "$1" icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } @th,384,16 { $set } notrack
 	}
 	chain out {
 		type filter hook output priority raw; policy accept;
