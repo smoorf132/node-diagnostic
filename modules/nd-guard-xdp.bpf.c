@@ -2,7 +2,8 @@
  * nd-guard-xdp.bpf.c — XDP-часть guard: гео-фильтр по LPM и SYN-ACK с SYN-cookie.
  *
  * На каждый пакет (порт из guard_ports_map, иначе PASS без статистики):
- *   allowlist → гео (единственный DROP) → SYN: окно 1 с, auto/always → SYN-ACK (XDP_TX) → PASS.
+ *   allowlist → гео (единственный DROP) → SYN: окно 1 с, auto/always → обычный TCP-listener? →
+ *   SYN-ACK (XDP_TX) → PASS. Нет listener'а или он MPTCP — SYN ядру (nd_syn_listener).
  * Любая ошибка — PASS (fail-open, D9). ACK с cookie проверяет tc (nd-guard-tc.bpf.c).
  *
  * Совместимость: ядро ≥ 5.10, clang без -mcpu=v3 — без atomic fetch, bpf_loop и доступа
@@ -205,6 +206,82 @@ static __always_inline int syn_wants_cookie(const struct guard_cfg *cfg, __u64 n
 	if (cfg->cookie_mode == COOKIE_ALWAYS)
 		return 1;
 	return cfg->cookie_mode == COOKIE_AUTO && now < st->attack_until_ns;
+}
+
+/*
+ * Кто в ядре примет этот SYN. Cookie выдаётся только обычному TCP-listener'у:
+ *   ND_LSN_TCP   — обычный TCP-listener: SYN-ACK с cookie;
+ *   ND_LSN_NONE  — сокета нет или он не LISTEN (TIME_WAIT, request, established): ядро ответит
+ *                  само. Cookie здесь сделал бы закрытый порт «открытым», а ACK по нему tc не к чему
+ *                  назначить — RST;
+ *   ND_LSN_MPTCP — MPTCP-listener (Go ≥ 1.24, а с ним xray, слушает MPTCP по умолчанию): kfunc
+ *                  bpf_sk_assign_tcp_reqsk отвергает его (-EINVAL), соединение по cookie получило бы
+ *                  RST. SYN — ядру, от флуда его держат собственные syncookies ядра.
+ * MPTCP проверяется только с -DND_GUARD_MPTCP (guard.sh ставит при MPTCP в ядре и kfunc): хелпер
+ * bpf_skc_to_mptcp_sock есть с 5.19, и на старом ядре (5.15 у Ubuntu 22.04) объект с ним не
+ * загрузился бы — вместе с гео; а без kfunc (< 6.9) cookie выключены и проверка не нужна.
+ * Глобальная функция: заголовки перечитывает сама, ссылку на сокет берёт и отпускает внутри.
+ */
+#define ND_LSN_NONE  0
+#define ND_LSN_TCP   1
+#define ND_LSN_MPTCP 2
+
+__noinline int nd_syn_listener(struct xdp_md *ctx)
+{
+	void *data = (void *)(long)ctx->data;
+	void *data_end = (void *)(long)ctx->data_end;
+	struct ethhdr *eth = data;
+	struct bpf_sock_tuple t;
+	struct bpf_sock *sk;
+	struct tcphdr *tcp;
+	__u32 tlen;
+	int r = ND_LSN_NONE;
+
+	__builtin_memset(&t, 0, sizeof(t));
+	if ((void *)(eth + 1) > data_end)
+		return ND_LSN_NONE;
+	if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+		struct iphdr *ip = (void *)(eth + 1);
+
+		if ((void *)(ip + 1) > data_end || ip->ihl != 5)
+			return ND_LSN_NONE;
+		tcp = (void *)(ip + 1);
+		if ((void *)(tcp + 1) > data_end)
+			return ND_LSN_NONE;
+		t.ipv4.saddr = ip->saddr;
+		t.ipv4.daddr = ip->daddr;
+		t.ipv4.sport = tcp->source;
+		t.ipv4.dport = tcp->dest;
+		tlen = sizeof(t.ipv4);
+	} else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+		struct ipv6hdr *ip6 = (void *)(eth + 1);
+
+		if ((void *)(ip6 + 1) > data_end)
+			return ND_LSN_NONE;
+		tcp = (void *)(ip6 + 1);
+		if ((void *)(tcp + 1) > data_end)
+			return ND_LSN_NONE;
+		__builtin_memcpy(t.ipv6.saddr, &ip6->saddr, 16);
+		__builtin_memcpy(t.ipv6.daddr, &ip6->daddr, 16);
+		t.ipv6.sport = tcp->source;
+		t.ipv6.dport = tcp->dest;
+		tlen = sizeof(t.ipv6);
+	} else {
+		return ND_LSN_NONE;
+	}
+
+	sk = bpf_skc_lookup_tcp(ctx, &t, tlen, BPF_F_CURRENT_NETNS, 0);
+	if (!sk)
+		return ND_LSN_NONE;
+	if (sk->state == BPF_TCP_LISTEN) {
+		r = ND_LSN_TCP;
+#ifdef ND_GUARD_MPTCP
+		if (bpf_skc_to_mptcp_sock(sk))
+			r = ND_LSN_MPTCP;
+#endif
+	}
+	bpf_sk_release(sk);
+	return r;
 }
 
 /* Пакет вмещает TCP-заголовок + nw слов опций с начала w */
@@ -476,10 +553,18 @@ int nd_guard_xdp(struct xdp_md *ctx)
 		__u32 doff = tcp->doff;
 
 		guard_stat(ST_SYN);
-		if (doff >= 5 && syn_wants_cookie(cfg, now) &&
-		    nd_synack(ctx, nd_syn_opts(ctx, v6, doff * 4 - sizeof(struct tcphdr)), now) == 0) {
-			guard_stat(ST_COOKIE_SENT);
-			return XDP_TX;
+		if (doff >= 5 && syn_wants_cookie(cfg, now)) {
+			int lsn = nd_syn_listener(ctx);
+
+			if (lsn == ND_LSN_TCP &&
+			    nd_synack(ctx, nd_syn_opts(ctx, v6, doff * 4 - sizeof(struct tcphdr)), now) == 0) {
+				guard_stat(ST_COOKIE_SENT);
+				return XDP_TX;
+			}
+			if (lsn == ND_LSN_MPTCP)
+				guard_stat(ST_SYN_MPTCP);
+			else if (lsn == ND_LSN_NONE)
+				guard_stat(ST_SYN_NOLISTEN);
 		}
 	}
 

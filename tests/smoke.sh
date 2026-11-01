@@ -324,9 +324,23 @@ _guard_iface_ether '2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq
   && ! _guard_iface_ether '5: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\    link/none ' \
   && ! _guard_iface_ether '7: ppp0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1492 qdisc fq state UNKNOWN qlen 3\    link/ppp ' \
   && ok "iface_ether: link/ether — да; link/none, link/ppp — нет" || bad "iface_ether"
-# F8: cookie_sent ≥ 100 при cookie_ok = 0 — драйвер теряет XDP_TX; подсказка сохраняет вариант
-_guard_xdp_tx_lost 100 0 2>/dev/null && ! _guard_xdp_tx_lost 99 0 && ! _guard_xdp_tx_lost 5000 1 && ! _guard_xdp_tx_lost "" 0 \
-  && ok "xdp_tx_lost: 100/0 — да; 99/0, 5000/1 — нет" || bad "xdp_tx_lost"
+# F8: cookie_sent ≥ 100 при cookie_ok = 0 и assign_err = 0 — драйвер теряет XDP_TX; assign_err ≥ 10
+# и больше cookie_ok — соединения по cookie отвергает ядро (не XDP_TX: ACK-то пришли)
+[ "$(_guard_cookie_diag 100 0 0 2>/dev/null)" = txlost ] && [ -z "$(_guard_cookie_diag 99 0 0)" ] \
+  && [ -z "$(_guard_cookie_diag 5000 1 0)" ] && [ -z "$(_guard_cookie_diag "" 0 0)" ] \
+  && [ "$(_guard_cookie_diag 3324 0 6029)" = assign ] && [ "$(_guard_cookie_diag 50 0 10)" = assign ] \
+  && [ -z "$(_guard_cookie_diag 50 0 9)" ] && [ -z "$(_guard_cookie_diag 5000 400 300)" ] \
+  && ok "cookie_diag: txlost 100/0/0; assign 3324/0/6029, 50/0/10; иначе пусто" || bad "cookie_diag"
+# MPTCP-listener'ы на портах guard — по `ss -MlnH` (с колонкой Netid и без): 4430 — не 443
+ss_m='LISTEN 0      4096   *:443   *:*
+LISTEN 0      4096   [::]:4430   [::]:*
+mptcp LISTEN 0 128 0.0.0.0:80 0.0.0.0:*'
+[ "$(_guard_mptcp_ports 443,80,8443 "$ss_m" 2>/dev/null)" = 443,80 ] && [ -z "$(_guard_mptcp_ports 8443 "$ss_m")" ] \
+  && [ -z "$(_guard_mptcp_ports 443 "")" ] \
+  && ok "mptcp_ports: 443 и 80 — MPTCP, 4430 ≠ 443" || bad "mptcp_ports"
+_guard_mptcp_hint 443 2>/dev/null | grep -q "net.mptcp.enabled=0" \
+  && _guard_mptcp_hint 443,8443 | grep -q "^порты 443,8443" \
+  && ok "mptcp_hint: как включить cookies" || bad "mptcp_hint"
 [ "$(_guard_cookies_off_cmd ru 443,80 eth0 eth0 2>/dev/null)" = "rr guard on --geo ru --cookies off" ] \
   && [ "$(_guard_cookies_off_cmd off 443 ens3 eth0)" = "rr guard on --ports 443 --iface ens3 --cookies off" ] \
   && ok "cookies_off_cmd: вариант, порты и интерфейс сохраняются" || bad "cookies_off_cmd"

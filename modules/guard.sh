@@ -89,12 +89,46 @@ _guard_rcv_wscale() {
 # Generic XDP без дела не вешаем: он линеаризует GRO-пакеты и съедает пропускную способность.
 _guard_need_xdp() { [ "$1" = ru ] || { [ "$2" != off ] && [ "$3" = 1 ]; }; }
 
-# COOKIE_SENT COOKIE_OK → rc 0, если cookie-ответы уходят (≥ 100), а ни одно соединение по ним не
-# завершилось: похоже, драйвер принимает XDP, но молча теряет XDP_TX (R13: только предупреждение в status)
-_guard_xdp_tx_lost() {
-    case "$1" in '' | *[!0-9]*) return 1 ;; esac
-    case "$2" in '' | *[!0-9]*) return 1 ;; esac
-    [ "$1" -ge 100 ] 2>/dev/null && [ "$2" -eq 0 ] 2>/dev/null
+# COOKIE_SENT COOKIE_OK ASSIGN_ERR → диагноз cookie-пути для status (R13: только предупреждение):
+#   assign — ACK с верным cookie приходят, но ядро отвергает соединения (assign_err ≥ 10 и больше
+#            cookie_ok): клиенты получают RST;
+#   txlost — cookie-ответы уходят (≥ 100), а ни одного ACK по ним: похоже, драйвер принимает XDP,
+#            но молча теряет XDP_TX;
+#   пусто  — признаков нет
+_guard_cookie_diag() {
+    local n
+    for n in "$1" "$2" "$3"; do case "$n" in '' | *[!0-9]*) return 0 ;; esac; done
+    if [ "$3" -ge 10 ] && [ "$3" -gt "$2" ]; then
+        echo assign
+    elif [ "$1" -ge 100 ] && [ "$2" -eq 0 ] && [ "$3" -eq 0 ]; then
+        echo txlost
+    fi
+}
+
+# PORTS [ВЫВОД `ss -MlnH`] → порты из списка (через запятую), где слушает MPTCP-сокет. Go ≥ 1.24, а с
+# ним xray, слушает MPTCP по умолчанию; kfunc bpf_sk_assign_tcp_reqsk такой listener отвергает, и XDP
+# отдаёт его SYN ядру (syn_mptcp). Локальный адрес — первое поле вида «адрес:порт» (колонка Netid
+# есть не во всех версиях ss). Пусто — таких нет или ss без -M.
+_guard_mptcp_ports() {
+    local p l out=""
+    l=${2-$(ss -MlnH 2>/dev/null)}
+    [ -n "$l" ] || return 0
+    for p in ${1//,/ }; do
+        echo "$l" | awk -v p=":$p" '{
+            for (i = 1; i <= NF; i++) if ($i ~ /:[0-9]+$/) {
+                if (substr($i, length($i) - length(p) + 1) == p) f = 1
+                break
+            }
+        } END { exit !f }' && out="$out${out:+,}$p"
+    done
+    echo "$out"
+}
+
+# PORTS → что сделать, чтобы XDP-cookies работали для MPTCP-listener'ов на PORTS
+_guard_mptcp_hint() {
+    local w="порт"
+    case "$1" in *,*) w="порты" ;; esac
+    echo "$w $1 слушает MPTCP (так по умолчанию слушают программы на Go ≥ 1.24, в том числе xray) — XDP-cookies к MPTCP-listener'ам не применяются, SYN-флуд держат syncookies ядра. Включить XDP-cookies: sysctl -w net.mptcp.enabled=0 (навсегда — net.mptcp.enabled = 0 в /etc/sysctl.d/), затем перезапусти сервис (docker restart remnanode)"
 }
 
 # GEO PORTS IFACE DEFAULT_IFACE → команда «тот же вариант, но cookies off»: on начинает с умолчаний,
@@ -456,20 +490,32 @@ _guard_newer() {   # OBJ SRC… → rc 0, если OBJ новее всех SRC
     for s in "$@"; do [ "$o" -nt "$s" ] || return 1; done
 }
 
-_guard_compile() {   # → GUARD_DIR/nd-guard-{xdp,tc}.bpf.o; пропуск, если .o новее исходников
-    local n src obj inc=()
+# OBJ (xdp|tc) → флаги clang. XDP: -DND_GUARD_MPTCP — проверка MPTCP-listener'а (nd_syn_listener),
+# только при MPTCP в ядре и kfunc: её хелпер есть с 5.19, а без kfunc cookie всё равно выключены
+_guard_cflags() {
+    [ "$1" = xdp ] && [ "${G_KFUNC:-0}" = 1 ] && [ -e /proc/sys/net/mptcp/enabled ] && echo "-DND_GUARD_MPTCP"
+    return 0
+}
+
+# → GUARD_DIR/nd-guard-{xdp,tc}.bpf.o; пропуск, если .o новее исходников и собран с теми же флагами
+# (флаги — в .o.flags: MPTCP или kfunc могли появиться с новым ядром)
+_guard_compile() {
+    local n src obj fl cf inc=()
     [ -d "/usr/include/$(uname -m)-linux-gnu" ] && inc=(-I"/usr/include/$(uname -m)-linux-gnu")
     for n in xdp tc; do
         src="$_guard_self/nd-guard-$n.bpf.c" obj="$GUARD_DIR/nd-guard-$n.bpf.o"
         [ -f "$src" ] || { msg_err "нет $src (нужен весь репозиторий)"; return 1; }
-        _guard_newer "$obj" "$src" "$_guard_self/nd-guard.h" "$_guard_self/nd-guard-cookie.h" && continue
+        fl=$(_guard_cflags "$n") cf=()
+        [ -n "$fl" ] && cf=("$fl")
+        [ "$(cat "$obj.flags" 2>/dev/null)" = "$fl" ] \
+            && _guard_newer "$obj" "$src" "$_guard_self/nd-guard.h" "$_guard_self/nd-guard-cookie.h" && continue
         have clang || { msg_err "нет clang — $obj не собрать"; return 1; }
-        if ! clang -O2 -g -Wall -target bpf ${inc[@]+"${inc[@]}"} -c "$src" -o "$obj.tmp" >"$GUARD_DIR/clang-$n.log" 2>&1; then
+        if ! clang -O2 -g -Wall -target bpf ${inc[@]+"${inc[@]}"} ${cf[@]+"${cf[@]}"} -c "$src" -o "$obj.tmp" >"$GUARD_DIR/clang-$n.log" 2>&1; then
             rm -f "$obj.tmp"
             msg_err "clang не собрал $src — смотри $GUARD_DIR/clang-$n.log (нет libbpf-dev/linux-libc-dev?)"
             return 1
         fi
-        mv -f "$obj.tmp" "$obj"
+        mv -f "$obj.tmp" "$obj" && echo "$fl" >"$obj.flags"
     done
 }
 
@@ -932,6 +978,9 @@ guard_on() {
     if [ "$G_COOKIES" != off ] && [ "$G_XDP_OK" = 1 ] && [ "$G_KFUNC" = 0 ]; then
         msg_warn "ядро $(uname -r) без kfunc bpf_sk_assign_tcp_reqsk (нужно ≥ 6.9) — XDP-cookies выключены, SYN-флуд держат syncookies ядра. Свежее ядро: $(_guard_kernel_hint /etc/os-release)"
     fi
+    if [ "$G_COOKIES" != off ] && [ "$G_KFUNC" = 1 ] && c=$(_guard_mptcp_ports "$G_PORTS") && [ -n "$c" ]; then
+        msg_warn "$(_guard_mptcp_hint "$c")"
+    fi
     _guard_sysctls                                                             # 9
     if [ "$G_GEO" = ru ]; then                                                 # 10
         if _guard_geo_fetch; then
@@ -1128,7 +1177,7 @@ guard_hook() {   # certbot pre|post (D7): только вариант 1 и то�
 }
 
 guard_status() {
-    local conf=0 root=0 ifc xm="" tcon=0 nft=0 v s n att now txlost=0 nokf=0
+    local conf=0 root=0 ifc xm="" tcon=0 nft=0 v s n att now nokf=0 diag="" mp=""
     [ $# -eq 0 ] || _guard_badarg "status: лишние аргументы"
     _guard_defaults
     need_root && root=1
@@ -1192,12 +1241,18 @@ guard_status() {
     if [ "$root" = 1 ] && _guard_active && s=$(_guard_ctrl stats 2>/dev/null); then
         box_kv "Счётчики" "$(echo "$s" | cut -d' ' -f1-3)"
         box_kv "" "$(echo "$s" | cut -d' ' -f4-6)"
-        box_kv "" "$(echo "$s" | cut -d' ' -f7-)"
-        if _guard_xdp_tx_lost "$(echo "$s" | sed -n 's/.*cookie_sent=\([0-9]*\).*/\1/p')" \
-            "$(echo "$s" | sed -n 's/.*cookie_ok=\([0-9]*\).*/\1/p')"; then
-            txlost=1
-            box_kv "${I_WARN} XDP_TX" "cookie-ответы уходят, соединений по ним — 0"
-        fi
+        box_kv "" "$(echo "$s" | cut -d' ' -f7-8)"
+        box_kv "" "$(echo "$s" | cut -d' ' -f9-)"
+        diag=$(_guard_cookie_diag "$(echo "$s" | sed -n 's/.*cookie_sent=\([0-9]*\).*/\1/p')" \
+            "$(echo "$s" | sed -n 's/.*cookie_ok=\([0-9]*\).*/\1/p')" \
+            "$(echo "$s" | sed -n 's/.*assign_err=\([0-9]*\).*/\1/p')")
+        case "$diag" in
+        assign) box_kv "${I_WARN} Cookies" "ядро отвергает соединения по cookie (assign_err)" ;;
+        txlost) box_kv "${I_WARN} XDP_TX" "cookie-ответы уходят, ACK по ним — 0" ;;
+        esac
+    fi
+    if [ "$tcon" = 1 ] && mp=$(_guard_mptcp_ports "$G_PORTS") && [ -n "$mp" ]; then
+        box_kv "${I_WARN} MPTCP" "порт $mp: cookies не применяются — см. ниже"
     fi
     if _guard_deadman_armed; then
         box_kv "Dead-man" "взведён — подтвердить: guard confirm"
@@ -1206,9 +1261,15 @@ guard_status() {
     fi
     box_bottom
     [ "$nokf" = 1 ] && msg_info "ядро для XDP-cookies: $(_guard_kernel_hint /etc/os-release)"
-    if [ "$txlost" = 1 ]; then   # F8/R13: только сигнал, без watchdog
-        msg_warn "cookie-ответы уходят, но ни одно соединение не завершилось — похоже, драйвер теряет XDP_TX; выключи cookies: $(_guard_cookies_off_cmd "$G_GEO" "$G_PORTS" "$G_IFACE" "$(default_iface)") (вариант сохранится)"
-    fi
+    [ -n "$mp" ] && msg_info "$(_guard_mptcp_hint "$mp")"
+    case "$diag" in   # F8/R13: только сигнал, без watchdog
+    assign)
+        msg_warn "ACK с верным cookie приходят, но ядро отвергает соединения (bpf_sk_assign_tcp_reqsk) — клиенты получают RST; выключи cookies: $(_guard_cookies_off_cmd "$G_GEO" "$G_PORTS" "$G_IFACE" "$(default_iface)") (вариант сохранится)"
+        ;;
+    txlost)
+        msg_warn "cookie-ответы уходят, но ни одного ACK по ним — похоже, драйвер теряет XDP_TX; выключи cookies: $(_guard_cookies_off_cmd "$G_GEO" "$G_PORTS" "$G_IFACE" "$(default_iface)") (вариант сохранится)"
+        ;;
+    esac
     return 0
 }
 

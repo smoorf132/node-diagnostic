@@ -28,9 +28,10 @@ struct guard_state { __u64 win_start_ns, win_syn, attack_until_ns; };
 struct lpm4 { __u32 prefixlen; __u8 addr[4]; };    /* prefixlen — host order */
 struct lpm6 { __u32 prefixlen; __u8 addr[16]; };
 
-/* guard_stats_map: PERCPU, guard_ctrl.py stats суммирует по CPU */
+/* guard_stats_map: PERCPU, guard_ctrl.py stats суммирует по CPU.
+ * ST_SYN_MPTCP / ST_SYN_NOLISTEN — SYN в режиме cookie отдан ядру: listener MPTCP / listener'а нет */
 enum { ST_PASS, ST_GEO_DROP, ST_ALLOW, ST_SYN, ST_COOKIE_SENT, ST_COOKIE_OK, ST_COOKIE_BAD,
-       ST_ASSIGN_ERR, ST__MAX };
+       ST_ASSIGN_ERR, ST_SYN_MPTCP, ST_SYN_NOLISTEN, ST__MAX };
 
 _Static_assert(sizeof(struct guard_cfg) == 40, "guard_cfg: 40 байт (guard_ctrl.py)");
 _Static_assert(sizeof(struct guard_state) == 24, "guard_state: 3×u64");

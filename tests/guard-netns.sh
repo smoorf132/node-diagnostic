@@ -30,12 +30,13 @@ PIN=/sys/fs/bpf/nd-guard-netns
 MAPS="$PIN/maps"
 BPFTOOL="${BPFTOOL:-bpftool}"
 COOKIE_CASES=(cookie_handshake_v4 cookie_handshake_v6 dualstack_listener_v4_cookie
-              cookie_ts_from_ack no_timestamps_keeps_wscale bad_cookie_ack_fails_open cookie_modes)
+              cookie_ts_from_ack no_timestamps_keeps_wscale bad_cookie_ack_fails_open cookie_modes
+              mptcp_listener_no_cookie no_listener_refused)
 # режим guard: «чужие» (не из гео-фикстуры 10.200.0.0/25, fd00:200::/120) адреса клиента
 FOREIGN4=10.200.0.200 FOREIGN6=fd00:200::200
 GUARD_CASES=(geo_unavailable_refuses ssh_port_refused variant1_geo_drop xdp_mode_veth allowlist_bypasses_geo
              notrack_no_conntrack_entries icmp_errors_not_invalid variant2_cookies_always
-             tc_load_fail_degrades reapply_no_stacking
+             variant2_mptcp_listener tc_load_fail_degrades reapply_no_stacking
              shaper_survives_guard shaper_legacy_filters_removed certbot_hooks_toggle_geo_80 reattach_restores_from_disk
              reattach_unconfirmed_rolls_back off_cleans_everything)
 TMP=""
@@ -87,10 +88,11 @@ reap() {
 
 srv_stop() { reap "$SRV_PID"; SRV_PID=""; }
 
-# srv_start 6 — dual-stack [::]:443 (IPV6_V6ONLY=0); srv_start 4 — 0.0.0.0:443
+# srv_start 6 — dual-stack [::]:443 (IPV6_V6ONLY=0); srv_start 4 — 0.0.0.0:443;
+# srv_start 6 mptcp — то же на IPPROTO_MPTCP (так слушает xray на Go ≥ 1.24)
 srv_start() {
     srv_stop
-    bg_in "$SRV_NS" python3 "$TMP/echo.py" "$1" >>"$TMP/echo.log" 2>&1
+    bg_in "$SRV_NS" python3 "$TMP/echo.py" "$1" "${2:-tcp}" >>"$TMP/echo.log" 2>&1
     SRV_PID=$!
     for _ in $(seq 50); do
         [ -n "$(in_srv ss -"$1"ltnH "sport = :$PORT")" ] && return 0
@@ -123,7 +125,8 @@ write_helpers() {
     cat >"$TMP/echo.py" <<'EOF'
 import socket, sys, threading
 v6 = sys.argv[1] == "6"
-s = socket.socket(socket.AF_INET6 if v6 else socket.AF_INET, socket.SOCK_STREAM)
+proto = 262 if sys.argv[2:] == ["mptcp"] else 0   # IPPROTO_MPTCP
+s = socket.socket(socket.AF_INET6 if v6 else socket.AF_INET, socket.SOCK_STREAM, proto)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 if v6:
     s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
@@ -488,6 +491,56 @@ case_cookie_modes() {
     fi
 }
 
+have_mptcp() {   # have_mptcp КЕЙС — rc 1 (SKIP + ::warning::), если ядро без MPTCP
+    [ -e /proc/sys/net/mptcp/enabled ] && return 0
+    skip "$1 — ядро без MPTCP"
+    echo "::warning::ядро $(uname -r) без MPTCP — $1 не проверен"
+    return 1
+}
+
+# MPTCP-listener (так слушает xray на Go ≥ 1.24): kfunc его отвергает, поэтому XDP cookie не выдаёт,
+# а отдаёт SYN ядру — эхо v4 и v6 идёт обычным путём. Печатает причины провала (пусто — в порядке);
+# в конце на :443 снова обычный dual-stack
+mptcp_echo_why() {
+    local s0 s1 out why=""
+    in_srv sysctl -qw net.mptcp.enabled=1
+    if ! srv_start 6 mptcp; then
+        echo "MPTCP-listener [::]:$PORT не поднялся: $(tail -n 3 "$TMP/echo.log" | tr '\n' ' ')"
+        srv_start 6
+        return
+    fi
+    s0=$(stats)
+    out=$(cli_echo "$SRV4") || why="эхо v4 не прошло ($out);"
+    out=$(cli_echo "$SRV6") || why="$why эхо v6 не прошло ($out);"
+    s1=$(stats)
+    [ "$(delta syn_mptcp "$s0" "$s1")" -ge 2 ] || why="$why syn_mptcp +$(delta syn_mptcp "$s0" "$s1") < 2;"
+    [ "$(delta cookie_sent "$s0" "$s1")" = 0 ] || why="$why cookie_sent +$(delta cookie_sent "$s0" "$s1");"
+    [ "$(delta assign_err "$s0" "$s1")" = 0 ] || why="$why assign_err +$(delta assign_err "$s0" "$s1");"
+    srv_start 6 || why="$why dual-stack [::]:$PORT не вернулся;"
+    [ -z "$why" ] || echo "$why [$s1]"
+}
+
+case_mptcp_listener_no_cookie() {
+    have_mptcp mptcp_listener_no_cookie || return
+    verdict "mptcp_listener_no_cookie (SYN к MPTCP-listener'у — ядру, эхо v4/v6)" "$(mptcp_echo_why)"
+}
+
+# порт без listener'а: SYN уходит ядру, и клиент сразу получает RST (Connection refused), а не
+# «открытый» порт, который рвётся на первом ACK
+case_no_listener_refused() {
+    local s0 s1 out why=""
+    srv_stop
+    s0=$(stats)
+    out=$(cli_echo "$SRV4")
+    case "$out" in *"Connection refused"*) ;; *) why="клиент: '$out', а не Connection refused;" ;; esac
+    s1=$(stats)
+    [ "$(delta syn_nolisten "$s0" "$s1")" -ge 1 ] || why="$why syn_nolisten не вырос;"
+    [ "$(delta cookie_sent "$s0" "$s1")" = 0 ] || why="$why cookie_sent +$(delta cookie_sent "$s0" "$s1");"
+    srv_start 6 || why="$why dual-stack [::]:$PORT не вернулся;"
+    [ -z "$why" ] || why="$why [$s1]"
+    verdict "no_listener_refused (порт без listener'а: RST от ядра, cookie нет)" "$why"
+}
+
 run_cookie_cases() {
     local c
     if has_kfunc; then
@@ -502,8 +555,11 @@ run_cookie_cases() {
 
 # ── режим raw: объекты цепляются напрямую ──
 
+# флаги XDP-объекта — как у guard.sh (_guard_cflags): проверка MPTCP при MPTCP в ядре и kfunc
 raw_build() {
-    bpf_cc modules/nd-guard-xdp.bpf.c "$TMP/nd-guard-xdp.bpf.o" \
+    local fl=""
+    [ -e /proc/sys/net/mptcp/enabled ] && has_kfunc && fl=-DND_GUARD_MPTCP
+    bpf_cc modules/nd-guard-xdp.bpf.c "$TMP/nd-guard-xdp.bpf.o" ${fl:+"$fl"} \
         && bpf_cc modules/nd-guard-tc.bpf.c "$TMP/nd-guard-tc.bpf.o"
 }
 
@@ -796,6 +852,32 @@ case_variant2_cookies_always() {
     [ "$(st assign_err "$s1")" = 0 ] || why="$why assign_err=$(st assign_err "$s1");"
     [ -z "$why" ] || why="$why [$s1]"
     verdict "variant2_cookies_always (RU и чужие v4/v6, cookie_ok +$(delta cookie_ok "$s0" "$s1"), XDP generic)" "$why"
+}
+
+# MPTCP-listener через guard.sh: on и status предупреждают, объект собран с проверкой MPTCP
+# (_guard_cflags) — SYN уходят ядру, эхо проходит
+case_variant2_mptcp_listener() {
+    local out why=""
+    need_kfunc variant2_mptcp_listener || return
+    have_mptcp variant2_mptcp_listener || return
+    in_srv sysctl -qw net.mptcp.enabled=1
+    if ! srv_start 6 mptcp; then
+        bad "variant2_mptcp_listener: MPTCP-listener не поднялся: $(tail -n 3 "$TMP/echo.log" | tr '\n' ' ')"
+        srv_start 6
+        return
+    fi
+    out=$(guard off) || why="off: $(tail3 "$out");"
+    if out=$(g_on --cookies always); then
+        printf '%s\n' "$out" | grep -q "порт $PORT слушает MPTCP" || why="$why on не предупредил о MPTCP;"
+    else
+        why="$why on: $(tail3 "$out");"
+    fi
+    out=$(guard status)
+    printf '%s\n' "$out" | grep -q "MPTCP.*порт $PORT" || why="$why в status нет строки MPTCP;"
+    grep -qx -- -DND_GUARD_MPTCP "$GUARD_DIR/nd-guard-xdp.bpf.o.flags" 2>/dev/null \
+        || why="$why XDP собран без -DND_GUARD_MPTCP;"
+    why="$why$(mptcp_echo_why)"
+    verdict "variant2_mptcp_listener (on/status предупреждают, SYN — ядру, эхо v4/v6)" "$why"
 }
 
 # F2: tc-объект не загрузился (битый .o новее исходников — _guard_compile его не пересобирает) — как

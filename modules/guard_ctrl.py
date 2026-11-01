@@ -27,7 +27,7 @@ STATE_FMT = "=QQQ"
 COOKIE_MODES = {"off": 0, "auto": 1, "always": 2}
 PORT_FLAGS = (("tcp", 0x1), ("udp", 0x2), ("geo", 0x4))
 STAT_NAMES = ("pass", "geo_drop", "allow", "syn", "cookie_sent", "cookie_ok", "cookie_bad",
-              "assign_err")
+              "assign_err", "syn_mptcp", "syn_nolisten")
 GEO_MAPS = ((4, "geo4_map", "loaded4.txt"), (6, "geo6_map", "loaded6.txt"))
 
 

@@ -12,6 +12,7 @@ import ipaddress
 import os
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -29,6 +30,7 @@ MAPS = PIN + "/maps"
 PROG = PIN + "/progs/nd_guard_xdp"
 
 XDP_DROP, XDP_PASS, XDP_TX = 1, 2, 3
+IPPROTO_MPTCP = getattr(socket, "IPPROTO_MPTCP", 262)
 M64 = (1 << 64) - 1
 
 
@@ -220,24 +222,59 @@ def _bpf_env_ok():
     return os.geteuid() == 0 and shutil.which(BPFTOOL) and shutil.which("clang")
 
 
+def mptcp_check_cflags():
+    """Как guard.sh (_guard_mptcp_cflags): проверка MPTCP-listener'а — при MPTCP в ядре и kfunc"""
+    if not os.path.exists("/proc/sys/net/mptcp/enabled"):
+        return []
+    r = run([BPFTOOL, "btf", "dump", "file", "/sys/kernel/btf/vmlinux", "format", "raw"])
+    return ["-DND_GUARD_MPTCP"] if "'bpf_sk_assign_tcp_reqsk'" in r.stdout else []
+
+
+def unshare_net():
+    """Своя netns: XDP ищет listener (bpf_skc_lookup_tcp) в netns запуска — listener'ы теста
+    не зависят от того, что слушает хост"""
+    if hasattr(os, "unshare"):
+        os.unshare(os.CLONE_NEWNET)
+        return
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.unshare(0x40000000) != 0:  # CLONE_NEWNET
+        e = ctypes.get_errno()
+        raise OSError(e, os.strerror(e))
+
+
+def listen(port, mptcp=False):
+    """dual-stack [::]:port, как у xray; mptcp — IPPROTO_MPTCP (Go ≥ 1.24 слушает так по умолчанию)"""
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM, IPPROTO_MPTCP if mptcp else 0)
+    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    s.bind(("::", port))
+    s.listen(16)
+    return s
+
+
 @unittest.skipUnless(_bpf_env_ok(), "нужны root, bpftool и clang (tests/guard-deps.sh)")
 class GuardXdpTest(unittest.TestCase):
     MSS4, MSS6, RCV_WS = 1452, 1432, 9
 
     @classmethod
     def setUpClass(cls):
+        unshare_net()
         cls.tmp = tempfile.mkdtemp(prefix="nd-guard-xdp-")
         try:
             cls._load()
         except Exception:
             cls._cleanup()
             raise
+        # cookie выдаётся только обычному TCP-listener'у: 443 слушается всегда, 80 — никогда
+        cls.lsn = listen(443)
 
     @classmethod
     def _load(cls):
         obj = os.path.join(cls.tmp, "nd-guard-xdp.bpf.o")
         inc = ["-I/usr/include/x86_64-linux-gnu"] if os.path.isdir("/usr/include/x86_64-linux-gnu") else []
-        r = run(["clang", "-O2", "-g", "-Wall", "-target", "bpf", *inc, "-c", BPF_SRC, "-o", obj])
+        cls.mptcp_flags = mptcp_check_cflags()
+        r = run(["clang", "-O2", "-g", "-Wall", "-target", "bpf", *inc, *cls.mptcp_flags, "-c", BPF_SRC,
+                 "-o", obj])
         if r.returncode != 0:
             raise RuntimeError("clang:\n" + r.stderr)
         shutil.rmtree(PIN, ignore_errors=True)
@@ -261,6 +298,7 @@ class GuardXdpTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.lsn.close()
         cls._cleanup()
 
     @staticmethod
@@ -314,7 +352,8 @@ class GuardXdpTest(unittest.TestCase):
     def stats(self):
         out = self.ctrl("stats")
         self.assertRegex(out, r"^pass=\d+ geo_drop=\d+ allow=\d+ syn=\d+ cookie_sent=\d+ "
-                              r"cookie_ok=\d+ cookie_bad=\d+ assign_err=\d+$")
+                              r"cookie_ok=\d+ cookie_bad=\d+ assign_err=\d+ syn_mptcp=\d+ "
+                              r"syn_nolisten=\d+$")
         return {k: int(v) for k, v in (x.split("=") for x in out.split())}
 
     def delta(self, before):
@@ -491,6 +530,36 @@ class GuardXdpTest(unittest.TestCase):
         seq, opts, _, _ = self.check_synack(RU4, o, v6=False)
         self.assertEqual(seq & 0xFF, 4 << 5 | 2)  # mss_idx(1400) = 4, без SACK, WS 2
         self.assertEqual(opts, [(2, struct.pack("!H", self.MSS4)), (1, b""), (3, bytes([self.RCV_WS]))])
+
+    # ── кому XDP отвечает cookie: только обычному TCP-listener'у ──
+
+    def test_cookie_syn_without_listener_goes_to_kernel(self):
+        # порт без listener'а: SYN-ACK с cookie сделал бы закрытый порт «открытым», а ACK по нему
+        # всё равно получил бы RST — SYN уходит ядру (оно само ответит RST)
+        self.set_cfg(cookies="always")
+        s0 = self.stats()
+        self.assertEqual(self.send(syn(RU4, dport=80))[0], XDP_PASS)
+        self.assertEqual(self.send(syn(RU6, dport=80))[0], XDP_PASS)
+        d = self.delta(s0)
+        self.assertEqual((d["syn"], d["syn_nolisten"], d["cookie_sent"], d["pass"]), (2, 2, 0, 2))
+
+    def test_cookie_syn_mptcp_listener_goes_to_kernel(self):
+        # MPTCP-listener (xray на Go ≥ 1.24): bpf_sk_assign_tcp_reqsk его отвергает (-EINVAL),
+        # и соединение по cookie получило бы RST — SYN уходит ядру
+        if not self.mptcp_flags:
+            self.skipTest("ядро без MPTCP или без kfunc — проверка MPTCP не собирается")
+        self.ctrl("set-port", "8443", "tcp")
+        lsn = listen(8443, mptcp=True)
+        try:
+            self.set_cfg(cookies="always")
+            s0 = self.stats()
+            self.assertEqual(self.send(syn(RU4, dport=8443))[0], XDP_PASS)
+            self.assertEqual(self.send(syn(RU6, dport=8443))[0], XDP_PASS)
+            d = self.delta(s0)
+            self.assertEqual((d["syn"], d["syn_mptcp"], d["cookie_sent"], d["pass"]), (2, 2, 0, 2))
+        finally:
+            lsn.close()
+            self.ctrl("set-port", "8443", "none")
 
     def test_auto_mode_engages_over_threshold(self):
         self.set_cfg(cookies="auto", threshold=5)
