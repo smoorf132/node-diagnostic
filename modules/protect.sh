@@ -63,6 +63,7 @@ BRIDGE_NETS="${BRIDGE_NETS:-}"
 PROTECT_PERSIST="${PROTECT_PERSIST:-/etc/nftables.d/node_protect.nft}"
 # ключи <out>/protect.conf: параметры прошлой генерации, их берут повторный protect и trust/bridge
 PROTECT_CONF_KEYS="GENERATED PANEL_IP NODE_PORT SSH_FROM HY2 TRUST_NETS BRIDGE_PORT BRIDGE_NETS BAN_NETS"
+GENERATED=""
 
 # per-IP лимиты в nft (из практики node-accelerator)
 CONN_LIMIT="${CONN_LIMIT:-2048}"
@@ -122,7 +123,9 @@ protect_out_dir() {
 protect_conf_load() {
     local f="$1/protect.conf" line k v
     CONF_PRESENT=" "
-    for k in $PROTECT_CONF_KEYS; do printf -v "CONF_$k" '%s' ""; done
+    # shellcheck disable=SC2034  # часть читается только косвенно (${!v} в protect_live)
+    CONF_GENERATED="" CONF_PANEL_IP="" CONF_NODE_PORT="" CONF_SSH_FROM="" CONF_HY2=""
+    CONF_TRUST_NETS="" CONF_BRIDGE_PORT="" CONF_BRIDGE_NETS="" CONF_BAN_NETS=""
     [ -r "$f" ] || return 1
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in ''|\#*) continue ;; esac

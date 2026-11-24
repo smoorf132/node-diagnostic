@@ -313,6 +313,49 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     fi
 fi
 
+echo "== balancer (nginx stream: SNI → upstream) =="
+bc=$(mktemp -d); export BALANCER_CONF="$bc/balancer.conf"
+bash modules/balancer.sh add sni-eu.example.com 80.79.117.98:8443 >/dev/null 2>&1
+bash modules/balancer.sh add SNI-US.example.com '203.0.113.10:8443,[2001:DB8::1]:8443' >/dev/null 2>&1
+bash modules/balancer.sh add '*.example.org' 198.51.100.1:8443 >/dev/null 2>&1
+BAL_IPV6=1 BAL_USER=nginx bash modules/balancer.sh render > "$bc/nginx.conf" 2>/dev/null
+if grep -qF 'map $ssl_preread_server_name $backend {' "$bc/nginx.conf" \
+   && grep -q '^        hostnames;' "$bc/nginx.conf" \
+   && grep -qE '^ +sni-eu\.example\.com +up1_sni_eu_example_com;' "$bc/nginx.conf" \
+   && grep -qE '^ +sni-us\.example\.com +up2_sni_us_example_com;' "$bc/nginx.conf" \
+   && grep -qE '^ +\*\.example\.org +up3_example_org;' "$bc/nginx.conf" \
+   && grep -qE '^ +default +up1_sni_eu_example_com;' "$bc/nginx.conf" \
+   && grep -q 'server 80.79.117.98:8443;' "$bc/nginx.conf" \
+   && grep -qF 'server [2001:db8::1]:8443;' "$bc/nginx.conf" \
+   && grep -q 'ssl_preread on;' "$bc/nginx.conf" && grep -qF 'proxy_pass $backend;' "$bc/nginx.conf" \
+   && grep -q 'proxy_protocol on;' "$bc/nginx.conf" && grep -q 'preread_timeout 5s;' "$bc/nginx.conf" \
+   && grep -qF 'listen [::]:443 reuseport deferred backlog=65535 so_keepalive=30s:10s:3;' "$bc/nginx.conf" \
+   && grep -q 'worker_rlimit_nofile 140000;' "$bc/nginx.conf" && grep -q 'worker_connections 65535;' "$bc/nginx.conf"; then
+    ok "balancer: рендер (map hostnames, маска, IPv6-upstream, ssl_preread, proxy_protocol)"
+else
+    bad "balancer: рендер"
+fi
+BAL_IPV6=0 bash modules/balancer.sh render 2>/dev/null | grep -qF 'listen [::]' && bad "balancer: listen [::] без IPv6" || ok "balancer: без IPv6 — без listen [::]"
+bash modules/balancer.sh add 'bad_sni!' 1.2.3.4:8443 >/dev/null 2>&1 && bad "balancer: мусорный SNI принят" || ok "balancer: отказ на мусорный SNI"
+bash modules/balancer.sh add a.example.com 1.2.3.4:99999 >/dev/null 2>&1 && bad "balancer: порт 99999 принят" || ok "balancer: отказ на плохой upstream"
+bash modules/balancer.sh del sni-eu.example.com >/dev/null 2>&1
+grep -q '^default sni-us.example.com$' "$BALANCER_CONF" && ! grep -q 'sni-eu' "$BALANCER_CONF" \
+    && ok "balancer: del default-маршрута → default на первый оставшийся" || bad "balancer: del default"
+bash modules/balancer.sh add sni-us.example.com 203.0.113.11:8443 >/dev/null 2>&1
+[ "$(grep -c '^route sni-us.example.com' "$BALANCER_CONF")" = 1 ] && grep -q '^route sni-us.example.com 203.0.113.11:8443$' "$BALANCER_CONF" \
+    && ok "balancer: add существующего SNI заменяет upstream'ы" || bad "balancer: add существующего SNI"
+bash modules/balancer.sh help 2>/dev/null | grep -q 'ssl_preread' && bash node-diagnostic.sh help | grep -q 'balancer' \
+    && ok "balancer: help + dispatcher" || bad "balancer: help/dispatcher"
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    # тот же рендер — nginx -t в образе последней stable (stream + ssl_preread собраны статически)
+    if nt=$(docker run --rm -v "$bc/nginx.conf:/etc/nginx/nginx.conf:ro" nginx:stable-alpine nginx -t 2>&1); then
+        ok "balancer: nginx -t (nginx:stable-alpine)"
+    else
+        bad "balancer: nginx -t (nginx:stable-alpine)"; printf '%s\n' "$nt" | tail -n 5 | sed 's/^/      /'
+    fi
+fi
+unset BALANCER_CONF; rm -rf "$bc"
+
 echo "== protect: NODE_PORT из docker-compose.yml ноды =="
 rn=$(mktemp -d); po=$(mktemp -d)
 printf 'services:\n  remnanode:\n    environment:\n      - NODE_PORT=2345\n' > "$rn/docker-compose.yml"

@@ -59,7 +59,7 @@ node-diagnostic.sh v$ND_VERSION — модульный тулкит ноды (Re
                                  BBRv3 через XanMod-ядро (гейт контейнеров, без автоперезагрузки)
   rollback [--yes|--dry-run]     Откат наложенных оптимизаций (namespaced-артефакты)
   status                         Что наложено на систему, ядро, cc/qdisc
-  install {node|warp|netbird|monitoring|crowdsec}
+  install {node|warp|netbird|monitoring|crowdsec|balancer}
                                  Установка ноды Remnawave (nginx-selfsteal + сертификат) / WARP /
                                  NetBird / мониторинга / CrowdSec
   certs    [menu|renew|issue [ДОМЕН]|manual [ДОМЕН]]
@@ -72,6 +72,8 @@ node-diagnostic.sh v$ND_VERSION — модульный тулкит ноды (Re
   guard  {on [--geo ru]|off|status|reattach|allow IP|unallow IP|update-geo|confirm}
                                  Защита от DDoS (XDP + tc + NOTRACK): вариант 1 — только Россия, вариант 2 — весь мир
   ssh-port [ПОРТ]                Смена SSH-порта без лок-аута (sshd + firewall, проверка входа, откат)
+  balancer {install|add SNI HOST:PORT[,…]|del SNI|default SNI|list|status|apply}
+                                 Балансер: nginx stable (nginx.org), SNI → upstream'ы нод с proxy-protocol
   menu                           Интерактивное меню (по умолчанию в TTY)
   help | --version
 
@@ -96,9 +98,10 @@ menu() {
         echo -e "   ${C}${BOLD}[10]${NC} Сертификаты        ${DIM}продление/выпуск/свой${NC}"
         echo -e "   ${C}${BOLD}[11]${NC} IPv6               ${DIM}включить/выключить${NC}"
         echo -e "   ${C}${BOLD}[12]${NC} Защита от DDoS     ${DIM}XDP: только Россия / весь мир${NC}"
+        echo -e "   ${C}${BOLD}[13]${NC} Балансер nginx     ${DIM}SNI → ноды, proxy-protocol${NC}"
         echo -e "    ${C}${BOLD}[0]${NC} Выход"
         echo
-        printf "  ${BOLD}Выбор${NC} ${DIM}[0-12]${NC}: "
+        printf "  ${BOLD}Выбор${NC} ${DIM}[0-13]${NC}: "
         local c; read -r c
         echo
         case "$c" in
@@ -114,6 +117,7 @@ menu() {
             10) run certs menu ;;
             11) run ipv6 menu ;;
             12) menu_guard ;;
+            13) menu_balancer ;;
             0|q|"") echo -e "  ${DIM}выход${NC}"; return 0 ;;
             *) echo -e "  ${Y}нет такого пункта${NC}" ;;
         esac
@@ -314,6 +318,30 @@ menu_protect_nets() {   # trust|bridge
     esac
 }
 
+menu_balancer() {
+    if [ ! -t 0 ]; then run balancer status; return; fi
+    echo -e "  ${BOLD}Балансер nginx${NC} ${DIM}(stream + ssl_preread: SNI → upstream'ы нод с proxy-protocol)${NC}"
+    run balancer list
+    echo
+    echo -e "    ${C}${BOLD}[1]${NC} Установить / переустановить ${DIM}nginx stable с nginx.org + маршруты${NC}"
+    echo -e "    ${C}${BOLD}[2]${NC} Добавить / изменить маршрут"
+    echo -e "    ${C}${BOLD}[3]${NC} Удалить маршрут"
+    echo -e "    ${C}${BOLD}[4]${NC} SNI по умолчанию"
+    echo -e "    ${C}${BOLD}[5]${NC} Статус ${DIM}(nginx, доступность upstream'ов)${NC}"
+    echo -e "    ${C}${BOLD}[0]${NC} Назад"
+    printf "  ${BOLD}Выбор${NC} ${DIM}[0-5]${NC}: "; local c sni ups; read -r c; echo
+    case "$c" in
+        1) run balancer install ;;
+        2) printf "  SNI (домен или *.домен): "; read -r sni
+           printf "  upstream'ы (HOST:PORT через запятую, напр. 80.79.117.98:8443): "; read -r ups
+           [ -n "$sni" ] && [ -n "$ups" ] && run balancer add "$sni" "$ups" ;;
+        3) printf "  SNI: "; read -r sni; [ -n "$sni" ] && run balancer del "$sni" ;;
+        4) printf "  SNI: "; read -r sni; [ -n "$sni" ] && run balancer default "$sni" ;;
+        5) run balancer status ;;
+        *) return 0 ;;
+    esac
+}
+
 menu_install() {
     if [ ! -t 0 ]; then echo -e "  ${Y}установка доступна только в интерактивном режиме${NC}"; return 0; fi
     echo -e "  ${BOLD}Установка Remnanode${NC}"
@@ -398,6 +426,7 @@ case "$cmd" in
     install|setup)         run install "$@" ;;
     shape|shaper)          run shape "$@" ;;
     guard|ddos)            run guard "$@" ;;
+    balancer|lb)           run balancer "$@" ;;
     ssh-port|sshport)      run sshport "$@" ;;
     certs|cert|ssl)        run certs "$@" ;;
     warp)                  run warp "$@" ;;

@@ -71,7 +71,7 @@
 
 **Files:**
 - Create: `modules/balancer.sh`
-- Modify: `node-diagnostic.sh` (dispatch `balancer|lb`, help, меню `[13]`), `modules/install.sh` (`install balancer` → модуль), `.github/workflows/ci.yml` (джоба `balancer-nginx`)
+- Modify: `node-diagnostic.sh` (dispatch `balancer|lb`, help, меню `[13]`), `modules/install.sh` (`install balancer` → модуль)
 - Test: `tests/smoke.sh` (рендер/conf), CI `nginx -t` в `nginx:stable-alpine`
 
 **Interfaces:**
@@ -85,7 +85,7 @@
 
 - [ ] **Step 1: smoke** — рендер двух маршрутов: `map $ssl_preread_server_name $backend`, `hostnames;`, строки SNI→upstream, `default up_…`, `ssl_preread on;`, `proxy_pass $backend;`, `proxy_protocol on;`, `server 80.79.117.98:8443;`; `worker_rlimit_nofile` ≥ 131070; без IPv6 нет `listen [::]`; `*.example.com` и `[2001:db8::1]:8443` принимаются; `bad_sni!`/`1.2.3.4:99999` отвергаются; `del` default-маршрута переводит default на первый оставшийся.
 - [ ] **Step 2:** реализовать модуль + установку nginx.org (apt: keyring + отпечаток + pin 900; dnf/yum: nginx-stable repo); проверка `nginx -V` на ssl_preread; занятые 80/443 чужим процессом → отказ.
-- [ ] **Step 3:** CI-джоба: рендер → `docker run nginx:stable-alpine nginx -t -c …`.
+- [ ] **Step 3:** `nginx -t` рендера в `nginx:stable-alpine` — в smoke (джоба smoke-ubuntu, где есть docker), отдельная CI-джоба не нужна.
 - [ ] **Step 4:** commit `feat(balancer): nginx stable с nginx.org, SNI → upstream с proxy-protocol`.
 
 ### Task 4: документация
