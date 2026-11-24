@@ -661,7 +661,7 @@ _live_list() {   # trust|bridge
 
 # protect trust|bridge СУБКОМАНДА [АРГ…] (вызывается из protect_main, --out уже разобран)
 protect_live() {
-    local kind=$1 act=${2:-list} out k v n c nets="" var ssh_port gen_ok=0
+    local kind=$1 act=${2:-list} out k v n c nets="" var ssh_port ssh_conf gen_ok=0
     shift; [ $# -gt 0 ] && shift
     out=$(protect_out_dir)
     PROTECT_LIVE_ERR="${TMPDIR:-/tmp}/nd-protect-live.$$"
@@ -671,6 +671,7 @@ protect_live() {
         case "$CONF_PRESENT" in *" $k "*) v=CONF_$k; printf -v "$k" '%s' "${!v}" ;; esac
     done
     [ "$BRIDGE_PORT" = off ] && BRIDGE_PORT=""
+    ssh_conf=$CONF_SSH_FROM
     if [ "$kind" = trust ]; then var=TRUST_NETS; else var=BRIDGE_NETS; fi
     case "$act" in
         add|del)
@@ -724,6 +725,9 @@ protect_live() {
     if [ -f "$PROTECT_PERSIST" ]; then
         if [ "$gen_ok" != 1 ]; then
             msg_warn "$PROTECT_PERSIST не обновлён (нет свежего firewall.nft) — после ребута изменение пропадёт"
+        elif [ -z "$ssh_conf" ]; then
+            # SSH-источник не из conf: перегенерация взяла бы IP этой сессии и затёрла ручную правку
+            msg_warn "$PROTECT_PERSIST не обновлён: в protect.conf нет SSH_FROM — перегенерируй protect с --ssh-from, затем install -m600 firewall.nft $PROTECT_PERSIST"
         elif grep -qE '<(PANEL_IP|NODE_PORT|YOUR_SSH_IP)>' "$out/firewall.nft"; then
             msg_warn "$PROTECT_PERSIST не обновлён: в firewall.nft плейсхолдеры — перегенерируй protect с --panel-ip/--node-port/--ssh-from"
         elif install -m600 "$out/firewall.nft" "$PROTECT_PERSIST" 2>/dev/null; then
