@@ -6,6 +6,7 @@
 #   balancer install [--route SNI=HOST:PORT[,HOST:PORT…]]… [--default SNI] [--no-proxy-protocol]
 #   balancer add SNI HOST:PORT[,HOST:PORT…]   — маршрут (есть — upstream'ы заменяются)
 #   balancer del SNI | default SNI | list | status | apply | render
+#   balancer log on|off | log [-f]            — access-лог stream (кто, SNI, куда, сколько) в $BAL_LOG_FILE
 #
 # Маршруты — в $BALANCER_CONF; /etc/nginx/nginx.conf целиком генерируется из него (бэкап прежнего —
 # nginx.conf.nd-bak-<время>, при провале nginx -t он возвращается). На нодах за балансером порт
@@ -29,6 +30,9 @@ BAL_RLIMIT=70000
 NGINX_KEY_URL="https://nginx.org/keys/nginx_signing.key"
 NGINX_KEY_FPR="573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"
 NGINX_KEYRING="/usr/share/keyrings/nginx-archive-keyring.gpg"
+# access-лог stream: строка пишется при ЗАКРЫТИИ сессии ($time_local — время конца, t — длительность).
+# Ротация — /etc/logrotate.d/nginx из пакета (маска /var/log/nginx/*.log)
+BAL_LOG_FILE="${BAL_LOG_FILE:-/var/log/nginx/stream.log}"
 
 # ── валидация ────────────────────────────────────────────────────────
 # SNI: домен или маска *.domain / .domain (map hostnames); в нижний регистр. rc 1 — мусор
@@ -64,11 +68,11 @@ bal_ups_norm() {
     echo "$out"
 }
 
-# ── conf: строки «route SNI UP…», «default SNI», «proxy_protocol on|off» ─
-BAL_SNI=(); BAL_UPS=(); BAL_DEFAULT=""; BAL_PP=on
+# ── conf: строки «route SNI UP…», «default SNI», «proxy_protocol on|off», «access_log on|off» ─
+BAL_SNI=(); BAL_UPS=(); BAL_DEFAULT=""; BAL_PP=on; BAL_LOG=off
 bal_load() {
     local kw a rest s u
-    BAL_SNI=(); BAL_UPS=(); BAL_DEFAULT=""; BAL_PP=on
+    BAL_SNI=(); BAL_UPS=(); BAL_DEFAULT=""; BAL_PP=on; BAL_LOG=off
     [ -r "$BALANCER_CONF" ] || return 1
     while read -r kw a rest || [ -n "$kw" ]; do
         case "$kw" in
@@ -78,6 +82,7 @@ bal_load() {
                 BAL_SNI+=("$s"); BAL_UPS+=("$u") ;;
             default) BAL_DEFAULT=$(bal_sni_norm "$a") || BAL_DEFAULT="" ;;
             proxy_protocol) case "$a" in off) BAL_PP=off ;; *) BAL_PP=on ;; esac ;;
+            access_log) case "$a" in on) BAL_LOG=on ;; *) BAL_LOG=off ;; esac ;;
         esac
     done < "$BALANCER_CONF"
     return 0
@@ -88,6 +93,7 @@ bal_save() {
     {
         echo "# node-diagnostic balancer: SNI → upstream'ы. Правится командами rr balancer add|del|default."
         echo "proxy_protocol $BAL_PP"
+        echo "access_log $BAL_LOG"
         [ -n "$BAL_DEFAULT" ] && echo "default $BAL_DEFAULT"
         for i in "${!BAL_SNI[@]}"; do echo "route ${BAL_SNI[i]} ${BAL_UPS[i]}"; done
     } > "$BALANCER_CONF.tmp" && mv -f "$BALANCER_CONF.tmp" "$BALANCER_CONF"
@@ -124,11 +130,16 @@ bal_user() {
 
 # ── рендер nginx.conf (по шаблону пользователя) ──────────────────────
 bal_render() {
-    local i d="" v6=0 pp=""
+    local i d="" v6=0 pp="" lg=""
     [ "${#BAL_SNI[@]}" -gt 0 ] || { msg_err "нет ни одного маршрута SNI → upstream" >&2; return 1; }
     bal_has_ipv6 && v6=1
     [ "$BAL_PP" = on ] && pp="
         proxy_protocol on;"
+    # sni="" in=0 — за preread_timeout клиент не прислал ни байта (nginx закрывает с st=200, без upstream)
+    [ "$BAL_LOG" = on ] && lg='    log_format sni '\''$remote_addr [$time_local] sni="$ssl_preread_server_name" '\''
+                   '\''up=$upstream_addr st=$status in=$bytes_received out=$bytes_sent t=$session_time'\'';
+    access_log '"$BAL_LOG_FILE"' sni buffer=64k flush=5s;
+'
     if i=$(bal_idx "$BAL_DEFAULT"); then d=$(bal_upname "$i"); else d=$(bal_upname 0); fi
     cat <<EOF
 $BAL_MARK — сгенерировано из $BALANCER_CONF, руками не правится (перезапишется).
@@ -154,7 +165,7 @@ $([ "$v6" = 1 ] && echo "        listen [::]:80 default_server;")
     }
 }
 stream {
-    map \$ssl_preread_server_name \$backend {
+${lg}    map \$ssl_preread_server_name \$backend {
         hostnames;
 EOF
     for i in "${!BAL_SNI[@]}"; do printf '        %-40s %s;\n' "${BAL_SNI[i]}" "$(bal_upname "$i")"; done
@@ -294,7 +305,7 @@ _bal_maybe_apply() {
 bal_list() {
     local i mark
     bal_load || { msg_info "маршрутов нет ($BALANCER_CONF)"; return 0; }
-    echo -e "    ${DIM}proxy-protocol:${NC} $BAL_PP   ${DIM}conf:${NC} $BALANCER_CONF"
+    echo -e "    ${DIM}proxy-protocol:${NC} $BAL_PP   ${DIM}access-лог:${NC} $BAL_LOG   ${DIM}conf:${NC} $BALANCER_CONF"
     [ "${#BAL_SNI[@]}" -gt 0 ] || { msg_info "маршрутов нет"; return 0; }
     for i in "${!BAL_SNI[@]}"; do
         mark=""; [ "${BAL_SNI[i]}" = "$BAL_DEFAULT" ] && mark=" ${DIM}(default)${NC}"
@@ -442,6 +453,26 @@ balancer_main() {
             BAL_DEFAULT=$s; bal_save || die "не записал $BALANCER_CONF"
             msg_ok "default: $s"
             _bal_maybe_apply ;;
+        log)
+            case "${1:-}" in
+                on|off)
+                    bal_load || die "маршрутов нет — rr balancer install"
+                    BAL_LOG=$1; bal_save || die "не записал $BALANCER_CONF"
+                    if [ "$1" = on ]; then
+                        msg_ok "access-лог stream включён → $BAL_LOG_FILE"
+                        msg_info "строка пишется при закрытии сессии: время — конец, t — длительность; sni=\"\" in=0 — клиент молчал до preread_timeout"
+                        msg_info "это IP пользователей: ротация — /etc/logrotate.d/nginx; после отладки — rr balancer log off"
+                    else
+                        msg_ok "access-лог stream выключен (файл $BAL_LOG_FILE не удаляю)"
+                    fi
+                    _bal_maybe_apply ;;
+                ""|-f|tail)
+                    bal_load || true
+                    [ "$BAL_LOG" = on ] || msg_info "access-лог выключен — rr balancer log on"
+                    [ -r "$BAL_LOG_FILE" ] || die "нет $BAL_LOG_FILE"
+                    if [ "${1:-}" = "" ]; then tail -n 50 "$BAL_LOG_FILE"; else tail -n 50 -f "$BAL_LOG_FILE"; fi ;;
+                *) die "balancer log on|off | log [-f]" ;;
+            esac ;;
         list|ls) bal_list ;;
         status|st) bal_status ;;
         apply) bal_apply ;;
@@ -456,6 +487,8 @@ balancer — L4-балансер на nginx (stream + ssl_preread): SNI → upst
   balancer default SNI             куда идут неизвестные и пустые SNI
   balancer list | status           маршруты; status — ещё nginx и доступность upstream'ов
   balancer apply | render          пересобрать nginx.conf из conf / показать без применения
+  balancer log on|off              access-лог stream: IP, SNI, upstream, байты, длительность → /var/log/nginx/stream.log
+  balancer log [-f]                последние 50 строк (-f — следить)
 HELP
             ;;
         *) echo "balancer: неизвестная команда $cmd (см. balancer help)" >&2; return 2 ;;

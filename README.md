@@ -208,12 +208,15 @@ sudo rr balancer del sni-us.example.com                  # default переед�
 sudo rr balancer default sni-eu.example.com
 sudo rr balancer status                                  # nginx, маршруты, TCP-доступность upstream'ов
 sudo rr balancer render                                  # показать nginx.conf без применения
+sudo rr balancer log on                                  # access-лог stream → /var/log/nginx/stream.log
+sudo rr balancer log -f                                  # следить (без -f — последние 50 строк); log off — выключить
 ```
 
 - nginx — **последняя stable из официального репозитория nginx.org**. apt (Debian/Ubuntu): ключ подписи сверяется по отпечатку `573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62`, pin 900 на origin nginx.org. dnf/yum: репозиторий `nginx-stable`. nginx дистрибутива конфликтует с пакетом nginx.org, поэтому модуль предлагает удалить его (`/etc/nginx` уходит в бэкап). Сборка без `--with-stream_ssl_preread_module` — отказ.
 - Маршруты лежат в `/etc/node-diagnostic/balancer.conf`. Из него целиком генерируется `/etc/nginx/nginx.conf`: шаблон с `map $ssl_preread_server_name $backend { hostnames; … }`, маски `*.domain`, IPv6-upstream'ы `[2001:db8::1]:8443`. Прежний файл сохраняется в `nginx.conf.nd-bak-<время>`. Если `nginx -t` не прошёл, он возвращается, иначе — `reload`.
 - Отличия от исходного шаблона: `user` — `www-data` или `nginx`, `listen [::]` — только если на хосте есть IPv6.
 - Порты 80 и 443 должен держать только nginx, иначе установка откажет.
+- Access-лог (`log on`) по умолчанию выключен: в нём IP пользователей. Формат: `IP [время] sni="…" up=нода:порт st=код in=байт out=байт t=сек`. Строка пишется, когда сессия закрывается, поэтому время в ней — конец сессии. Строка `sni="" up=- st=200 in=0 out=0 t=5.000` значит, что клиент открыл TCP и за `preread_timeout` (5 с) не прислал ни байта: nginx закрыл соединение, не трогая ноды. `st=200` тут не означает успех. Настройка хранится в `balancer.conf` и переживает `add`/`del`. Ротация — `/etc/logrotate.d/nginx` из пакета.
 - Firewall самого балансера: `rr protect --role balancer` (443/80 всем с per-IP лимитами, SSH — твой IP или `any`).
 
 На каждой ноде за балансером: `rr protect bridge port 8443 && rr protect bridge add <IP балансера>`. У inbound'а xray на этом порту должен стоять `sockopt.acceptProxyProtocol: true`, иначе xray не разберёт PROXY-заголовок. Меню: **[13]**, также `install balancer`.

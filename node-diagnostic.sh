@@ -72,7 +72,7 @@ node-diagnostic.sh v$ND_VERSION — модульный тулкит ноды (Re
   guard  {on [--geo ru]|off|status|reattach|allow IP|unallow IP|update-geo|confirm}
                                  Защита от DDoS (XDP + tc + NOTRACK): вариант 1 — только Россия, вариант 2 — весь мир
   ssh-port [ПОРТ]                Смена SSH-порта без лок-аута (sshd + firewall, проверка входа, откат)
-  balancer {install|add SNI HOST:PORT[,…]|del SNI|default SNI|list|status|apply}
+  balancer {install|add SNI HOST:PORT[,…]|del SNI|default SNI|list|status|apply|log on|off|log [-f]}
                                  Балансер: nginx stable (nginx.org), SNI → upstream'ы нод с proxy-protocol
   menu                           Интерактивное меню (по умолчанию в TTY)
   help | --version
@@ -337,8 +337,10 @@ menu_balancer() {
     echo -e "    ${C}${BOLD}[3]${NC} Удалить маршрут"
     echo -e "    ${C}${BOLD}[4]${NC} SNI по умолчанию"
     echo -e "    ${C}${BOLD}[5]${NC} Статус ${DIM}(nginx, доступность upstream'ов)${NC}"
+    echo -e "    ${C}${BOLD}[6]${NC} Access-лог вкл/выкл ${DIM}(IP, SNI, upstream → /var/log/nginx/stream.log)${NC}"
+    echo -e "    ${C}${BOLD}[7]${NC} Последние строки access-лога"
     echo -e "    ${C}${BOLD}[0]${NC} Назад"
-    printf "  ${BOLD}Выбор${NC} ${DIM}[0-5]${NC}: "; local c sni ups; read -r c; echo
+    printf "  ${BOLD}Выбор${NC} ${DIM}[0-7]${NC}: "; local c sni ups; read -r c; echo
     case "$c" in
         1) run balancer install ;;
         2) printf "  SNI (домен или *.домен): "; read -r sni
@@ -347,6 +349,9 @@ menu_balancer() {
         3) printf "  SNI: "; read -r sni; [ -n "$sni" ] && run balancer del "$sni" ;;
         4) printf "  SNI: "; read -r sni; [ -n "$sni" ] && run balancer default "$sni" ;;
         5) run balancer status ;;
+        6) printf "  access-лог [on/off]: "; read -r sni
+           case "$sni" in on|off) run balancer log "$sni" ;; esac ;;
+        7) run balancer log ;;
         *) return 0 ;;
     esac
 }
