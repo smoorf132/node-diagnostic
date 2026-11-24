@@ -85,6 +85,80 @@ if command -v nft >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
 fi
 bash modules/protect.sh --ssh-from bogus --out "$nbo" >/dev/null 2>&1 && bad "--ssh-from мусор принят" || ok "--ssh-from отвергает мусор"
 
+echo "== protect: HY2 / trusted / порт мостов =="
+n6=$(bash -c 'source lib/common.sh; echo "$(ip6_norm 2001:DB8::1/32) $(ip6_norm 2001:0db8:0:0:1:0:0:1) $(net_norm 192.0.2.7/24)"
+    ip6_norm 1::2::3 >/dev/null || ip6_norm 2001:db8::/129 >/dev/null || echo rej' 2>/dev/null | tr '\n' ' ')
+[ "$n6" = "2001:db8::/32 2001:db8::1:0:0:1 192.0.2.0/24 rej " ] && ok "ip6_norm / net_norm" || bad "ip6_norm / net_norm: $n6"
+# по умолчанию (без --hy2) — как раньше: 443/udp открыт; пустые set'ы trusted/bridge, порта мостов нет
+if grep -q 'udp dport 443 accept' "$out/firewall.nft" && grep -q 'ufw allow 443/udp' "$out/firewall-ufw.sh" \
+   && grep -q 'set trusted6' "$out/firewall.nft" && grep -q 'set bridge4' "$out/firewall.nft" \
+   && ! grep -q '"nd:bridge"' "$out/firewall.nft"; then
+    ok "protect: дефолт — HY2 да, set'ы trusted/bridge пустые, порт мостов закрыт"
+else
+    bad "protect: дефолт HY2/trusted/bridge"
+fi
+hb=$(mktemp -d)
+bash modules/protect.sh --panel-ip 203.0.113.5 --node-port 2222 --ssh-from 198.51.100.2 --hy2 n \
+    --trust 192.0.2.7/24 --trust 2001:DB8::/32 --bridge-port 8443 --bridge-from 198.51.100.9 \
+    --bridge-from 2001:db8:1::5 --out "$hb" >/dev/null 2>&1
+if ! grep -q 'udp dport 443' "$hb/firewall.nft" && ! grep -q '443/udp' "$hb/firewall-ufw.sh" \
+   && grep -q 'ufw allow 443/tcp' "$hb/firewall-ufw.sh"; then
+    ok "protect --hy2 n: 443/udp закрыт в nft и ufw"
+else
+    bad "protect --hy2 n: остался 443/udp"
+fi
+if grep -A4 'set trusted4' "$hb/firewall.nft" | grep -q 'elements = { 192.0.2.0/24 }' \
+   && grep -A4 'set trusted6' "$hb/firewall.nft" | grep -q 'elements = { 2001:db8::/32 }' \
+   && grep -A4 'set bridge4' "$hb/firewall.nft" | grep -q 'elements = { 198.51.100.9/32 }' \
+   && grep -A4 'set bridge6' "$hb/firewall.nft" | grep -q 'elements = { 2001:db8:1::5 }'; then
+    ok "protect: --trust/--bridge-from по семействам (v4/v6, канон)"
+else
+    bad "protect: элементы trusted/bridge"
+fi
+# trusted — раньше лимитов 443, порт мостов — раньше финального drop
+lt=$(grep -n '"nd:trusted"' "$hb/firewall.nft" | head -1 | cut -d: -f1)
+lc=$(grep -n 'meter conn443_4' "$hb/firewall.nft" | cut -d: -f1)
+lb=$(grep -n 'tcp dport 8443 ip saddr @bridge4 counter accept comment "nd:bridge"' "$hb/firewall.nft" | cut -d: -f1)
+ld=$(grep -n 'node_protect drop' "$hb/firewall.nft" | cut -d: -f1)
+[ -n "$lt" ] && [ -n "$lc" ] && [ "$lt" -lt "$lc" ] && [ -n "$lb" ] && [ "$lb" -lt "$ld" ] \
+    && grep -q 'from 198.51.100.9/32 to any port 8443 proto tcp' "$hb/firewall-ufw.sh" \
+    && ok "protect: порядок trusted < conn443, bridge < drop; ufw с пулом" || bad "protect: порядок правил trusted/bridge"
+# повтор без флагов — всё из protect.conf
+bash modules/protect.sh --out "$hb" >/dev/null 2>&1
+grep -q 'HY2="n"' "$hb/protect.conf" && ! grep -q 'udp dport 443' "$hb/firewall.nft" \
+    && grep -q 'tcp dport 8443 ip6 saddr @bridge6' "$hb/firewall.nft" \
+    && grep -A4 'set trusted4' "$hb/firewall.nft" | grep -q '192.0.2.0/24' \
+    && grep -q 'tcp dport 22 ip saddr 198.51.100.2 accept' "$hb/firewall.nft" \
+    && ok "protect: повтор без флагов берёт protect.conf" || bad "protect: повтор потерял параметры"
+bash modules/protect.sh --trust bogus --out "$hb" >/dev/null 2>&1 && bad "--trust мусор принят" || ok "--trust отвергает мусор"
+bash modules/protect.sh --bridge-port 443 --out "$hb" >/dev/null 2>&1 && bad "--bridge-port 443 принят" || ok "--bridge-port 443 отвергнут"
+bash modules/protect.sh --hy2 maybe --out "$hb" >/dev/null 2>&1 && bad "--hy2 мусор принят" || ok "--hy2 отвергает мусор"
+# живые команды без живой таблицы: правят conf и перегенерируют firewall.nft
+PROTECT_PERSIST="$hb/persist.nft" bash modules/protect.sh trust add 203.0.113.0/25 2001:db8:2::/48 --out "$hb" >/dev/null 2>&1
+PROTECT_PERSIST="$hb/persist.nft" bash modules/protect.sh bridge port 9443 --out "$hb" >/dev/null 2>&1
+PROTECT_PERSIST="$hb/persist.nft" bash modules/protect.sh bridge del 198.51.100.9 --out "$hb" >/dev/null 2>&1
+grep -q 'TRUST_NETS="192.0.2.0/24 2001:db8::/32 203.0.113.0/25 2001:db8:2::/48"' "$hb/protect.conf" \
+    && grep -q 'BRIDGE_PORT="9443"' "$hb/protect.conf" && grep -q 'BRIDGE_NETS="2001:db8:1::5"' "$hb/protect.conf" \
+    && grep -q 'tcp dport 9443 ip saddr @bridge4' "$hb/firewall.nft" && ! grep -q 'dport 8443' "$hb/firewall.nft" \
+    && ! grep -A4 'set bridge4' "$hb/firewall.nft" | grep -q elements \
+    && ok "protect trust/bridge: conf + перегенерация" || bad "protect trust/bridge: conf/перегенерация"
+PROTECT_PERSIST="$hb/persist.nft" bash modules/protect.sh bridge port off --out "$hb" >/dev/null 2>&1
+grep -q 'BRIDGE_PORT=""' "$hb/protect.conf" && ! grep -q '"nd:bridge"' "$hb/firewall.nft" \
+    && grep -A4 'set bridge6' "$hb/firewall.nft" | grep -q '2001:db8:1::5' \
+    && ok "protect bridge port off: правило снято, пул сохранён" || bad "protect bridge port off"
+bash modules/protect.sh bridge port 22 --out "$hb" >/dev/null 2>&1 && bad "bridge port 22 принят" || ok "bridge port: отказ на порт SSH"
+bash modules/protect.sh trust add nope --out "$hb" >/dev/null 2>&1 && bad "trust add мусор принят" || ok "trust add отвергает мусор"
+# без прошлой генерации: только conf, BAN_NETS не затирается пустым
+ng=$(mktemp -d)
+bash modules/protect.sh trust add 192.0.2.1 --out "$ng" >/dev/null 2>&1
+grep -q 'TRUST_NETS="192.0.2.1/32"' "$ng/protect.conf" && grep -q 'BAN_NETS="185.224.228.0/22' "$ng/protect.conf" \
+    && [ ! -e "$ng/firewall.nft" ] && ok "protect trust без генерации: conf, бан не потерян" || bad "protect trust без генерации"
+if command -v nft >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+    bash modules/protect.sh --bridge-port 8443 --hy2 y --out "$hb" >/dev/null 2>&1
+    nft -c -f "$hb/firewall.nft" >/dev/null 2>&1 && ok "nft -c (HY2 + trusted v4/v6 + мосты)" || bad "nft -c (HY2 + trusted + мосты)"
+fi
+rm -rf "$hb" "$ng"
+
 echo "== rollback --dry-run =="
 bash modules/rollback.sh --dry-run >/dev/null 2>&1 && ok "rollback dry-run" || bad "rollback dry-run"
 
