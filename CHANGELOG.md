@@ -14,6 +14,7 @@ WARP, IPv6 и команда `rr`. fail2ban заменён на CrowdSec; SSH м
 - **protect: порт мостов/балансеров** — `--bridge-port N|off` + пул `--bridge-from IP|CIDR` (set'ы `bridge4/6`): порт (напр. 8443, xray с proxy-protocol) открыт только пулу, правила `nd:bridge` перед финальным drop. Совпадение с 443/80/SSH/NODE_PORT отвергается.
 - **protect trust|bridge — на лету**: `trust add|del|list`, `bridge add|del|list|port N|off`. Правят `<каталог>/protect.conf`, перегенерируют артефакты, вносят дельту в живую `node_protect` одной транзакцией `nft -f -` (у таблицы от старой версии set'ы и правила досоздаются по handle) и обновляют `/etc/nftables.d/node_protect.nft`, если он есть. Повторный `protect` берёт параметры из `protect.conf`. integration: netns с живой таблицей, в т.ч. старой.
 - `lib/common.sh`: `ip6_norm` / `net_norm` — канон IPv4/IPv6 с обнулением хост-битов.
+- **`balancer log on|off`, `balancer log [-f]`** (меню `[13]` → `[6]`/`[7]`) — access-лог stream в `/var/log/nginx/stream.log`: IP, SNI, upstream, код, байты, длительность. Хранится в `balancer.conf` (`access_log on|off`), переживает перегенерацию `nginx.conf`. По умолчанию выключен.
 - **protect `--role balancer`** — firewall для сервера балансера: 443/80 всем с per-IP лимитами, trusted, SSH; без NODE_PORT, панели, UDP и порта мостов. Меню `[3]` → `[1]` спрашивает роль; `balancer install` подсказывает команду.
 - **protect `--ssh-from any`** — SSH с любого адреса: только rate-limit (v4 и v6 по /64), `APPLY.txt` требует CrowdSec и вход по ключу. В меню — ответ `any`.
 - **protect: banned6** — `BAN_NETS` принимает IPv6, drop в input и forward.
@@ -40,6 +41,7 @@ WARP, IPv6 и команда `rr`. fail2ban заменён на CrowdSec; SSH м
 - Команда `guard` (алиас `ddos`) в диспетчере и `usage`, строка «Guard (DDoS)» в `rr status`; smoke: `help: guard`, диспетчер, SYN-rate в `protect`.
 
 ### Changed
+- **balancer: `listen 443` без `deferred`.** С TCP_DEFER_ACCEPT часть клиентов зависала в `ssl_preread` до `preread_timeout`: в логе `sni="" up=- in=0 t=5.0`, у пользователей нестабильное подключение. На проде без `deferred` всё стабильно, маршрутизация по SNI работает.
 - **protect: per-IP лимиты — set'ы с size и timeout вместо `meter`.** Записи meter'а не истекали: set забивался (65535), и на полном set'е лимит молча переставал действовать для новых адресов. Теперь `RL_SIZE4=131072`, `RL_SIZE6=65536`, `RL_TIMEOUT=30s` (SSH — 5 мин).
 - **protect: IPv6-лимиты по /64** (`ip6 saddr and ffff:ffff:ffff:ffff::`) — по /128 обходились перебором адресов. NDP (neighbor/router solicit/advert с `hoplimit 255`) пропускается до лимита: весь `fe80::/64` иначе делил бы один бакет, и на шумном L2 нода теряла бы шлюз по IPv6.
 - **protect: HY2 под guard** — `udp443` под NOTRACK считает только QUIC Long Header: раньше лимит на каждый пакет срезал HY2 до ~2 Мбит/с на IP. Без guard — только новые потоки.

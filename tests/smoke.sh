@@ -384,7 +384,8 @@ if grep -qF 'map $ssl_preread_server_name $backend {' "$bc/nginx.conf" \
    && grep -qF 'server [2001:db8::1]:8443;' "$bc/nginx.conf" \
    && grep -q 'ssl_preread on;' "$bc/nginx.conf" && grep -qF 'proxy_pass $backend;' "$bc/nginx.conf" \
    && grep -q 'proxy_protocol on;' "$bc/nginx.conf" && grep -q 'preread_timeout 5s;' "$bc/nginx.conf" \
-   && grep -qF 'listen [::]:443 reuseport deferred backlog=65535 so_keepalive=30s:10s:3;' "$bc/nginx.conf" \
+   && grep -qF 'listen [::]:443 reuseport backlog=65535 so_keepalive=30s:10s:3;' "$bc/nginx.conf" \
+   && ! grep -q 'deferred' "$bc/nginx.conf" \
    && grep -q 'worker_rlimit_nofile 70000;' "$bc/nginx.conf" && grep -q 'worker_connections 65535;' "$bc/nginx.conf"; then
     ok "balancer: рендер (map hostnames, маска, IPv6-upstream, ssl_preread, proxy_protocol)"
 else
@@ -399,11 +400,30 @@ grep -q '^default sni-us.example.com$' "$BALANCER_CONF" && ! grep -q 'sni-eu' "$
 bash modules/balancer.sh add sni-us.example.com 203.0.113.11:8443 >/dev/null 2>&1
 [ "$(grep -c '^route sni-us.example.com' "$BALANCER_CONF")" = 1 ] && grep -q '^route sni-us.example.com 203.0.113.11:8443$' "$BALANCER_CONF" \
     && ok "balancer: add существующего SNI заменяет upstream'ы" || bad "balancer: add существующего SNI"
+grep -q '^access_log off$' "$BALANCER_CONF" && ! grep -q 'log_format' "$bc/nginx.conf" \
+    && ok "balancer: access-лог по умолчанию выключен" || bad "balancer: access-лог включён по умолчанию"
+bash modules/balancer.sh log on >/dev/null 2>&1
+BAL_IPV6=1 BAL_USER=nginx bash modules/balancer.sh render > "$bc/nginx-log.conf" 2>/dev/null
+if grep -q '^access_log on$' "$BALANCER_CONF" \
+   && sed -n '/^stream {/,/map /p' "$bc/nginx-log.conf" | grep -qF "log_format sni '\$remote_addr [\$time_local] sni=\"\$ssl_preread_server_name\" '" \
+   && sed -n '/^stream {/,/map /p' "$bc/nginx-log.conf" | grep -qF 'access_log /var/log/nginx/stream.log sni buffer=64k flush=5s;' \
+   && grep -qF 'up=$upstream_addr st=$status in=$bytes_received out=$bytes_sent t=$session_time' "$bc/nginx-log.conf" \
+   && bash modules/balancer.sh list 2>/dev/null | grep -q 'access-лог:.* on' \
+   && bash modules/balancer.sh add sni-x.example.com 192.0.2.9:8443 >/dev/null 2>&1 && grep -q '^access_log on$' "$BALANCER_CONF"; then
+    ok "balancer log on: log_format + access_log в stream, переживает add"
+else
+    bad "balancer log on"
+fi
+bash modules/balancer.sh log off >/dev/null 2>&1
+grep -q '^access_log off$' "$BALANCER_CONF" && ! bash modules/balancer.sh render 2>/dev/null | grep -q 'log_format' \
+    && ok "balancer log off: строки из stream убраны" || bad "balancer log off"
+bash modules/balancer.sh log maybe >/dev/null 2>&1 && bad "balancer log: мусорный аргумент принят" || ok "balancer log: отказ на мусорный аргумент"
 bash modules/balancer.sh help 2>/dev/null | grep -q 'ssl_preread' && bash node-diagnostic.sh help | grep -q 'balancer' \
     && ok "balancer: help + dispatcher" || bad "balancer: help/dispatcher"
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     # тот же рендер — nginx -t в образе последней stable (stream + ssl_preread собраны статически)
-    if nt=$(docker run --rm -v "$bc/nginx.conf:/etc/nginx/nginx.conf:ro" nginx:stable-alpine nginx -t 2>&1); then
+    # рендер с access-логом: log_format/access_log в stream (каталог /var/log/nginx в образе есть)
+    if nt=$(docker run --rm -v "$bc/nginx-log.conf:/etc/nginx/nginx.conf:ro" nginx:stable-alpine nginx -t 2>&1); then
         ok "balancer: nginx -t (nginx:stable-alpine)"
     else
         bad "balancer: nginx -t (nginx:stable-alpine)"; printf '%s\n' "$nt" | tail -n 5 | sed 's/^/      /'
