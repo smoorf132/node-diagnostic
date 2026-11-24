@@ -22,7 +22,8 @@
 |---|---|---|
 | `diagnose` | 27 чеков: система, сеть, скорость, сервисы, репутация IP, Xray/Remnanode | — (только читает) |
 | `optimize` | sysctl-тюнинг, BBR+cake, FD-лимиты, RPS/RFS/XPS, NIC, MSS clamp, irqbalance, journald, zram | да (namespaced drop-in) |
-| `protect`  | firewall под Remnawave, SSH-хардненинг, DDoS-хардненинг | **нет — только генерирует файлы** |
+| `protect`  | firewall под Remnawave (HY2 y/n, trusted, порт мостов), SSH-хардненинг | **генерация — нет**; `trust`/`bridge` правят живую таблицу |
+| `balancer` | L4-балансер: nginx stable с nginx.org, SNI → upstream'ы нод с proxy-protocol | да |
 | `shape`    | per-IP шейпер полосы (eBPF/EDT): лимит DL/UL на клиента, whitelist, dynamic-штраф | да (tc clsact + BPF, свой `off`) |
 | `guard`    | защита от DDoS: XDP-cookies + NOTRACK, вариант «только Россия» / «весь мир», allowlist, dead-man | да (XDP + tc + nft, свой `off`) |
 | `bbr3`     | ядро XanMod для TCP **BBRv3** (mainline даёт только v1) | да, но **без автоперезагрузки** |
@@ -43,7 +44,8 @@ lib/dns.sh                  базовый домен, публичный IP, A-
 modules/
   diagnose.sh               27 чеков, дашборд, вердикт, рекомендации
   optimize.sh               сетевой/системный тюнинг
-  protect.sh                защита ноды (генерация артефактов)
+  protect.sh                защита ноды (генерация артефактов, trusted/мосты на лету)
+  balancer.sh               балансер: nginx stable (nginx.org), stream + ssl_preread, SNI → upstream
   bbr3.sh                   установка XanMod (BBRv3)
   rollback.sh               откат оптимизаций
   install.sh                диспетчер установки: нода/WARP/NetBird/мониторинг/CrowdSec
@@ -151,11 +153,70 @@ sudo bash node-diagnostic.sh protect --panel-ip <IP_панели> --ssh-from 100
 ```
 
 Откуда пускать SSH:
+- `--ssh-from any` — с любого адреса, без ограничения по IP. Остаётся rate-limit 6 соединений/мин на IP (v6 — на /64); брут режут CrowdSec и вход только по ключу, в `APPLY.txt` оба шага обязательны. Лок-аута при смене домашнего IP нет.
 - `--ssh-from IP|CIDR` — явно. Хост-биты обнуляются, поэтому можно передать адрес ноды в том виде, в каком его отдаёт NetBird: `100.92.13.5/16` → `100.92.0.0/16`.
 - Без флага, если текущая SSH-сессия пришла **через NetBird** (её IP входит в подсеть интерфейса `wt0` или `netbird status`), SSH открывается всей подсети NetBird. С публичного IP SSH тогда закрыт, а `APPLY.txt` предупреждает о рисках: при падении NetBird вход останется только через VNC-консоль хостера.
 - Иначе SSH открывается только с IP текущей сессии. Если на ноде есть NetBird, модуль подскажет нужный `--ssh-from`.
 
-Из меню то же самое без флагов: пункт **[3]** спросит IP панели, NODE_PORT и откуда пускать SSH (Enter — автодетект/плейсхолдер).
+Из меню то же самое без флагов: пункт **[3]** → **[1]** спросит IP панели, NODE_PORT, откуда пускать SSH (Enter — автодетект/плейсхолдер), есть ли HY2 (y/n), доверенные IP и порт мостов с пулом.
+
+### Лимиты и фильтры
+
+- Per-IP лимиты (`conn443`, `syn443`, `udp443`, ICMP, SSH) живут в set'ах с `size` и `timeout` (v4 — до `RL_SIZE4=131072` адресов, v6 — до `RL_SIZE6=65536`, `RL_TIMEOUT=30s`). У прежних `meter` записи не истекали: set забивался, и для новых адресов лимит молча переставал действовать.
+- IPv6-лимиты считаются по /64: по /128 их обходили перебором адресов внутри своей сети. NDP со своего сегмента (`hoplimit 255`) идёт мимо лимита ICMPv6 (RFC 4890), иначе весь `fe80::/64` делил бы один бакет.
+- HY2 под guard (NOTRACK): лимит `udp443` считает только QUIC Long Header (рукопожатие), поток данных не душится. Без guard — только новые потоки, как раньше. С обфускацией Salamander под guard подними `UDP_RATE`.
+- У каждого лимитирующего `drop` есть `counter` — видно, кого режут: `nft list chain inet node_protect input | grep -E 'counter packets [1-9]'`.
+- Невозможные комбинации TCP-флагов (SYN+FIN, SYN+RST, null, xmas) отбрасываются после `established`: под NOTRACK `ct state invalid` их не ловит.
+- `BAN_NETS` принимает и IPv6 — set `banned6`, drop в input и forward.
+- Роль `--role balancer` — firewall для сервера балансера: 443/80 всем с теми же per-IP лимитами, trusted, SSH. Без NODE_PORT, панели, UDP и порта мостов (`protect bridge` там отказывает).
+
+### HY2, trusted, порт мостов/балансеров
+
+- **`--hy2 y|n`** — есть ли Hysteria2/QUIC на 443/udp. `n` закрывает 443/udp и в `firewall.nft`, и в `firewall-ufw.sh`. Без флага — как раньше, открыт (меню спрашивает явно).
+- Широкие префиксы в trusted и bridge: `/0` не принимается никогда, короче `/8` (v4) и `/32` (v6) — только с подтверждением в терминале или `ND_WIDE_OK=1`. trusted `/0` выключил бы лимиты всем, а bridge `/0` открыл бы порт с proxy-protocol всем: подмена IP клиента ломает учёт IP в Remnawave.
+- **trusted4/6** (`--trust IP|CIDR`, повторяемый, v4 и v6) — адреса, которые на 443 проходят **мимо per-IP лимитов** (`conn443` 2048 соединений, `syn443` 200 SYN/с): CGNAT-шлюзы, мосты, которые ходят на 443. Правила `nd:trusted` стоят до лимитов, `banned4` сильнее.
+- **порт мостов** (`--bridge-port 8443`, пул `--bridge-from IP|CIDR`) — порт для мостов и балансеров (xray с proxy-protocol). Открыт **только** пулу `bridge4/6`, лимитов нет: за одним IP балансера идут все его клиенты. Порт не может совпасть с 443/80/SSH/NODE_PORT. Пустой пул — порт закрыт для всех.
+
+Параметры генерации сохраняются в `<каталог>/protect.conf`. Повторный `protect` без флагов берёт их оттуда (флаг > переменная окружения > conf > автодетект), списки trusted/bridge объединяются.
+
+На применённом firewall всё это правится **на лету**, без ручной перегенерации:
+
+```bash
+sudo rr protect trust add 192.0.2.0/24 2001:db8::/32   # trusted4/6
+sudo rr protect trust del 192.0.2.0/24
+sudo rr protect trust list                             # conf + живые set'ы + счётчики правил
+sudo rr protect bridge port 8443                       # открыть порт мостов (off — закрыть, пул остаётся)
+sudo rr protect bridge add 80.79.117.98                # IP балансера / моста
+sudo rr protect bridge list
+```
+
+Каждая команда правит `protect.conf`, перегенерирует `firewall.nft`, одной транзакцией `nft -f -` вносит дельту в живую таблицу `node_protect` и обновляет `/etc/nftables.d/node_protect.nft`, если автозагрузка уже заведена. Таблица от старой версии `protect` (без `trusted`/`bridge`) догоняется: set'ы создаются, правила вставляются по handle до лимитов 443 / до финального drop. SSH эти команды не трогают. В меню: **[3]** → **[2]** (trusted) и **[3]** (мосты).
+
+Автозагрузка (`APPLY.txt`) — только своя таблица: `install -Dm600 firewall.nft /etc/nftables.d/node_protect.nft` + `include` в `/etc/nftables.conf`. Дамп всего `nft list ruleset` утаскивал бы таблицы Docker и CrowdSec.
+
+## `balancer` — L4-балансер на nginx (SNI → ноды)
+
+Отдельный сервер перед нодами. nginx `stream` читает SNI из ClientHello (`ssl_preread`, без расшифровки) и проксирует TCP на upstream'ы этого SNI. С `proxy_protocol on` нода видит реальный IP клиента.
+
+```bash
+sudo rr balancer install \
+    --route sni-eu.example.com=80.79.117.98:8443 \
+    --route sni-us.example.com=203.0.113.10:8443,203.0.113.11:8443 \
+    --default sni-eu.example.com          # без --route в терминале спросит маршруты
+sudo rr balancer add '*.example.org' 198.51.100.1:8443   # маршрут (есть — upstream'ы заменятся)
+sudo rr balancer del sni-us.example.com                  # default переедет на первый оставшийся
+sudo rr balancer default sni-eu.example.com
+sudo rr balancer status                                  # nginx, маршруты, TCP-доступность upstream'ов
+sudo rr balancer render                                  # показать nginx.conf без применения
+```
+
+- nginx — **последняя stable из официального репозитория nginx.org**. apt (Debian/Ubuntu): ключ подписи сверяется по отпечатку `573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62`, pin 900 на origin nginx.org. dnf/yum: репозиторий `nginx-stable`. nginx дистрибутива конфликтует с пакетом nginx.org, поэтому модуль предлагает удалить его (`/etc/nginx` уходит в бэкап). Сборка без `--with-stream_ssl_preread_module` — отказ.
+- Маршруты лежат в `/etc/node-diagnostic/balancer.conf`. Из него целиком генерируется `/etc/nginx/nginx.conf`: шаблон с `map $ssl_preread_server_name $backend { hostnames; … }`, маски `*.domain`, IPv6-upstream'ы `[2001:db8::1]:8443`. Прежний файл сохраняется в `nginx.conf.nd-bak-<время>`. Если `nginx -t` не прошёл, он возвращается, иначе — `reload`.
+- Отличия от исходного шаблона: `user` — `www-data` или `nginx`, `listen [::]` — только если на хосте есть IPv6.
+- Порты 80 и 443 должен держать только nginx, иначе установка откажет.
+- Firewall самого балансера: `rr protect --role balancer` (443/80 всем с per-IP лимитами, SSH — твой IP или `any`).
+
+На каждой ноде за балансером: `rr protect bridge port 8443 && rr protect bridge add <IP балансера>`. У inbound'а xray на этом порту должен стоять `sockopt.acceptProxyProtocol: true`, иначе xray не разберёт PROXY-заголовок. Меню: **[13]**, также `install balancer`.
 
 ## `bbr3` — TCP BBRv3 через XanMod
 

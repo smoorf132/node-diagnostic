@@ -85,6 +85,135 @@ if command -v nft >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
 fi
 bash modules/protect.sh --ssh-from bogus --out "$nbo" >/dev/null 2>&1 && bad "--ssh-from мусор принят" || ok "--ssh-from отвергает мусор"
 
+echo "== protect: HY2 / trusted / порт мостов =="
+n6=$(bash -c 'source lib/common.sh; echo "$(ip6_norm 2001:DB8::1/32) $(ip6_norm 2001:0db8:0:0:1:0:0:1) $(net_norm 192.0.2.7/24)"
+    ip6_norm 1::2::3 >/dev/null || ip6_norm 2001:db8::/129 >/dev/null || echo rej' 2>/dev/null | tr '\n' ' ')
+[ "$n6" = "2001:db8::/32 2001:db8::1:0:0:1 192.0.2.0/24 rej " ] && ok "ip6_norm / net_norm" || bad "ip6_norm / net_norm: $n6"
+# по умолчанию (без --hy2) — как раньше: 443/udp открыт; пустые set'ы trusted/bridge, порта мостов нет
+if grep -q 'udp dport 443 accept' "$out/firewall.nft" && grep -q 'ufw allow 443/udp' "$out/firewall-ufw.sh" \
+   && grep -q 'set trusted6' "$out/firewall.nft" && grep -q 'set bridge4' "$out/firewall.nft" \
+   && ! grep -q '"nd:bridge"' "$out/firewall.nft"; then
+    ok "protect: дефолт — HY2 да, set'ы trusted/bridge пустые, порт мостов закрыт"
+else
+    bad "protect: дефолт HY2/trusted/bridge"
+fi
+hb=$(mktemp -d)
+bash modules/protect.sh --panel-ip 203.0.113.5 --node-port 2222 --ssh-from 198.51.100.2 --hy2 n \
+    --trust 192.0.2.7/24 --trust 2001:DB8::/32 --bridge-port 8443 --bridge-from 198.51.100.9 \
+    --bridge-from 2001:db8:1::5 --out "$hb" >/dev/null 2>&1
+if ! grep -q 'udp dport 443' "$hb/firewall.nft" && ! grep -q '443/udp' "$hb/firewall-ufw.sh" \
+   && grep -q 'ufw allow 443/tcp' "$hb/firewall-ufw.sh"; then
+    ok "protect --hy2 n: 443/udp закрыт в nft и ufw"
+else
+    bad "protect --hy2 n: остался 443/udp"
+fi
+if grep -A4 'set trusted4' "$hb/firewall.nft" | grep -q 'elements = { 192.0.2.0/24 }' \
+   && grep -A4 'set trusted6' "$hb/firewall.nft" | grep -q 'elements = { 2001:db8::/32 }' \
+   && grep -A4 'set bridge4' "$hb/firewall.nft" | grep -q 'elements = { 198.51.100.9/32 }' \
+   && grep -A4 'set bridge6' "$hb/firewall.nft" | grep -q 'elements = { 2001:db8:1::5 }'; then
+    ok "protect: --trust/--bridge-from по семействам (v4/v6, канон)"
+else
+    bad "protect: элементы trusted/bridge"
+fi
+# trusted — раньше лимитов 443, порт мостов — раньше финального drop
+lt=$(grep -n '"nd:trusted"' "$hb/firewall.nft" | head -1 | cut -d: -f1)
+lc=$(grep -n 'add @conn443_4' "$hb/firewall.nft" | cut -d: -f1)
+lb=$(grep -n 'tcp dport 8443 ip saddr @bridge4 counter accept comment "nd:bridge"' "$hb/firewall.nft" | cut -d: -f1)
+ld=$(grep -n 'node_protect drop' "$hb/firewall.nft" | cut -d: -f1)
+[ -n "$lt" ] && [ -n "$lc" ] && [ "$lt" -lt "$lc" ] && [ -n "$lb" ] && [ "$lb" -lt "$ld" ] \
+    && grep -q 'from 198.51.100.9/32 to any port 8443 proto tcp' "$hb/firewall-ufw.sh" \
+    && ok "protect: порядок trusted < conn443, bridge < drop; ufw с пулом" || bad "protect: порядок правил trusted/bridge"
+# повтор без флагов — всё из protect.conf
+bash modules/protect.sh --out "$hb" >/dev/null 2>&1
+grep -q 'HY2="n"' "$hb/protect.conf" && ! grep -q 'udp dport 443' "$hb/firewall.nft" \
+    && grep -q 'tcp dport 8443 ip6 saddr @bridge6' "$hb/firewall.nft" \
+    && grep -A4 'set trusted4' "$hb/firewall.nft" | grep -q '192.0.2.0/24' \
+    && grep -q 'tcp dport 22 ip saddr 198.51.100.2 accept' "$hb/firewall.nft" \
+    && ok "protect: повтор без флагов берёт protect.conf" || bad "protect: повтор потерял параметры"
+bash modules/protect.sh --trust bogus --out "$hb" >/dev/null 2>&1 && bad "--trust мусор принят" || ok "--trust отвергает мусор"
+bash modules/protect.sh --bridge-port 443 --out "$hb" >/dev/null 2>&1 && bad "--bridge-port 443 принят" || ok "--bridge-port 443 отвергнут"
+bash modules/protect.sh --hy2 maybe --out "$hb" >/dev/null 2>&1 && bad "--hy2 мусор принят" || ok "--hy2 отвергает мусор"
+# живые команды без живой таблицы: правят conf и перегенерируют firewall.nft
+PROTECT_PERSIST="$hb/persist.nft" bash modules/protect.sh trust add 203.0.113.0/25 2001:db8:2::/48 --out "$hb" >/dev/null 2>&1
+PROTECT_PERSIST="$hb/persist.nft" bash modules/protect.sh bridge port 9443 --out "$hb" >/dev/null 2>&1
+PROTECT_PERSIST="$hb/persist.nft" bash modules/protect.sh bridge del 198.51.100.9 --out "$hb" >/dev/null 2>&1
+grep -q 'TRUST_NETS="192.0.2.0/24 2001:db8::/32 203.0.113.0/25 2001:db8:2::/48"' "$hb/protect.conf" \
+    && grep -q 'BRIDGE_PORT="9443"' "$hb/protect.conf" && grep -q 'BRIDGE_NETS="2001:db8:1::5"' "$hb/protect.conf" \
+    && grep -q 'tcp dport 9443 ip saddr @bridge4' "$hb/firewall.nft" && ! grep -q 'dport 8443' "$hb/firewall.nft" \
+    && ! grep -A4 'set bridge4' "$hb/firewall.nft" | grep -q elements \
+    && ok "protect trust/bridge: conf + перегенерация" || bad "protect trust/bridge: conf/перегенерация"
+PROTECT_PERSIST="$hb/persist.nft" bash modules/protect.sh bridge port off --out "$hb" >/dev/null 2>&1
+grep -q 'BRIDGE_PORT=""' "$hb/protect.conf" && ! grep -q '"nd:bridge"' "$hb/firewall.nft" \
+    && grep -A4 'set bridge6' "$hb/firewall.nft" | grep -q '2001:db8:1::5' \
+    && ok "protect bridge port off: правило снято, пул сохранён" || bad "protect bridge port off"
+bash modules/protect.sh bridge port 22 --out "$hb" >/dev/null 2>&1 && bad "bridge port 22 принят" || ok "bridge port: отказ на порт SSH"
+bash modules/protect.sh trust add nope --out "$hb" >/dev/null 2>&1 && bad "trust add мусор принят" || ok "trust add отвергает мусор"
+# без прошлой генерации: только conf, BAN_NETS не затирается пустым
+ng=$(mktemp -d)
+bash modules/protect.sh trust add 192.0.2.1 --out "$ng" >/dev/null 2>&1
+grep -q 'TRUST_NETS="192.0.2.1/32"' "$ng/protect.conf" && grep -q 'BAN_NETS="185.224.228.0/22' "$ng/protect.conf" \
+    && [ ! -e "$ng/firewall.nft" ] && ok "protect trust без генерации: conf, бан не потерян" || bad "protect trust без генерации"
+if command -v nft >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+    bash modules/protect.sh --bridge-port 8443 --hy2 y --out "$hb" >/dev/null 2>&1
+    nft -c -f "$hb/firewall.nft" >/dev/null 2>&1 && ok "nft -c (HY2 + trusted v4/v6 + мосты)" || bad "nft -c (HY2 + trusted + мосты)"
+fi
+rm -rf "$hb" "$ng"
+
+echo "== protect: лимиты (set'ы с timeout, /64), флаги TCP, banned6, SSH any, балансер =="
+lm=$(mktemp -d)
+BAN_NETS="185.224.228.0/22 2001:db8:dead::/48" bash modules/protect.sh --panel-ip 203.0.113.5 --node-port 2222 \
+    --ssh-from any --hy2 y --bridge-port 8443 --bridge-from 80.79.117.98 --out "$lm" >/dev/null 2>&1
+f="$lm/firewall.nft"
+# ни одного meter'а: у всех лимитов set с size, у rate-лимитов ещё и timeout
+! grep -q 'meter ' "$f" \
+    && grep -q 'set syn443_4 { type ipv4_addr; size 131072; flags dynamic,timeout; timeout 30s; }' "$f" \
+    && grep -q 'set conn443_6 { type ipv6_addr; size 65536; flags dynamic; }' "$f" \
+    && grep -q 'set udp443_4 { type ipv4_addr; size 131072; flags dynamic,timeout; timeout 30s; }' "$f" \
+    && ok "protect: лимиты в set'ах с size/timeout, без meter" || bad "protect: meter/set'ы лимитов"
+[ "$(grep -c 'ip6 saddr and ffff:ffff:ffff:ffff::' "$f")" -ge 5 ] && ! grep -qE '@(syn443|conn443|udp443|icmp)6 \{ ip6 saddr limit|\{ ip6 saddr ct count' "$f" \
+    && ok "protect: v6-лимиты по /64" || bad "protect: v6-лимиты не по /64"
+# каждый лимитирующий drop — со счётчиком
+! grep -E 'limit rate over|ct count over' "$f" | grep -v 'counter drop' | grep -q 'drop' \
+    && [ "$(grep -cE '(limit rate over|ct count over).*counter drop' "$f")" -ge 10 ] \
+    && ok "protect: счётчики на лимитирующих drop" || bad "protect: drop лимита без counter"
+grep -q 'udp dport 443 meta nfproto ipv4 ct state untracked @th,64,1 1' "$f" \
+    && grep -q 'udp dport 443 meta nfproto ipv4 ct state new' "$f" \
+    && ok "protect: HY2 под guard — лимит только QUIC Long Header" || bad "protect: udp443 под NOTRACK"
+ln=$(grep -n 'icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } ip6 hoplimit 255 accept' "$f" | cut -d: -f1)
+li=$(grep -n 'update @icmp6' "$f" | cut -d: -f1)
+[ -n "$ln" ] && [ -n "$li" ] && [ "$ln" -lt "$li" ] \
+    && ok "protect: NDP (hoplimit 255) до /64-лимита icmp6" || bad "protect: NDP под лимитом icmp6"
+grep -A4 'set banned6' "$f" | grep -q 'elements = { 2001:db8:dead::/48 }' \
+    && [ "$(grep -c 'ip6 saddr @banned6 counter drop' "$f")" = 2 ] \
+    && ok "protect: banned6 (input + forward)" || bad "protect: banned6"
+lf=$(grep -n 'tcp flags & (fin|syn) == (fin|syn) counter drop' "$f" | cut -d: -f1)
+le=$(grep -n 'ct state established,related accept' "$f" | cut -d: -f1)
+[ -n "$lf" ] && [ "$lf" -gt "$le" ] && grep -q 'tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 counter drop' "$f" \
+    && ok "protect: невозможные TCP-флаги после established" || bad "protect: фильтр TCP-флагов"
+grep -q 'tcp dport 22 ct state new meta nfproto ipv6' "$f" && grep -qE '^        tcp dport 22 accept$' "$f" \
+    && ! grep -q 'tcp dport 22 ip saddr' "$f" && grep -q 'ufw allow 22/tcp' "$lm/firewall-ufw.sh" \
+    && grep -q 'SSH_FROM="any"' "$lm/protect.conf" && grep -q 'с ЛЮБОГО адреса' "$lm/APPLY.txt" \
+    && ok "protect --ssh-from any: SSH всем + rate-limit v4/v6" || bad "protect --ssh-from any"
+bash modules/protect.sh --trust 0.0.0.0/0 --out "$lm" </dev/null >/dev/null 2>&1 && bad "--trust 0.0.0.0/0 принят" || ok "--trust /0 отвергнут"
+bash modules/protect.sh trust add 10.0.0.0/4 --out "$lm" </dev/null >/dev/null 2>&1 && bad "trust add /4 без подтверждения принят" || ok "trust add: широкий префикс без подтверждения отвергнут"
+ND_WIDE_OK=1 bash modules/protect.sh bridge add 10.0.0.0/7 --out "$lm" </dev/null >/dev/null 2>&1 \
+    && grep -q '10.0.0.0/7' "$lm/protect.conf" && ok "ND_WIDE_OK=1 пропускает широкий префикс" || bad "ND_WIDE_OK"
+ba=$(mktemp -d)
+bash modules/protect.sh --role balancer --ssh-from 198.51.100.2 --hy2 y --bridge-port 8443 --out "$ba" >/dev/null 2>&1
+! grep -qE 'panel_ip|udp dport|dport 8443|dport 2222|<NODE_PORT>|<PANEL_IP>' "$ba/firewall.nft" \
+    && grep -q 'tcp dport 443 accept' "$ba/firewall.nft" && grep -q 'tcp dport 80 accept' "$ba/firewall.nft" \
+    && grep -q '"nd:trusted"' "$ba/firewall.nft" && ! grep -q 'control-API' "$ba/firewall-ufw.sh" \
+    && grep -q 'ROLE="balancer"' "$ba/protect.conf" && grep -q 'HY2="n"' "$ba/protect.conf" \
+    && ok "protect --role balancer: 443/80/SSH, без панели/UDP/мостов" || bad "protect --role balancer"
+bash modules/protect.sh bridge add 192.0.2.1 --out "$ba" >/dev/null 2>&1 && bad "bridge на балансере принят" || ok "bridge на балансере отвергнут"
+if command -v nft >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+    nft -c -f "$f" >/dev/null 2>&1 && ok "nft -c (SSH any + HY2 + мосты + banned6)" \
+        || { bad "nft -c (SSH any + HY2 + мосты + banned6)"; nft -c -f "$f" 2>&1 | head -5 | sed 's/^/      /'; }
+    nft -c -f "$ba/firewall.nft" >/dev/null 2>&1 && ok "nft -c (балансер)" \
+        || { bad "nft -c (балансер)"; nft -c -f "$ba/firewall.nft" 2>&1 | head -5 | sed 's/^/      /'; }
+fi
+rm -rf "$lm" "$ba"
+
 echo "== rollback --dry-run =="
 bash modules/rollback.sh --dry-run >/dev/null 2>&1 && ok "rollback dry-run" || bad "rollback dry-run"
 
@@ -239,6 +368,49 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     fi
 fi
 
+echo "== balancer (nginx stream: SNI → upstream) =="
+bc=$(mktemp -d); export BALANCER_CONF="$bc/balancer.conf"
+bash modules/balancer.sh add sni-eu.example.com 80.79.117.98:8443 >/dev/null 2>&1
+bash modules/balancer.sh add SNI-US.example.com '203.0.113.10:8443,[2001:DB8::1]:8443' >/dev/null 2>&1
+bash modules/balancer.sh add '*.example.org' 198.51.100.1:8443 >/dev/null 2>&1
+BAL_IPV6=1 BAL_USER=nginx bash modules/balancer.sh render > "$bc/nginx.conf" 2>/dev/null
+if grep -qF 'map $ssl_preread_server_name $backend {' "$bc/nginx.conf" \
+   && grep -q '^        hostnames;' "$bc/nginx.conf" \
+   && grep -qE '^ +sni-eu\.example\.com +up1_sni_eu_example_com;' "$bc/nginx.conf" \
+   && grep -qE '^ +sni-us\.example\.com +up2_sni_us_example_com;' "$bc/nginx.conf" \
+   && grep -qE '^ +\*\.example\.org +up3_example_org;' "$bc/nginx.conf" \
+   && grep -qE '^ +default +up1_sni_eu_example_com;' "$bc/nginx.conf" \
+   && grep -q 'server 80.79.117.98:8443;' "$bc/nginx.conf" \
+   && grep -qF 'server [2001:db8::1]:8443;' "$bc/nginx.conf" \
+   && grep -q 'ssl_preread on;' "$bc/nginx.conf" && grep -qF 'proxy_pass $backend;' "$bc/nginx.conf" \
+   && grep -q 'proxy_protocol on;' "$bc/nginx.conf" && grep -q 'preread_timeout 5s;' "$bc/nginx.conf" \
+   && grep -qF 'listen [::]:443 reuseport deferred backlog=65535 so_keepalive=30s:10s:3;' "$bc/nginx.conf" \
+   && grep -q 'worker_rlimit_nofile 70000;' "$bc/nginx.conf" && grep -q 'worker_connections 65535;' "$bc/nginx.conf"; then
+    ok "balancer: рендер (map hostnames, маска, IPv6-upstream, ssl_preread, proxy_protocol)"
+else
+    bad "balancer: рендер"
+fi
+BAL_IPV6=0 bash modules/balancer.sh render 2>/dev/null | grep -qF 'listen [::]' && bad "balancer: listen [::] без IPv6" || ok "balancer: без IPv6 — без listen [::]"
+bash modules/balancer.sh add 'bad_sni!' 1.2.3.4:8443 >/dev/null 2>&1 && bad "balancer: мусорный SNI принят" || ok "balancer: отказ на мусорный SNI"
+bash modules/balancer.sh add a.example.com 1.2.3.4:99999 >/dev/null 2>&1 && bad "balancer: порт 99999 принят" || ok "balancer: отказ на плохой upstream"
+bash modules/balancer.sh del sni-eu.example.com >/dev/null 2>&1
+grep -q '^default sni-us.example.com$' "$BALANCER_CONF" && ! grep -q 'sni-eu' "$BALANCER_CONF" \
+    && ok "balancer: del default-маршрута → default на первый оставшийся" || bad "balancer: del default"
+bash modules/balancer.sh add sni-us.example.com 203.0.113.11:8443 >/dev/null 2>&1
+[ "$(grep -c '^route sni-us.example.com' "$BALANCER_CONF")" = 1 ] && grep -q '^route sni-us.example.com 203.0.113.11:8443$' "$BALANCER_CONF" \
+    && ok "balancer: add существующего SNI заменяет upstream'ы" || bad "balancer: add существующего SNI"
+bash modules/balancer.sh help 2>/dev/null | grep -q 'ssl_preread' && bash node-diagnostic.sh help | grep -q 'balancer' \
+    && ok "balancer: help + dispatcher" || bad "balancer: help/dispatcher"
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    # тот же рендер — nginx -t в образе последней stable (stream + ssl_preread собраны статически)
+    if nt=$(docker run --rm -v "$bc/nginx.conf:/etc/nginx/nginx.conf:ro" nginx:stable-alpine nginx -t 2>&1); then
+        ok "balancer: nginx -t (nginx:stable-alpine)"
+    else
+        bad "balancer: nginx -t (nginx:stable-alpine)"; printf '%s\n' "$nt" | tail -n 5 | sed 's/^/      /'
+    fi
+fi
+unset BALANCER_CONF; rm -rf "$bc"
+
 echo "== protect: NODE_PORT из docker-compose.yml ноды =="
 rn=$(mktemp -d); po=$(mktemp -d)
 printf 'services:\n  remnanode:\n    environment:\n      - NODE_PORT=2345\n' > "$rn/docker-compose.yml"
@@ -374,7 +546,7 @@ bash modules/guard.sh status >/dev/null 2>&1 && ok "guard status (выключе
 bash node-diagnostic.sh help | grep -q 'guard' && ok "help: guard" || bad "help: guard"
 bash node-diagnostic.sh guard help >/dev/null 2>&1 && ok "dispatcher guard" || bad "dispatcher guard"
 [ "$(grep -c 'tcp flags & (fin|syn|rst|ack) == syn' "$out/firewall.nft")" = 2 ] \
-  && ! grep -B1 'meter syn443_' "$out/firewall.nft" | grep -q 'ct state new' \
+  && ! grep -B1 'update @syn443_' "$out/firewall.nft" | grep -q 'ct state new' \
   && ok "protect: SYN-rate работает и под NOTRACK" || bad "protect: syn443 на ct state new"
 
 echo

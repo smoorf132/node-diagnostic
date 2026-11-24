@@ -137,7 +137,7 @@ _sp_fw_open() {   # _sp_fw_open <new> <old...>
     if have nft && nft list table inet node_protect >/dev/null 2>&1; then
         any=1
         for old in "$@"; do
-            # meter-правило (rate-limit) не копируем: полный набор вернёт перегенерация protect
+            # rate-limit-правило (… counter drop) не копируем: полный набор вернёт перегенерация protect
             while IFS= read -r r; do
                 r=$(sed -E "s/tcp dport $old( |$)/tcp dport $new\1/" <<< "$r")
                 # shellcheck disable=SC2086  # правило nft — набор слов

@@ -547,6 +547,59 @@ ip_in_cidr() {
     [ "$(ipv4_net "$1/$p" 2>/dev/null)" = "$net" ]
 }
 
+# ip6_norm ADDR[/N] → канонический IPv6 (нижний регистр, хост-биты под маской обнулены, сжатие «::»).
+# Без /N — адрес как есть, с /N — «сеть/N». rc 1 — мусор (встроенный IPv4 вида ::ffff:1.2.3.4 не берём).
+# Канон нужен для дедупликации списков trusted/bridge и потому, что nft отвергает префикс с хост-битами.
+ip6_norm() {
+    local a=${1%/*} p=128 has_p=0 i g k m out="" best=-1 blen=0 cur=-1 clen=0 fill
+    local -a G=() H=() T=()
+    case "$1" in */*) p=${1#*/}; has_p=1 ;; esac
+    [[ "$p" =~ ^[0-9]{1,3}$ ]] && [ "$((10#$p))" -le 128 ] || return 1
+    p=$((10#$p))
+    [[ "$a" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    case "$a" in *:*) ;; *) return 1 ;; esac
+    case "$a" in *:::*|*::*::*) return 1 ;; esac
+    if [[ "$a" == *::* ]]; then
+        [ -n "${a%%::*}" ] && IFS=: read -r -a H <<< "${a%%::*}"
+        [ -n "${a#*::}" ]  && IFS=: read -r -a T <<< "${a#*::}"
+        fill=$((8 - ${#H[@]} - ${#T[@]}))
+        [ "$fill" -ge 1 ] || return 1
+        G=(${H[@]+"${H[@]}"})
+        for ((i = 0; i < fill; i++)); do G+=(0); done
+        G+=(${T[@]+"${T[@]}"})
+    else
+        IFS=: read -r -a G <<< "$a"
+    fi
+    [ "${#G[@]}" -eq 8 ] || return 1
+    for ((i = 0; i < 8; i++)); do
+        g=${G[i]}
+        [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        k=$((p - i * 16)); [ "$k" -gt 16 ] && k=16; [ "$k" -lt 0 ] && k=0
+        m=$(( (0xFFFF << (16 - k)) & 0xFFFF ))
+        G[i]=$(( 16#$g & m ))
+        if [ "${G[i]}" -eq 0 ]; then
+            [ "$cur" -lt 0 ] && cur=$i
+            clen=$((clen + 1))
+            [ "$clen" -gt "$blen" ] && { blen=$clen; best=$cur; }
+        else
+            cur=-1; clen=0
+        fi
+    done
+    for ((i = 0; i < 8; i++)); do
+        if [ "$blen" -ge 2 ] && [ "$i" -ge "$best" ] && [ "$i" -lt $((best + blen)) ]; then
+            [ "$i" -eq "$best" ] && out="$out::"
+            continue
+        fi
+        case "$out" in ""|*:) ;; *) out="$out:" ;; esac
+        out="$out$(printf '%x' "${G[i]}")"
+    done
+    [ "$has_p" = 1 ] && out="$out/$p"
+    echo "$out"
+}
+
+# net_norm IP|CIDR (v4 или v6) → канон: IPv4 — «сеть/N» (без /N — /32), IPv6 — ip6_norm. rc 1 — мусор
+net_norm() { ipv4_net "$1" 2>/dev/null || ip6_norm "$1"; }
+
 # NetBird: адрес ноды в оверлее с префиксом (100.92.13.5/16) — с интерфейса wt0,
 # иначе из `netbird status` (интерфейс могли переименовать). Пусто — NetBird не поднят.
 netbird_addr() {

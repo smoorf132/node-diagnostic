@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # modules/install.sh — установка компонентов ноды Remnawave.
-# Сабкоманды: node | warp | netbird | monitoring | crowdsec.
+# Сабкоманды: node | warp | netbird | monitoring | crowdsec | balancer.
 # Вызывается через node-diagnostic.sh (пункт меню «Установка Remnanode»).
 # Нода и WARP — отдельные модули (node.sh, warp.sh); здесь только диспетчер к ним.
 # Внешние установщики запускаются ТОЛЬКО после явного подтверждения.
@@ -405,11 +405,12 @@ case "${1:-}" in
     netbird)    _need_tty; inst_netbird ;;
     monitoring) _need_tty; inst_monitoring ;;
     crowdsec)   _need_tty; inst_crowdsec ;;
+    balancer)   shift; bash "$_self/balancer.sh" install "$@" ;;
     selfsteal)
         echo "install: selfsteal теперь часть установки ноды (nginx + шаблон сайта) — sudo bash node-diagnostic.sh install node" >&2
         exit 2 ;;
     ""|help|-h|--help)
-        echo "install: sudo bash node-diagnostic.sh install {node|warp|netbird|monitoring|crowdsec}"
+        echo "install: sudo bash node-diagnostic.sh install {node|warp|netbird|monitoring|crowdsec|balancer}"
         ;;
-    *) echo "install: неизвестная сабкоманда '$1' (node|warp|netbird|monitoring|crowdsec)" >&2; exit 2 ;;
+    *) echo "install: неизвестная сабкоманда '$1' (node|warp|netbird|monitoring|crowdsec|balancer)" >&2; exit 2 ;;
 esac

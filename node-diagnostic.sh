@@ -47,14 +47,19 @@ node-diagnostic.sh v$ND_VERSION — модульный тулкит ноды (Re
                                  Тюнинг: sysctl/BBR/FD-лимиты/RPS-RFS-XPS/NIC/MSS/irqbalance/journald
                                  --all включает irqbalance+journald; --zram (zram-swap) — только явно
                                  --from-findings — только фиксы по находкам последней диагностики
-  protect  [--panel-ip IP] [--node-port N] [--ssh-from IP|CIDR] [--out DIR]
+  protect  [--role node|balancer] [--panel-ip IP] [--node-port N] [--ssh-from IP|CIDR|any] [--out DIR]
+           [--hy2 y|n] [--trust IP|CIDR]... [--bridge-port N|off] [--bridge-from IP|CIDR]...
                                  Защита под Remnawave (firewall/SSH) — ГЕНЕРАЦИЯ, не применяет
                                  SSH по умолчанию: подсеть NetBird, если сессия через неё, иначе твой IP
+  protect trust  {add|del IP|CIDR…|list}
+  protect bridge {add|del IP|CIDR…|port N|off|list}
+                                 На лету: trusted4/6 (443 мимо per-IP лимитов), порт мостов/балансеров
+                                 и его пул bridge4/6 — conf, firewall.nft и живая таблица node_protect
   bbr3     [--status|--install|--dry-run|--yes]
                                  BBRv3 через XanMod-ядро (гейт контейнеров, без автоперезагрузки)
   rollback [--yes|--dry-run]     Откат наложенных оптимизаций (namespaced-артефакты)
   status                         Что наложено на систему, ядро, cc/qdisc
-  install {node|warp|netbird|monitoring|crowdsec}
+  install {node|warp|netbird|monitoring|crowdsec|balancer}
                                  Установка ноды Remnawave (nginx-selfsteal + сертификат) / WARP /
                                  NetBird / мониторинга / CrowdSec
   certs    [menu|renew|issue [ДОМЕН]|manual [ДОМЕН]]
@@ -67,6 +72,8 @@ node-diagnostic.sh v$ND_VERSION — модульный тулкит ноды (Re
   guard  {on [--geo ru]|off|status|reattach|allow IP|unallow IP|update-geo|confirm}
                                  Защита от DDoS (XDP + tc + NOTRACK): вариант 1 — только Россия, вариант 2 — весь мир
   ssh-port [ПОРТ]                Смена SSH-порта без лок-аута (sshd + firewall, проверка входа, откат)
+  balancer {install|add SNI HOST:PORT[,…]|del SNI|default SNI|list|status|apply}
+                                 Балансер: nginx stable (nginx.org), SNI → upstream'ы нод с proxy-protocol
   menu                           Интерактивное меню (по умолчанию в TTY)
   help | --version
 
@@ -81,7 +88,7 @@ menu() {
         echo
         echo -e "    ${C}${BOLD}[1]${NC} Диагностика        ${DIM}27 чеков, дашборд, вердикт${NC}"
         echo -e "    ${C}${BOLD}[2]${NC} Оптимизация        ${DIM}sysctl/BBR/FD/RPS/NIC${NC}"
-        echo -e "    ${C}${BOLD}[3]${NC} Защита ноды        ${DIM}firewall/SSH (Remnawave, генерация)${NC}"
+        echo -e "    ${C}${BOLD}[3]${NC} Защита ноды        ${DIM}firewall/SSH, trusted, мосты${NC}"
         echo -e "    ${C}${BOLD}[4]${NC} BBRv3-ядро         ${DIM}XanMod, нужен reboot${NC}"
         echo -e "    ${C}${BOLD}[5]${NC} Откат              ${DIM}снять наложенные оптимизации${NC}"
         echo -e "    ${C}${BOLD}[6]${NC} Статус             ${DIM}что применено, ядро, cc/qdisc${NC}"
@@ -91,9 +98,10 @@ menu() {
         echo -e "   ${C}${BOLD}[10]${NC} Сертификаты        ${DIM}продление/выпуск/свой${NC}"
         echo -e "   ${C}${BOLD}[11]${NC} IPv6               ${DIM}включить/выключить${NC}"
         echo -e "   ${C}${BOLD}[12]${NC} Защита от DDoS     ${DIM}XDP: только Россия / весь мир${NC}"
+        echo -e "   ${C}${BOLD}[13]${NC} Балансер nginx     ${DIM}SNI → ноды, proxy-protocol${NC}"
         echo -e "    ${C}${BOLD}[0]${NC} Выход"
         echo
-        printf "  ${BOLD}Выбор${NC} ${DIM}[0-12]${NC}: "
+        printf "  ${BOLD}Выбор${NC} ${DIM}[0-13]${NC}: "
         local c; read -r c
         echo
         case "$c" in
@@ -109,6 +117,7 @@ menu() {
             10) run certs menu ;;
             11) run ipv6 menu ;;
             12) menu_guard ;;
+            13) menu_balancer ;;
             0|q|"") echo -e "  ${DIM}выход${NC}"; return 0 ;;
             *) echo -e "  ${Y}нет такого пункта${NC}" ;;
         esac
@@ -192,15 +201,47 @@ is_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 
 menu_protect() {
     if [ ! -t 0 ]; then run protect; return; fi
-    echo -e "  ${BOLD}Защита ноды${NC} ${DIM}(генерация firewall/SSH — ничего не применяет)${NC}"
-    local pip np sf nb
+    echo -e "  ${BOLD}Защита ноды${NC}"
+    echo -e "    ${C}${BOLD}[1]${NC} Сгенерировать firewall/SSH  ${DIM}ничего не применяет${NC}"
+    echo -e "    ${C}${BOLD}[2]${NC} Доверенные IP (trusted)     ${DIM}443 мимо per-IP лимитов, на лету${NC}"
+    echo -e "    ${C}${BOLD}[3]${NC} Мосты и балансеры           ${DIM}порт (8443) + пул IP, на лету${NC}"
+    echo -e "    ${C}${BOLD}[0]${NC} Назад"
+    printf "  ${BOLD}Выбор${NC} ${DIM}[0-3]${NC}: "; local c; read -r c; echo
+    case "$c" in
+        1) menu_protect_gen ;;
+        2) menu_protect_nets trust ;;
+        3) menu_protect_nets bridge ;;
+        *) return 0 ;;
+    esac
+}
+
+# список IP/подсетей через пробел (v4/v6) → массив _NETS; пустой ввод — пустой массив; rc 1 — мусор
+_read_nets() {
+    local line n; _NETS=()
+    read -r line || return 0
+    for n in $line; do
+        net_norm "$n" >/dev/null || { echo -e "    ${Y}«${n}» — не IP/подсеть${NC}"; return 1; }
+        _NETS+=("$n")
+    done
+}
+
+menu_protect_gen() {
+    echo -e "  ${BOLD}Генерация firewall/SSH${NC} ${DIM}(ничего не применяет)${NC}"
+    local pip="" np="" sf nb hy=n bp="" yn n role=node
+    local -a args=() trust=() bridge=()
     while true; do
+        printf "  Что это за сервер? ${DIM}[1 — нода Remnawave, 2 — балансер nginx; Enter — нода]${NC}: "
+        read -r yn || return 0
+        case "$yn" in ""|1) role=node; break ;; 2) role=balancer; break ;; esac
+        echo -e "    ${Y}1 или 2${NC}"
+    done
+    [ "$role" = balancer ] || while true; do
         printf "  IP панели Remnawave ${DIM}[Enter — оставить плейсхолдер <PANEL_IP>]${NC}: "
         read -r pip
         [ -z "$pip" ] || is_ipv4 "$pip" && break
         echo -e "    ${Y}это не IPv4-адрес${NC} ${DIM}(firewall.nft ждёт именно IPv4)${NC}"
     done
-    while true; do
+    [ "$role" = balancer ] || while true; do
         printf "  NODE_PORT (панель→нода) ${DIM}[Enter — автодетект из .env/docker]${NC}: "
         read -r np
         [ -z "$np" ] || is_port "$np" && break
@@ -208,16 +249,106 @@ menu_protect() {
     done
     nb=$(netbird_cidr) && echo -e "    ${DIM}NetBird на ноде: подсеть $nb${NC}"
     while true; do
-        printf "  SSH пускать с ${DIM}[Enter — авто: подсеть NetBird, если зашёл через неё, иначе твой IP]${NC}: "
+        printf "  SSH пускать с ${DIM}[Enter — авто: подсеть NetBird, если зашёл через неё, иначе твой IP; any — с любого]${NC}: "
         read -r sf
+        case "$sf" in any|all) sf=any; break ;; esac
         [ -z "$sf" ] || ipv4_net "$sf" >/dev/null && break
-        echo -e "    ${Y}нужен IPv4 или подсеть${NC} ${DIM}(напр. ${nb:-100.92.0.0/16})${NC}"
+        echo -e "    ${Y}нужен IPv4, подсеть или any${NC} ${DIM}(напр. ${nb:-100.92.0.0/16})${NC}"
     done
-    local args=()
+    [ "$role" = balancer ] || while true; do
+        printf "  Hysteria2 (HY2/QUIC) на 443/udp есть? ${DIM}[y/n]${NC}: "
+        read -r yn || return 0
+        case "$yn" in y|Y|yes|д|да) hy=y; break ;; n|N|no|н|нет) hy=n; break ;; esac
+        echo -e "    ${Y}ответь y или n${NC} ${DIM}(n — 443/udp будет закрыт)${NC}"
+    done
+    while true; do
+        printf "  Доверенные IP/подсети мимо per-IP лимитов 443 ${DIM}[через пробел, Enter — нет]${NC}: "
+        _read_nets && break
+    done
+    trust=(${_NETS[@]+"${_NETS[@]}"})
+    yn=n
+    [ "$role" = balancer ] || while true; do
+        printf "  Открыть порт для мостов/балансеров (xray + proxy-protocol) только пулу IP? ${DIM}[y/n]${NC}: "
+        read -r yn || return 0
+        case "$yn" in y|Y|yes|д|да|n|N|no|н|нет|"") break ;; esac
+        echo -e "    ${Y}ответь y или n${NC}"
+    done
+    if case "$yn" in y|Y|yes|д|да) true ;; *) false ;; esac; then
+        while true; do
+            printf "  Порт мостов ${DIM}[Enter — 8443]${NC}: "
+            read -r bp; bp=${bp:-8443}
+            is_port "$bp" && break
+            echo -e "    ${Y}порт — это число 1-65535${NC}"
+        done
+        while true; do
+            printf "  IP/подсети мостов и балансеров ${DIM}[через пробел; можно позже: rr protect bridge add]${NC}: "
+            _read_nets && break
+        done
+        bridge=(${_NETS[@]+"${_NETS[@]}"})
+    fi
+    args+=(--role "$role")
     [ -n "$pip" ] && args+=(--panel-ip "$pip")
     [ -n "$np" ]  && args+=(--node-port "$np")
     [ -n "$sf" ]  && args+=(--ssh-from "$sf")
-    run protect ${args[@]+"${args[@]}"}
+    [ "$role" = node ] && args+=(--hy2 "$hy")
+    for n in ${trust[@]+"${trust[@]}"}; do args+=(--trust "$n"); done
+    [ -n "$bp" ] && args+=(--bridge-port "$bp")
+    for n in ${bridge[@]+"${bridge[@]}"}; do args+=(--bridge-from "$n"); done
+    run protect "${args[@]}"
+}
+
+menu_protect_nets() {   # trust|bridge
+    local k=$1 c p
+    if [ "$k" = trust ]; then
+        echo -e "  ${BOLD}Доверенные IP${NC} ${DIM}(set trusted4/6: 443 мимо per-IP лимитов)${NC}"
+    else
+        echo -e "  ${BOLD}Мосты и балансеры${NC} ${DIM}(порт мостов открыт только пулу bridge4/6)${NC}"
+    fi
+    run protect "$k" list
+    echo
+    echo -e "    ${C}${BOLD}[1]${NC} Добавить IP/подсети"
+    echo -e "    ${C}${BOLD}[2]${NC} Удалить IP/подсети"
+    [ "$k" = bridge ] && echo -e "    ${C}${BOLD}[3]${NC} Порт мостов ${DIM}(число или off)${NC}"
+    echo -e "    ${C}${BOLD}[0]${NC} Назад"
+    printf "  ${BOLD}Выбор${NC}: "; read -r c; echo
+    case "$c" in
+        1|2)
+            while true; do
+                printf "  IP/подсети через пробел ${DIM}(v4/v6)${NC}: "
+                _read_nets && break
+            done
+            [ "${#_NETS[@]}" -gt 0 ] || return 0
+            if [ "$c" = 1 ]; then run protect "$k" add "${_NETS[@]}"; else run protect "$k" del "${_NETS[@]}"; fi ;;
+        3)
+            [ "$k" = bridge ] || return 0
+            printf "  Порт мостов ${DIM}[Enter — 8443, off — закрыть]${NC}: "; read -r p
+            run protect bridge port "${p:-8443}" ;;
+        *) return 0 ;;
+    esac
+}
+
+menu_balancer() {
+    if [ ! -t 0 ]; then run balancer status; return; fi
+    echo -e "  ${BOLD}Балансер nginx${NC} ${DIM}(stream + ssl_preread: SNI → upstream'ы нод с proxy-protocol)${NC}"
+    run balancer list
+    echo
+    echo -e "    ${C}${BOLD}[1]${NC} Установить / переустановить ${DIM}nginx stable с nginx.org + маршруты${NC}"
+    echo -e "    ${C}${BOLD}[2]${NC} Добавить / изменить маршрут"
+    echo -e "    ${C}${BOLD}[3]${NC} Удалить маршрут"
+    echo -e "    ${C}${BOLD}[4]${NC} SNI по умолчанию"
+    echo -e "    ${C}${BOLD}[5]${NC} Статус ${DIM}(nginx, доступность upstream'ов)${NC}"
+    echo -e "    ${C}${BOLD}[0]${NC} Назад"
+    printf "  ${BOLD}Выбор${NC} ${DIM}[0-5]${NC}: "; local c sni ups; read -r c; echo
+    case "$c" in
+        1) run balancer install ;;
+        2) printf "  SNI (домен или *.домен): "; read -r sni
+           printf "  upstream'ы (HOST:PORT через запятую, напр. 80.79.117.98:8443): "; read -r ups
+           [ -n "$sni" ] && [ -n "$ups" ] && run balancer add "$sni" "$ups" ;;
+        3) printf "  SNI: "; read -r sni; [ -n "$sni" ] && run balancer del "$sni" ;;
+        4) printf "  SNI: "; read -r sni; [ -n "$sni" ] && run balancer default "$sni" ;;
+        5) run balancer status ;;
+        *) return 0 ;;
+    esac
 }
 
 menu_install() {
@@ -304,6 +435,7 @@ case "$cmd" in
     install|setup)         run install "$@" ;;
     shape|shaper)          run shape "$@" ;;
     guard|ddos)            run guard "$@" ;;
+    balancer|lb)           run balancer "$@" ;;
     ssh-port|sshport)      run sshport "$@" ;;
     certs|cert|ssl)        run certs "$@" ;;
     warp)                  run warp "$@" ;;
