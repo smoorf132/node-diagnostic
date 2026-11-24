@@ -117,7 +117,7 @@ else
 fi
 # trusted — раньше лимитов 443, порт мостов — раньше финального drop
 lt=$(grep -n '"nd:trusted"' "$hb/firewall.nft" | head -1 | cut -d: -f1)
-lc=$(grep -n 'meter conn443_4' "$hb/firewall.nft" | cut -d: -f1)
+lc=$(grep -n 'add @conn443_4' "$hb/firewall.nft" | cut -d: -f1)
 lb=$(grep -n 'tcp dport 8443 ip saddr @bridge4 counter accept comment "nd:bridge"' "$hb/firewall.nft" | cut -d: -f1)
 ld=$(grep -n 'node_protect drop' "$hb/firewall.nft" | cut -d: -f1)
 [ -n "$lt" ] && [ -n "$lc" ] && [ "$lt" -lt "$lc" ] && [ -n "$lb" ] && [ "$lb" -lt "$ld" ] \
@@ -158,6 +158,57 @@ if command -v nft >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
     nft -c -f "$hb/firewall.nft" >/dev/null 2>&1 && ok "nft -c (HY2 + trusted v4/v6 + мосты)" || bad "nft -c (HY2 + trusted + мосты)"
 fi
 rm -rf "$hb" "$ng"
+
+echo "== protect: лимиты (set'ы с timeout, /64), флаги TCP, banned6, SSH any, балансер =="
+lm=$(mktemp -d)
+BAN_NETS="185.224.228.0/22 2001:db8:dead::/48" bash modules/protect.sh --panel-ip 203.0.113.5 --node-port 2222 \
+    --ssh-from any --hy2 y --bridge-port 8443 --bridge-from 80.79.117.98 --out "$lm" >/dev/null 2>&1
+f="$lm/firewall.nft"
+# ни одного meter'а: у всех лимитов set с size, у rate-лимитов ещё и timeout
+! grep -q 'meter ' "$f" \
+    && grep -q 'set syn443_4 { type ipv4_addr; size 131072; flags dynamic,timeout; timeout 30s; }' "$f" \
+    && grep -q 'set conn443_6 { type ipv6_addr; size 65536; flags dynamic; }' "$f" \
+    && grep -q 'set udp443_4 { type ipv4_addr; size 131072; flags dynamic,timeout; timeout 30s; }' "$f" \
+    && ok "protect: лимиты в set'ах с size/timeout, без meter" || bad "protect: meter/set'ы лимитов"
+[ "$(grep -c 'ip6 saddr and ffff:ffff:ffff:ffff::' "$f")" -ge 5 ] && ! grep -qE '@(syn443|conn443|udp443|icmp)6 \{ ip6 saddr limit|\{ ip6 saddr ct count' "$f" \
+    && ok "protect: v6-лимиты по /64" || bad "protect: v6-лимиты не по /64"
+# каждый лимитирующий drop — со счётчиком
+! grep -E 'limit rate over|ct count over' "$f" | grep -v 'counter drop' | grep -q 'drop' \
+    && [ "$(grep -cE '(limit rate over|ct count over).*counter drop' "$f")" -ge 10 ] \
+    && ok "protect: счётчики на лимитирующих drop" || bad "protect: drop лимита без counter"
+grep -q 'udp dport 443 meta nfproto ipv4 ct state untracked @th,64,1 1' "$f" \
+    && grep -q 'udp dport 443 meta nfproto ipv4 ct state new' "$f" \
+    && ok "protect: HY2 под guard — лимит только QUIC Long Header" || bad "protect: udp443 под NOTRACK"
+grep -A4 'set banned6' "$f" | grep -q 'elements = { 2001:db8:dead::/48 }' \
+    && [ "$(grep -c 'ip6 saddr @banned6 counter drop' "$f")" = 2 ] \
+    && ok "protect: banned6 (input + forward)" || bad "protect: banned6"
+lf=$(grep -n 'tcp flags & (fin|syn) == (fin|syn) counter drop' "$f" | cut -d: -f1)
+le=$(grep -n 'ct state established,related accept' "$f" | cut -d: -f1)
+[ -n "$lf" ] && [ "$lf" -gt "$le" ] && grep -q 'tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 counter drop' "$f" \
+    && ok "protect: невозможные TCP-флаги после established" || bad "protect: фильтр TCP-флагов"
+grep -q 'tcp dport 22 ct state new meta nfproto ipv6' "$f" && grep -qE '^        tcp dport 22 accept$' "$f" \
+    && ! grep -q 'tcp dport 22 ip saddr' "$f" && grep -q 'ufw allow 22/tcp' "$lm/firewall-ufw.sh" \
+    && grep -q 'SSH_FROM="any"' "$lm/protect.conf" && grep -q 'с ЛЮБОГО адреса' "$lm/APPLY.txt" \
+    && ok "protect --ssh-from any: SSH всем + rate-limit v4/v6" || bad "protect --ssh-from any"
+bash modules/protect.sh --trust 0.0.0.0/0 --out "$lm" </dev/null >/dev/null 2>&1 && bad "--trust 0.0.0.0/0 принят" || ok "--trust /0 отвергнут"
+bash modules/protect.sh trust add 10.0.0.0/4 --out "$lm" </dev/null >/dev/null 2>&1 && bad "trust add /4 без подтверждения принят" || ok "trust add: широкий префикс без подтверждения отвергнут"
+ND_WIDE_OK=1 bash modules/protect.sh bridge add 10.0.0.0/7 --out "$lm" </dev/null >/dev/null 2>&1 \
+    && grep -q '10.0.0.0/7' "$lm/protect.conf" && ok "ND_WIDE_OK=1 пропускает широкий префикс" || bad "ND_WIDE_OK"
+ba=$(mktemp -d)
+bash modules/protect.sh --role balancer --ssh-from 198.51.100.2 --hy2 y --bridge-port 8443 --out "$ba" >/dev/null 2>&1
+! grep -qE 'panel_ip|udp dport|dport 8443|dport 2222|<NODE_PORT>|<PANEL_IP>' "$ba/firewall.nft" \
+    && grep -q 'tcp dport 443 accept' "$ba/firewall.nft" && grep -q 'tcp dport 80 accept' "$ba/firewall.nft" \
+    && grep -q '"nd:trusted"' "$ba/firewall.nft" && ! grep -q 'control-API' "$ba/firewall-ufw.sh" \
+    && grep -q 'ROLE="balancer"' "$ba/protect.conf" && grep -q 'HY2="n"' "$ba/protect.conf" \
+    && ok "protect --role balancer: 443/80/SSH, без панели/UDP/мостов" || bad "protect --role balancer"
+bash modules/protect.sh bridge add 192.0.2.1 --out "$ba" >/dev/null 2>&1 && bad "bridge на балансере принят" || ok "bridge на балансере отвергнут"
+if command -v nft >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+    nft -c -f "$f" >/dev/null 2>&1 && ok "nft -c (SSH any + HY2 + мосты + banned6)" \
+        || { bad "nft -c (SSH any + HY2 + мосты + banned6)"; nft -c -f "$f" 2>&1 | head -5 | sed 's/^/      /'; }
+    nft -c -f "$ba/firewall.nft" >/dev/null 2>&1 && ok "nft -c (балансер)" \
+        || { bad "nft -c (балансер)"; nft -c -f "$ba/firewall.nft" 2>&1 | head -5 | sed 's/^/      /'; }
+fi
+rm -rf "$lm" "$ba"
 
 echo "== rollback --dry-run =="
 bash modules/rollback.sh --dry-run >/dev/null 2>&1 && ok "rollback dry-run" || bad "rollback dry-run"
@@ -491,7 +542,7 @@ bash modules/guard.sh status >/dev/null 2>&1 && ok "guard status (выключе
 bash node-diagnostic.sh help | grep -q 'guard' && ok "help: guard" || bad "help: guard"
 bash node-diagnostic.sh guard help >/dev/null 2>&1 && ok "dispatcher guard" || bad "dispatcher guard"
 [ "$(grep -c 'tcp flags & (fin|syn|rst|ack) == syn' "$out/firewall.nft")" = 2 ] \
-  && ! grep -B1 'meter syn443_' "$out/firewall.nft" | grep -q 'ct state new' \
+  && ! grep -B1 'update @syn443_' "$out/firewall.nft" | grep -q 'ct state new' \
   && ok "protect: SYN-rate работает и под NOTRACK" || bad "protect: syn443 на ct state new"
 
 echo

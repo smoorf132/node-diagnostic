@@ -47,7 +47,7 @@ node-diagnostic.sh v$ND_VERSION — модульный тулкит ноды (Re
                                  Тюнинг: sysctl/BBR/FD-лимиты/RPS-RFS-XPS/NIC/MSS/irqbalance/journald
                                  --all включает irqbalance+journald; --zram (zram-swap) — только явно
                                  --from-findings — только фиксы по находкам последней диагностики
-  protect  [--panel-ip IP] [--node-port N] [--ssh-from IP|CIDR] [--out DIR]
+  protect  [--role node|balancer] [--panel-ip IP] [--node-port N] [--ssh-from IP|CIDR|any] [--out DIR]
            [--hy2 y|n] [--trust IP|CIDR]... [--bridge-port N|off] [--bridge-from IP|CIDR]...
                                  Защита под Remnawave (firewall/SSH) — ГЕНЕРАЦИЯ, не применяет
                                  SSH по умолчанию: подсеть NetBird, если сессия через неё, иначе твой IP
@@ -227,15 +227,21 @@ _read_nets() {
 
 menu_protect_gen() {
     echo -e "  ${BOLD}Генерация firewall/SSH${NC} ${DIM}(ничего не применяет)${NC}"
-    local pip np sf nb hy bp="" yn n
+    local pip="" np="" sf nb hy=n bp="" yn n role=node
     local -a args=() trust=() bridge=()
     while true; do
+        printf "  Что это за сервер? ${DIM}[1 — нода Remnawave, 2 — балансер nginx; Enter — нода]${NC}: "
+        read -r yn || return 0
+        case "$yn" in ""|1) role=node; break ;; 2) role=balancer; break ;; esac
+        echo -e "    ${Y}1 или 2${NC}"
+    done
+    [ "$role" = balancer ] || while true; do
         printf "  IP панели Remnawave ${DIM}[Enter — оставить плейсхолдер <PANEL_IP>]${NC}: "
         read -r pip
         [ -z "$pip" ] || is_ipv4 "$pip" && break
         echo -e "    ${Y}это не IPv4-адрес${NC} ${DIM}(firewall.nft ждёт именно IPv4)${NC}"
     done
-    while true; do
+    [ "$role" = balancer ] || while true; do
         printf "  NODE_PORT (панель→нода) ${DIM}[Enter — автодетект из .env/docker]${NC}: "
         read -r np
         [ -z "$np" ] || is_port "$np" && break
@@ -243,12 +249,13 @@ menu_protect_gen() {
     done
     nb=$(netbird_cidr) && echo -e "    ${DIM}NetBird на ноде: подсеть $nb${NC}"
     while true; do
-        printf "  SSH пускать с ${DIM}[Enter — авто: подсеть NetBird, если зашёл через неё, иначе твой IP]${NC}: "
+        printf "  SSH пускать с ${DIM}[Enter — авто: подсеть NetBird, если зашёл через неё, иначе твой IP; any — с любого]${NC}: "
         read -r sf
+        case "$sf" in any|all) sf=any; break ;; esac
         [ -z "$sf" ] || ipv4_net "$sf" >/dev/null && break
-        echo -e "    ${Y}нужен IPv4 или подсеть${NC} ${DIM}(напр. ${nb:-100.92.0.0/16})${NC}"
+        echo -e "    ${Y}нужен IPv4, подсеть или any${NC} ${DIM}(напр. ${nb:-100.92.0.0/16})${NC}"
     done
-    while true; do
+    [ "$role" = balancer ] || while true; do
         printf "  Hysteria2 (HY2/QUIC) на 443/udp есть? ${DIM}[y/n]${NC}: "
         read -r yn || return 0
         case "$yn" in y|Y|yes|д|да) hy=y; break ;; n|N|no|н|нет) hy=n; break ;; esac
@@ -258,8 +265,9 @@ menu_protect_gen() {
         printf "  Доверенные IP/подсети мимо per-IP лимитов 443 ${DIM}[через пробел, Enter — нет]${NC}: "
         _read_nets && break
     done
-    trust=("${_NETS[@]}")
-    while true; do
+    trust=(${_NETS[@]+"${_NETS[@]}"})
+    yn=n
+    [ "$role" = balancer ] || while true; do
         printf "  Открыть порт для мостов/балансеров (xray + proxy-protocol) только пулу IP? ${DIM}[y/n]${NC}: "
         read -r yn || return 0
         case "$yn" in y|Y|yes|д|да|n|N|no|н|нет|"") break ;; esac
@@ -276,12 +284,13 @@ menu_protect_gen() {
             printf "  IP/подсети мостов и балансеров ${DIM}[через пробел; можно позже: rr protect bridge add]${NC}: "
             _read_nets && break
         done
-        bridge=("${_NETS[@]}")
+        bridge=(${_NETS[@]+"${_NETS[@]}"})
     fi
+    args+=(--role "$role")
     [ -n "$pip" ] && args+=(--panel-ip "$pip")
     [ -n "$np" ]  && args+=(--node-port "$np")
     [ -n "$sf" ]  && args+=(--ssh-from "$sf")
-    args+=(--hy2 "$hy")
+    [ "$role" = node ] && args+=(--hy2 "$hy")
     for n in ${trust[@]+"${trust[@]}"}; do args+=(--trust "$n"); done
     [ -n "$bp" ] && args+=(--bridge-port "$bp")
     for n in ${bridge[@]+"${bridge[@]}"}; do args+=(--bridge-from "$n"); done

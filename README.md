@@ -153,15 +153,27 @@ sudo bash node-diagnostic.sh protect --panel-ip <IP_панели> --ssh-from 100
 ```
 
 Откуда пускать SSH:
+- `--ssh-from any` — с любого адреса, без ограничения по IP. Остаётся rate-limit 6 соединений/мин на IP (v6 — на /64); брут режут CrowdSec и вход только по ключу, в `APPLY.txt` оба шага обязательны. Лок-аута при смене домашнего IP нет.
 - `--ssh-from IP|CIDR` — явно. Хост-биты обнуляются, поэтому можно передать адрес ноды в том виде, в каком его отдаёт NetBird: `100.92.13.5/16` → `100.92.0.0/16`.
 - Без флага, если текущая SSH-сессия пришла **через NetBird** (её IP входит в подсеть интерфейса `wt0` или `netbird status`), SSH открывается всей подсети NetBird. С публичного IP SSH тогда закрыт, а `APPLY.txt` предупреждает о рисках: при падении NetBird вход останется только через VNC-консоль хостера.
 - Иначе SSH открывается только с IP текущей сессии. Если на ноде есть NetBird, модуль подскажет нужный `--ssh-from`.
 
 Из меню то же самое без флагов: пункт **[3]** → **[1]** спросит IP панели, NODE_PORT, откуда пускать SSH (Enter — автодетект/плейсхолдер), есть ли HY2 (y/n), доверенные IP и порт мостов с пулом.
 
+### Лимиты и фильтры
+
+- Per-IP лимиты (`conn443`, `syn443`, `udp443`, ICMP, SSH) живут в set'ах с `size` и `timeout` (v4 — до `RL_SIZE4=131072` адресов, v6 — до `RL_SIZE6=65536`, `RL_TIMEOUT=30s`). У прежних `meter` записи не истекали: set забивался, и для новых адресов лимит молча переставал действовать.
+- IPv6-лимиты считаются по /64: по /128 их обходили перебором адресов внутри своей сети.
+- HY2 под guard (NOTRACK): лимит `udp443` считает только QUIC Long Header (рукопожатие), поток данных не душится. Без guard — только новые потоки, как раньше. С обфускацией Salamander под guard подними `UDP_RATE`.
+- У каждого лимитирующего `drop` есть `counter` — видно, кого режут: `nft list chain inet node_protect input | grep -E 'counter packets [1-9]'`.
+- Невозможные комбинации TCP-флагов (SYN+FIN, SYN+RST, null, xmas) отбрасываются после `established`: под NOTRACK `ct state invalid` их не ловит.
+- `BAN_NETS` принимает и IPv6 — set `banned6`, drop в input и forward.
+- Роль `--role balancer` — firewall для сервера балансера: 443/80 всем с теми же per-IP лимитами, trusted, SSH. Без NODE_PORT, панели, UDP и порта мостов (`protect bridge` там отказывает).
+
 ### HY2, trusted, порт мостов/балансеров
 
 - **`--hy2 y|n`** — есть ли Hysteria2/QUIC на 443/udp. `n` закрывает 443/udp и в `firewall.nft`, и в `firewall-ufw.sh`. Без флага — как раньше, открыт (меню спрашивает явно).
+- Широкие префиксы в trusted и bridge: `/0` не принимается никогда, короче `/8` (v4) и `/32` (v6) — только с подтверждением в терминале или `ND_WIDE_OK=1`. trusted `/0` выключил бы лимиты всем, а bridge `/0` открыл бы порт с proxy-protocol всем: подмена IP клиента ломает учёт IP в Remnawave.
 - **trusted4/6** (`--trust IP|CIDR`, повторяемый, v4 и v6) — адреса, которые на 443 проходят **мимо per-IP лимитов** (`conn443` 2048 соединений, `syn443` 200 SYN/с): CGNAT-шлюзы, мосты, которые ходят на 443. Правила `nd:trusted` стоят до лимитов, `banned4` сильнее.
 - **порт мостов** (`--bridge-port 8443`, пул `--bridge-from IP|CIDR`) — порт для мостов и балансеров (xray с proxy-protocol). Открыт **только** пулу `bridge4/6`, лимитов нет: за одним IP балансера идут все его клиенты. Порт не может совпасть с 443/80/SSH/NODE_PORT. Пустой пул — порт закрыт для всех.
 
@@ -202,6 +214,7 @@ sudo rr balancer render                                  # показать ngin
 - Маршруты лежат в `/etc/node-diagnostic/balancer.conf`. Из него целиком генерируется `/etc/nginx/nginx.conf`: шаблон с `map $ssl_preread_server_name $backend { hostnames; … }`, маски `*.domain`, IPv6-upstream'ы `[2001:db8::1]:8443`. Прежний файл сохраняется в `nginx.conf.nd-bak-<время>`. Если `nginx -t` не прошёл, он возвращается, иначе — `reload`.
 - Отличия от исходного шаблона: `user` — `www-data` или `nginx`, `listen [::]` — только если на хосте есть IPv6.
 - Порты 80 и 443 должен держать только nginx, иначе установка откажет.
+- Firewall самого балансера: `rr protect --role balancer` (443/80 всем с per-IP лимитами, SSH — твой IP или `any`).
 
 На каждой ноде за балансером: `rr protect bridge port 8443 && rr protect bridge add <IP балансера>`. У inbound'а xray на этом порту должен стоять `sockopt.acceptProxyProtocol: true`, иначе xray не разберёт PROXY-заголовок. Меню: **[13]**, также `install balancer`.
 

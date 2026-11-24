@@ -408,6 +408,8 @@ bal_install() {
     msg_info "на каждой ноде за балансером — порт мостов только для этого IP:"
     msg_info "  rr protect bridge port 8443 && rr protect bridge add $(_bal_src_ip || true)"
     [ "$BAL_PP" = on ] && msg_info "и у inbound ноды на этом порту — sockopt.acceptProxyProtocol: true (иначе xray не поймёт заголовок)"
+    msg_info "firewall самого балансера (443/80 всем с per-IP лимитами, SSH — только твой IP или any):"
+    msg_info "  rr protect --role balancer   # генерация + APPLY.txt, как для ноды"
 }
 
 balancer_main() {

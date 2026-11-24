@@ -5,7 +5,8 @@
 # удалённой ноде может отрезать SSH, поэтому применяешь руками, сверив IP панели/SSH.
 # Анти-брут SSH — CrowdSec, ставится отдельно: node-diagnostic.sh install crowdsec.
 #
-# Standalone:  sudo bash modules/protect.sh [--panel-ip X.X.X.X] [--node-port N] [--ssh-from IP|CIDR] [--out DIR]
+# Standalone:  sudo bash modules/protect.sh [--role node|balancer] [--panel-ip X.X.X.X] [--node-port N]
+#              [--ssh-from IP|CIDR|any] [--out DIR]
 #              [--hy2 y|n] [--trust IP|CIDR]... [--bridge-port N|off] [--bridge-from IP|CIDR]...
 # На лету:     protect trust {add|del} IP|CIDR… | trust list
 #              protect bridge {add|del} IP|CIDR… | bridge port N|off | bridge list
@@ -52,7 +53,8 @@ _BAN_FROM_ENV=${BAN_NETS+1}
 PROTECT_OUT="${PROTECT_OUT:-}"
 PANEL_IP="${PANEL_IP:-}"
 NODE_PORT="${NODE_PORT:-}"
-SSH_FROM="${SSH_FROM:-}"      # откуда пускать SSH: IP или CIDR (пусто — авто: NetBird / твой IP)
+SSH_FROM="${SSH_FROM:-}"      # откуда пускать SSH: IP, CIDR или any (пусто — авто: NetBird / твой IP)
+ROLE="${ROLE:-}"              # node (по умолчанию) | balancer — сервер балансера: без NODE_PORT/панели/мостов/HY2
 HY2="${HY2:-}"                # Hysteria2/QUIC на 443/udp: y|n (пусто — из protect.conf, иначе y)
 # доверенные (set trusted4/6): на 443 мимо per-IP лимитов — CGNAT-шлюзы, мосты, ходящие на 443
 TRUST_NETS="${TRUST_NETS:-}"
@@ -62,7 +64,7 @@ BRIDGE_NETS="${BRIDGE_NETS:-}"
 # куда класть копию firewall.nft для автозагрузки; trust/bridge обновляют её, если она уже есть
 PROTECT_PERSIST="${PROTECT_PERSIST:-/etc/nftables.d/node_protect.nft}"
 # ключи <out>/protect.conf: параметры прошлой генерации, их берут повторный protect и trust/bridge
-PROTECT_CONF_KEYS="GENERATED PANEL_IP NODE_PORT SSH_FROM HY2 TRUST_NETS BRIDGE_PORT BRIDGE_NETS BAN_NETS"
+PROTECT_CONF_KEYS="GENERATED ROLE PANEL_IP NODE_PORT SSH_FROM HY2 TRUST_NETS BRIDGE_PORT BRIDGE_NETS BAN_NETS"
 GENERATED=""
 
 # per-IP лимиты в nft (из практики node-accelerator)
@@ -71,6 +73,10 @@ SYN_RATE="${SYN_RATE:-200}"
 UDP_RATE="${UDP_RATE:-200}"
 ICMP_RATE="${ICMP_RATE:-10}"
 SSH_RATE="${SSH_RATE:-6}"     # соединений/мин на IP
+# per-IP лимиты живут в set'ах с size и timeout: v4 — до RL_SIZE4 адресов, v6 (по /64) — до RL_SIZE6
+RL_SIZE4="${RL_SIZE4:-131072}"
+RL_SIZE6="${RL_SIZE6:-65536}"
+RL_TIMEOUT="${RL_TIMEOUT:-30s}"
 
 # перманентный бан подсетей (set banned4, drop раньше любых accept). BAN_NETS="" — без бана
 BAN_NETS="${BAN_NETS-185.224.228.0/22 195.209.120.0/22 212.192.156.0/23 212.192.158.0/24 194.165.22.0/23}"
@@ -106,9 +112,30 @@ _nets_clean() {
     local n c out=""
     for n in $1; do
         c=$(net_norm "$n") || { msg_warn "$2: «${n}» не IP/подсеть — пропускаю" >&2; continue; }
+        case "$c" in */0) msg_warn "$2: $c — весь интернет, пропускаю" >&2; continue ;; esac
         out=$(_nets_add "$out" "$c")
     done
     echo "$out"
+}
+
+# _net_wide_ok NET ЧТО — /0 не берём никогда (trusted /0 выключил бы лимиты всем, bridge /0 открыл
+# бы порт с proxy-protocol всем — подмена IP клиента); короче /8 (v4) или /32 (v6) — только с
+# подтверждением в терминале или ND_WIDE_OK=1. rc 1 — отказ
+_net_wide_ok() {
+    local p=${1#*/} min=8
+    case "$1" in */*) ;; *) return 0 ;; esac
+    case "$1" in *:*) min=32 ;; esac
+    if [ "$p" -eq 0 ]; then
+        msg_err "$2: $1 — это весь интернет, не беру" >&2; return 1
+    fi
+    [ "$p" -ge "$min" ] && return 0
+    [ "${ND_WIDE_OK:-0}" = 1 ] && return 0
+    if [ -t 0 ]; then
+        confirm "$2: $1 — очень широкий префикс (/$p). Точно?" && return 0
+        return 1
+    fi
+    msg_err "$2: $1 — очень широкий префикс (/$p); подтверди в терминале или задай ND_WIDE_OK=1" >&2
+    return 1
 }
 
 # каталог артефактов (и protect.conf): --out / PROTECT_OUT, иначе /root/… под root, ./… без root
@@ -124,7 +151,7 @@ protect_conf_load() {
     local f="$1/protect.conf" line k v
     CONF_PRESENT=" "
     # shellcheck disable=SC2034  # часть читается только косвенно (${!v} в protect_live)
-    CONF_GENERATED="" CONF_PANEL_IP="" CONF_NODE_PORT="" CONF_SSH_FROM="" CONF_HY2=""
+    CONF_GENERATED="" CONF_ROLE="" CONF_PANEL_IP="" CONF_NODE_PORT="" CONF_SSH_FROM="" CONF_HY2=""
     CONF_TRUST_NETS="" CONF_BRIDGE_PORT="" CONF_BRIDGE_NETS="" CONF_BAN_NETS=""
     [ -r "$f" ] || return 1
     while IFS= read -r line || [ -n "$line" ]; do
@@ -168,6 +195,8 @@ protect_generate() {
     [ -z "$PANEL_IP" ]  && PANEL_IP=$CONF_PANEL_IP
     [ -z "$NODE_PORT" ] && NODE_PORT=$CONF_NODE_PORT
     [ -z "$SSH_FROM" ]  && SSH_FROM=$CONF_SSH_FROM
+    [ -z "$ROLE" ]      && ROLE=$CONF_ROLE
+    case "${ROLE:-node}" in node|balancer) ROLE=${ROLE:-node} ;; *) die "protect: --role ждёт node или balancer, получено: $ROLE" ;; esac
     [ -z "$HY2" ]       && HY2=$CONF_HY2
     [ -z "$BRIDGE_PORT" ] && BRIDGE_PORT=$CONF_BRIDGE_PORT
     if [ -z "$_BAN_FROM_ENV" ]; then
@@ -175,9 +204,14 @@ protect_generate() {
     fi
     HY2=$(_yn "${HY2:-y}") || die "protect: --hy2 ждёт y или n, получено: $HY2"
     [ "$BRIDGE_PORT" = off ] && BRIDGE_PORT=""
+    if [ "$ROLE" = balancer ]; then
+        # балансер — nginx stream по TCP: ни UDP, ни порта мостов, ни канала панели
+        HY2=n; PANEL_IP=""; NODE_PORT=""
+        [ -n "$BRIDGE_PORT" ] && { msg_warn "балансер: порт мостов не нужен — пропускаю $BRIDGE_PORT"; BRIDGE_PORT=""; }
+    fi
     TRUST_NETS=$(_nets_clean "$CONF_TRUST_NETS $TRUST_NETS" TRUST_NETS)
     BRIDGE_NETS=$(_nets_clean "$CONF_BRIDGE_NETS $BRIDGE_NETS" BRIDGE_NETS)
-    [ -z "$NODE_PORT" ] && NODE_PORT=$(detect_node_port || echo "")
+    [ "$ROLE" = node ] && [ -z "$NODE_PORT" ] && NODE_PORT=$(detect_node_port || echo "")
     if [ -n "$BRIDGE_PORT" ]; then
         [[ "$BRIDGE_PORT" =~ ^[0-9]+$ ]] && [ "$BRIDGE_PORT" -ge 1 ] && [ "$BRIDGE_PORT" -le 65535 ] \
             || die "protect: порт мостов — число 1-65535 или off, получено: $BRIDGE_PORT"
@@ -187,7 +221,9 @@ protect_generate() {
     fi
     # откуда пускать SSH: явный --ssh-from → вся подсеть NetBird, если текущая сессия
     # пришла через неё (админ ходит по NetBird) → IP текущей сессии
-    if [ -n "$SSH_FROM" ]; then
+    if [ "$SSH_FROM" = any ]; then
+        ssh_src=any
+    elif [ -n "$SSH_FROM" ]; then
         ssh_src="$SSH_FROM"
         case "$ssh_src" in */*) ssh_src=$(ipv4_net "$ssh_src" || echo "$ssh_src") ;; esac
     elif [ -n "$nb" ] && [ -n "$ssh_ip" ] && ip_in_cidr "$ssh_ip" "$nb"; then
@@ -206,28 +242,38 @@ protect_generate() {
     [ -z "$ph_ssh" ]   && ph_ssh="<YOUR_SSH_IP>"
 
     echo
-    ui_head "Генерация защиты ноды" "Remnawave · только генерация файлов"
-    echo -e "    ${DIM}SSH-порт:${NC} $ssh_port   ${DIM}SSH разрешён с:${NC} $ph_ssh"
+    if [ "$ROLE" = balancer ]; then
+        ui_head "Генерация защиты балансера" "nginx stream · только генерация файлов"
+    else
+        ui_head "Генерация защиты ноды" "Remnawave · только генерация файлов"
+    fi
+    echo -e "    ${DIM}SSH-порт:${NC} $ssh_port   ${DIM}SSH разрешён с:${NC} $([ "$ph_ssh" = any ] && echo "любого адреса (только rate-limit)" || echo "$ph_ssh")"
     [ -n "$nb" ] && echo -e "    ${DIM}NetBird:${NC} ${nb_addr%/*} ${DIM}(подсеть $nb)${NC}"
-    echo -e "    ${DIM}NODE_PORT (control-API):${NC} ${NODE_PORT:-<не найден, укажи --node-port>}"
-    echo -e "    ${DIM}IP панели:${NC} $ph_panel"
-    if [ "$HY2" = y ]; then echo -e "    ${DIM}HY2/QUIC:${NC} да ${DIM}(443/udp открыт)${NC}"
-    else echo -e "    ${DIM}HY2/QUIC:${NC} нет ${DIM}(443/udp закрыт)${NC}"; fi
+    if [ "$ROLE" = node ]; then
+        echo -e "    ${DIM}NODE_PORT (control-API):${NC} ${NODE_PORT:-<не найден, укажи --node-port>}"
+        echo -e "    ${DIM}IP панели:${NC} $ph_panel"
+        if [ "$HY2" = y ]; then echo -e "    ${DIM}HY2/QUIC:${NC} да ${DIM}(443/udp открыт)${NC}"
+        else echo -e "    ${DIM}HY2/QUIC:${NC} нет ${DIM}(443/udp закрыт)${NC}"; fi
+    fi
     [ -n "$TRUST_NETS" ] && echo -e "    ${DIM}trusted (443 мимо per-IP лимитов):${NC} $TRUST_NETS"
     if [ -n "$BRIDGE_PORT" ]; then
         echo -e "    ${DIM}порт мостов/балансеров:${NC} $BRIDGE_PORT ${DIM}← только${NC} ${BRIDGE_NETS:-${Y}пул пуст — порт закрыт для всех${NC}}"
     fi
     echo -e "    ${DIM}каталог:${NC} $out"
     echo
-    [ "$ph_panel" = "<PANEL_IP>" ] && msg_warn "IP панели не задан — в правилах плейсхолдер <PANEL_IP>, подставь перед применением (--panel-ip)"
-    [ -z "$NODE_PORT" ] && msg_warn "NODE_PORT не найден — плейсхолдер <NODE_PORT>, подставь (--node-port)"
+    if [ "$ROLE" = node ]; then
+        [ "$ph_panel" = "<PANEL_IP>" ] && msg_warn "IP панели не задан — в правилах плейсхолдер <PANEL_IP>, подставь перед применением (--panel-ip)"
+        [ -z "$NODE_PORT" ] && msg_warn "NODE_PORT не найден — плейсхолдер <NODE_PORT>, подставь (--node-port)"
+    fi
     # SSH-источник внутри NetBird (пир/подсеть) или накрывает её (100.64.0.0/10)
     local via_nb=0
     if [ -n "$nb" ] && { ip_in_cidr "${ph_ssh%/*}" "$nb" || ip_in_cidr "${nb_addr%/*}" "$ph_ssh"; }; then
         via_nb=1
     fi
-    if [ "$ph_ssh" = "<YOUR_SSH_IP>" ]; then
-        msg_warn "SSH-IP не определён (не по SSH?) — подставь свой IP вручную или задай --ssh-from"
+    if [ "$ph_ssh" = any ]; then
+        msg_warn "SSH открыт с любого адреса — защита: rate-limit ${SSH_RATE}/мин на IP, CrowdSec, вход только по ключу (sshd-hardening.conf)"
+    elif [ "$ph_ssh" = "<YOUR_SSH_IP>" ]; then
+        msg_warn "SSH-IP не определён (не по SSH?) — подставь свой IP вручную или задай --ssh-from (any — без ограничения)"
     elif [ "$via_nb" = "1" ]; then
         msg_warn "SSH будет открыт ТОЛЬКО из NetBird ($ph_ssh) — упадёт NetBird на ноде, вход останется только через VNC-консоль хостера"
     else
@@ -235,14 +281,15 @@ protect_generate() {
         [ -n "$nb" ] && msg_info "SSH только через NetBird: перегенерируй с --ssh-from $nb (и зайди через NetBird)"
     fi
     # текущая сессия вне разрешённого источника — firewall её оборвёт (IPv6 не сверяем)
-    case "$ssh_ip$ph_ssh" in *:*|*"<"*) ;; *)
+    case "$ssh_ip$ph_ssh" in *:*|*"<"*|*any) ;; *)
         [ -n "$ssh_ip" ] && ! ip_in_cidr "$ssh_ip" "$ph_ssh" \
             && msg_warn "текущая сессия ($ssh_ip) не входит в $ph_ssh — firewall её оборвёт: перед применением зайди через NetBird"
     esac
-    # бан-подсети: хост-биты обнуляются, не-IPv4 пропускается; свой SSH/панель в бане = лок-аут
-    local n n2 bn ban=""
+    # бан-подсети: v4 → banned4, v6 → banned6, хост-биты обнуляются; свой SSH/панель в бане = лок-аут
+    local n n2 bn ban="" ban6=""
     for n in $BAN_NETS; do
-        bn=$(ipv4_net "$n") || { msg_warn "BAN_NETS: «${n}» не IPv4-подсеть — пропускаю"; continue; }
+        bn=$(net_norm "$n") || { msg_warn "BAN_NETS: «${n}» не IP-подсеть — пропускаю"; continue; }
+        case "$bn" in *:*) ban6="$ban6${ban6:+, }$bn"; continue ;; esac
         ban="$ban${ban:+, }$bn"
         ip_in_cidr "${ph_ssh%/*}" "$bn" && msg_warn "SSH-источник $ph_ssh в забаненной подсети $bn — firewall отрежет SSH"
         ip_in_cidr "$ph_panel" "$bn" && msg_warn "IP панели $ph_panel в забаненной подсети $bn — нода потеряет панель"
@@ -254,7 +301,7 @@ protect_generate() {
     [ -n "$BRIDGE_PORT" ] && [ -z "$BRIDGE_NETS" ] \
         && msg_warn "порт мостов $BRIDGE_PORT без пула — закрыт для всех; добавить: protect bridge add <IP>"
 
-    _gen_nft   "$out" "$ssh_port" "$ph_ssh" "$ph_panel" "${NODE_PORT:-<NODE_PORT>}" "$ban"
+    _gen_nft   "$out" "$ssh_port" "$ph_ssh" "$ph_panel" "${NODE_PORT:-<NODE_PORT>}" "$ban" "$ban6"
     _gen_ufw   "$out" "$ssh_port" "$ph_ssh" "$ph_panel" "${NODE_PORT:-<NODE_PORT>}"
     _gen_sshd  "$out"
     _gen_apply "$out" "$ssh_port" "$ph_ssh" "$via_nb" "$nb_addr"
@@ -279,36 +326,80 @@ _nft_set() {
     printf '    }\n'
 }
 
-# Глобалы (их готовит protect_generate): HY2 y|n, TRUST_NETS, BRIDGE_PORT, BRIDGE_NETS.
-# Правила trusted/bridge помечены comment "nd:trusted" / "nd:bridge" — по ним protect trust|bridge
-# находит и правит их в живой таблице.
+# _nft_dset ИМЯ ТИП РАЗМЕР [TIMEOUT] — динамический set для per-IP лимитов. С timeout записи
+# истекают сами; size явный: у meter'а без них set забивался (65535 записей навсегда), а на полном
+# set'е update не срабатывает — лимит молча выключался для новых адресов (fail-open).
+_nft_dset() {
+    if [ -n "${4:-}" ]; then
+        printf '    set %s { type %s; size %s; flags dynamic,timeout; timeout %s; }\n' "$1" "$2" "$3" "$4"
+    else
+        printf '    set %s { type %s; size %s; flags dynamic; }\n' "$1" "$2" "$3"
+    fi
+}
+
+# Глобалы (их готовит protect_generate): ROLE node|balancer, HY2 y|n, TRUST_NETS, BRIDGE_PORT,
+# BRIDGE_NETS. Правила trusted/bridge помечены comment "nd:trusted" / "nd:bridge" — по ним
+# protect trust|bridge находит и правит их в живой таблице.
+# Ключ IPv6-лимитов — /64 (K6): у клиента обычно целая /64, по /128 лимит обходится перебором адресов.
 _gen_nft() {
-    local out=$1 ssh_port=$2 ssh_ip=$3 panel=$4 node_port=$5 ban=$6
+    local out=$1 ssh_port=$2 ssh_ip=$3 panel=$4 node_port=$5 ban=$6 ban6=$7
+    local K6="ip6 saddr and ffff:ffff:ffff:ffff::"
 
     # семейство адреса → правильный синтаксис saddr (dual-stack: v6 больше не игнорируется)
-    local ssh_saddr="ip saddr" panel_type="ipv4_addr" panel_saddr="ip saddr"
-    case "$ssh_ip" in *:*) ssh_saddr="ip6 saddr" ;; esac
+    local ssh_saddr="ip saddr" ssh_set=ssh_rate4 ssh_key="ip saddr" panel_type="ipv4_addr" panel_saddr="ip saddr"
+    case "$ssh_ip" in *:*) ssh_saddr="ip6 saddr"; ssh_set=ssh_rate6; ssh_key=$K6 ;; esac
     case "$panel"  in *:*) panel_type="ipv6_addr"; panel_saddr="ip6 saddr" ;; esac
 
-    local ports="443/tcp (VLESS/Reality)" udp_rules="" trusted_udp="" bridge_rules=""
+    local ports="443/tcp (VLESS/Reality)" ssh_rules udp_rules="" trusted_udp="" bridge_rules="" panel_rules=""
+    local what="Remnawave-ноды"
+    if [ "$ROLE" = balancer ]; then
+        what="балансера (nginx stream: SNI → ноды)"; ports="443/tcp (SNI → upstream'ы нод)"
+    else
+        ports="$ports, NODE_PORT (control-API) — только с IP панели"
+        panel_rules="
+        # NODE_PORT — канал панель->нода, ТОЛЬКО с IP панели
+        tcp dport $node_port $panel_saddr @panel_ip accept
+"
+    fi
+    if [ "$ssh_ip" = any ]; then
+        ssh_rules="        # SSH — с любого адреса (protect --ssh-from any): только rate-limit; брут режут CrowdSec и вход по ключу
+        tcp dport $ssh_port ct state new meta nfproto ipv4 \\
+            update @ssh_rate4 { ip saddr limit rate over ${SSH_RATE}/minute } counter drop
+        tcp dport $ssh_port ct state new meta nfproto ipv6 \\
+            update @ssh_rate6 { $K6 limit rate over ${SSH_RATE}/minute } counter drop
+        tcp dport $ssh_port accept"
+    else
+        ssh_rules="        # SSH — только с $ssh_ip (IP или подсеть, напр. NetBird) + анти-брут по скорости соединений
+        tcp dport $ssh_port $ssh_saddr $ssh_ip ct state new \\
+            update @$ssh_set { $ssh_key limit rate over ${SSH_RATE}/minute } counter drop
+        tcp dport $ssh_port $ssh_saddr $ssh_ip accept"
+    fi
     if [ "$HY2" = y ]; then
-        ports="443/tcp (VLESS/Reality) + 443/udp (HY2/QUIC)"
+        ports="$ports, 443/udp (HY2/QUIC)"
         trusted_udp="
         ip saddr @trusted4 udp dport 443 counter accept comment \"nd:trusted\"
         ip6 saddr @trusted6 udp dport 443 counter accept comment \"nd:trusted\""
+        # без guard лимит видит только новые потоки (дальше — established). Под guard (NOTRACK) поток
+        # untracked: лимит на каждый пакет срезал бы HY2 до ~2 Мбит/с на IP, поэтому считаем только
+        # QUIC Long Header (старший бит первого байта — рукопожатие), 1-RTT Short Header идёт мимо.
         udp_rules="
-        # 443/udp — Hysteria2/QUIC (protect --hy2 y)
-        udp dport 443 ip saddr 0.0.0.0/0 \\
-            meter udp443_4 { ip saddr limit rate over ${UDP_RATE}/second } drop
-        udp dport 443 ip6 saddr ::/0 \\
-            meter udp443_6 { ip6 saddr limit rate over ${UDP_RATE}/second } drop
+        # 443/udp — Hysteria2/QUIC (protect --hy2 y): новые потоки; под guard — только QUIC Long Header
+        udp dport 443 meta nfproto ipv4 ct state new \\
+            update @udp443_4 { ip saddr limit rate over ${UDP_RATE}/second } counter drop
+        udp dport 443 meta nfproto ipv6 ct state new \\
+            update @udp443_6 { $K6 limit rate over ${UDP_RATE}/second } counter drop
+        udp dport 443 meta nfproto ipv4 ct state untracked @th,64,1 1 \\
+            update @udp443_4 { ip saddr limit rate over ${UDP_RATE}/second } counter drop
+        udp dport 443 meta nfproto ipv6 ct state untracked @th,64,1 1 \\
+            update @udp443_6 { $K6 limit rate over ${UDP_RATE}/second } counter drop
         udp dport 443 accept"
     fi
     if [ -n "$BRIDGE_PORT" ]; then
         ports="$ports, $BRIDGE_PORT/tcp (мосты/балансеры — только пул bridge4/6)"
         bridge_rules="
         # $BRIDGE_PORT — мосты и балансеры (xray + proxy-protocol): ТОЛЬКО пул bridge4/6, лимитов нет —
-        # за одним IP балансера идут все его клиенты. Пул: protect bridge add|del <IP|CIDR>
+        # за одним IP балансера идут все его клиенты. Пул: protect bridge add|del <IP|CIDR>.
+        # Порт идёт через conntrack (guard его не берёт): nf_conntrack_max масштабирует optimize
         tcp dport $BRIDGE_PORT ip saddr @bridge4 counter accept comment \"nd:bridge\"
         tcp dport $BRIDGE_PORT ip6 saddr @bridge6 counter accept comment \"nd:bridge\"
 "
@@ -317,27 +408,40 @@ _gen_nft() {
     {
     cat <<EOF
 #!/usr/sbin/nft -f
-# node-diagnostic: firewall для Remnawave-ноды. Своя таблица, ruleset не флашится (уживается с Docker).
+# node-diagnostic: firewall $what. Своя таблица, ruleset не флашится (уживается с Docker).
 # Применить:  sudo nft -f $out/firewall.nft
-# Порты: $ports, 80 (ACME), NODE_PORT (control-API) — только с IP панели.
-# SSH ограничен по семейству твоего адреса ($ssh_saddr), 443 лимитируется и для v4, и для v6.
+# Порты: $ports, 80 (ACME/редирект).
+# SSH: $([ "$ssh_ip" = any ] && echo "с любого адреса, только rate-limit" || echo "только $ssh_ip ($ssh_saddr)"). Лимиты 443 — и для v4, и для v6 (v6 — по /64).
 
 table inet node_protect
 delete table inet node_protect
 table inet node_protect {
-    set panel_ip {
-        type $panel_type
-        elements = { $panel }
-    }
-    # перманентный бан подсетей (BAN_NETS). Добавить на лету: nft add element inet node_protect banned4 { X/N }
 EOF
+    if [ "$ROLE" != balancer ]; then
+        printf '    set panel_ip {\n        type %s\n        elements = { %s }\n    }\n' "$panel_type" "$panel"
+    fi
+    echo "    # перманентный бан подсетей (BAN_NETS). На лету: nft add element inet node_protect banned4|banned6 { X/N }"
     _nft_set banned4 ipv4_addr "$ban"
+    _nft_set banned6 ipv6_addr "$ban6"
     echo "    # доверенные — на 443 мимо per-IP лимитов (CGNAT, мосты на 443). На лету: protect trust add|del"
     _nft_set trusted4 ipv4_addr "$(_nets_fam "$TRUST_NETS" 4)"
     _nft_set trusted6 ipv6_addr "$(_nets_fam "$TRUST_NETS" 6)"
     echo "    # мосты/балансеры — единственные, кому открыт порт мостов. На лету: protect bridge add|del|port"
     _nft_set bridge4 ipv4_addr "$(_nets_fam "$BRIDGE_NETS" 4)"
     _nft_set bridge6 ipv6_addr "$(_nets_fam "$BRIDGE_NETS" 6)"
+    echo "    # состояние per-IP лимитов: size + timeout — записи истекают, set не забивается навсегда"
+    _nft_dset icmp4 ipv4_addr "$RL_SIZE6" "$RL_TIMEOUT"
+    _nft_dset icmp6 ipv6_addr "$RL_SIZE6" "$RL_TIMEOUT"
+    _nft_dset ssh_rate4 ipv4_addr "$RL_SIZE6" 5m
+    _nft_dset ssh_rate6 ipv6_addr "$RL_SIZE6" 5m
+    _nft_dset conn443_4 ipv4_addr "$RL_SIZE4"
+    _nft_dset conn443_6 ipv6_addr "$RL_SIZE6"
+    _nft_dset syn443_4 ipv4_addr "$RL_SIZE4" "$RL_TIMEOUT"
+    _nft_dset syn443_6 ipv6_addr "$RL_SIZE6" "$RL_TIMEOUT"
+    if [ "$HY2" = y ]; then
+        _nft_dset udp443_4 ipv4_addr "$RL_SIZE4" "$RL_TIMEOUT"
+        _nft_dset udp443_6 ipv6_addr "$RL_SIZE6" "$RL_TIMEOUT"
+    fi
     cat <<EOF
     chain input {
         type filter hook input priority 0; policy drop;
@@ -345,45 +449,45 @@ EOF
         iif "lo" accept
         # бан раньше established — рвёт и уже открытые сессии из этих подсетей
         ip saddr @banned4 counter drop
+        ip6 saddr @banned6 counter drop
         ct state established,related accept
-        ct state invalid drop
+        ct state invalid counter drop
+        # невозможные комбинации TCP-флагов: под guard (NOTRACK) ct state invalid их не ловит,
+        # а ответ ядра RST на такие пакеты — материал для fingerprint'а
+        tcp flags & (fin|syn) == (fin|syn) counter drop
+        tcp flags & (syn|rst) == (syn|rst) counter drop
+        tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 counter drop
+        tcp flags & (fin|psh|urg) == (fin|psh|urg) counter drop
 
-        # ICMP нужен для PMTU — не резать полностью, только флуд (per-IP)
-        ip  protocol icmp   meter icmp4 { ip  saddr limit rate over ${ICMP_RATE}/second } drop
-        ip6 nexthdr icmpv6  meter icmp6 { ip6 saddr limit rate over ${ICMP_RATE}/second } drop
+        # ICMP нужен для PMTU — не резать полностью, только флуд (per-IP, v6 — per-/64)
+        ip  protocol icmp  update @icmp4 { ip saddr limit rate over ${ICMP_RATE}/second } counter drop
+        ip6 nexthdr icmpv6 update @icmp6 { $K6 limit rate over ${ICMP_RATE}/second } counter drop
         ip  protocol icmp   accept
         ip6 nexthdr icmpv6  accept
 
-        # SSH — только с $ssh_ip (IP или подсеть, напр. NetBird) + анти-брут по скорости соединений
-        tcp dport $ssh_port $ssh_saddr $ssh_ip ct state new \\
-            meter ssh_rate { $ssh_saddr limit rate over ${SSH_RATE}/minute } drop
-        tcp dport $ssh_port $ssh_saddr $ssh_ip accept
+$ssh_rules
 
         # доверенные (trusted4/6) — до лимитов: один IP за многими клиентами упёрся бы в conn443/syn443
         ip saddr @trusted4 tcp dport 443 counter accept comment "nd:trusted"
         ip6 saddr @trusted6 tcp dport 443 counter accept comment "nd:trusted"$trusted_udp
 
         # 443 — публичный вход. Per-IP лимит одновременных соединений и SYN-rate.
-        # (ct count вне meter считал бы ВСЕ соединения порта разом — душил бы ноду целиком)
-        # Отдельные meter'ы для v4 и v6 — key ip saddr не матчит v6-пакеты, они бы обошли лимит.
+        # (ct count вне set'а считал бы ВСЕ соединения порта разом — душил бы ноду целиком)
         # Под guard (NOTRACK на 443) ct не видит соединений: conn443 (ct count) не действует, а SYN-rate
         # считается по флагу SYN, не по ct state new — SYN-флуд закрывает guard (rr guard on).
-        tcp dport 443 ip saddr 0.0.0.0/0 ct state new \\
-            meter conn443_4 { ip saddr ct count over $CONN_LIMIT } drop
-        tcp dport 443 ip6 saddr ::/0 ct state new \\
-            meter conn443_6 { ip6 saddr ct count over $CONN_LIMIT } drop
-        tcp dport 443 ip saddr 0.0.0.0/0 tcp flags & (fin|syn|rst|ack) == syn \\
-            meter syn443_4 { ip saddr limit rate over ${SYN_RATE}/second burst $((SYN_RATE*2)) packets } drop
-        tcp dport 443 ip6 saddr ::/0 tcp flags & (fin|syn|rst|ack) == syn \\
-            meter syn443_6 { ip6 saddr limit rate over ${SYN_RATE}/second burst $((SYN_RATE*2)) packets } drop
+        tcp dport 443 meta nfproto ipv4 ct state new \\
+            add @conn443_4 { ip saddr ct count over $CONN_LIMIT } counter drop
+        tcp dport 443 meta nfproto ipv6 ct state new \\
+            add @conn443_6 { $K6 ct count over $CONN_LIMIT } counter drop
+        tcp dport 443 meta nfproto ipv4 tcp flags & (fin|syn|rst|ack) == syn \\
+            update @syn443_4 { ip saddr limit rate over ${SYN_RATE}/second burst $((SYN_RATE*2)) packets } counter drop
+        tcp dport 443 meta nfproto ipv6 tcp flags & (fin|syn|rst|ack) == syn \\
+            update @syn443_6 { $K6 limit rate over ${SYN_RATE}/second burst $((SYN_RATE*2)) packets } counter drop
         tcp dport 443 accept$udp_rules
 
-        # 80 — ACME HTTP-01 / редирект
+        # 80 — ACME HTTP-01 / редирект на https
         tcp dport 80 accept
-
-        # NODE_PORT — канал панель->нода, ТОЛЬКО с IP панели
-        tcp dport $node_port $panel_saddr @panel_ip accept
-$bridge_rules
+$panel_rules$bridge_rules
         # остальное — в лог и drop
         limit rate 5/minute log prefix "node_protect drop: " level info
         counter drop
@@ -392,11 +496,18 @@ $bridge_rules
         type filter hook forward priority 0; policy accept;
         # бан и для трафика в docker-bridge (после DNAT он идёт сюда, а не в input)
         ip saddr @banned4 counter drop
+        ip6 saddr @banned6 counter drop
+EOF
+    if [ "$ROLE" != balancer ]; then
+        cat <<EOF
         # Если remnanode крутится в docker BRIDGE-сети (порт опубликован через -p),
         # трафик к нему проходит DNAT и попадает сюда, а НЕ в input — правило
         # NODE_PORT выше его не видит. Тогда раскомментируй (фильтр по исходному dport):
         # ct original proto-dst $node_port ip saddr != @panel_ip ct state new drop
         # Для штатного remnanode с network_mode: host это не нужно — работает input.
+EOF
+    fi
+    cat <<EOF
     }
     chain output  { type filter hook output  priority 0; policy accept; }
 }
@@ -405,8 +516,15 @@ EOF
 }
 
 _gen_ufw() {
-    local out=$1 ssh_port=$2 ssh_ip=$3 panel=$4 node_port=$5 n udp="" bridge=""
+    local out=$1 ssh_port=$2 ssh_ip=$3 panel=$4 node_port=$5 n udp="" bridge="" ssh panel_line=""
     [ "$HY2" = y ] && udp="ufw allow 443/udp comment 'HY2/QUIC'"
+    if [ "$ssh_ip" = any ]; then
+        ssh="ufw allow $ssh_port/tcp comment 'SSH (с любого адреса — брут режет CrowdSec)'"
+    else
+        ssh="ufw allow from $ssh_ip to any port $ssh_port proto tcp comment 'SSH (только $ssh_ip)'"
+    fi
+    [ "$ROLE" != balancer ] \
+        && panel_line="ufw allow from $panel to any port $node_port proto tcp comment 'Remnawave control-API (панель)'"
     if [ -n "$BRIDGE_PORT" ]; then
         bridge="# порт мостов/балансеров $BRIDGE_PORT — только пул (в ufw правится руками: ufw allow from <IP> to any port $BRIDGE_PORT proto tcp)"
         for n in $BRIDGE_NETS; do
@@ -422,14 +540,14 @@ set -e
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow from $ssh_ip to any port $ssh_port proto tcp comment 'SSH (только $ssh_ip)'
-ufw allow 443/tcp comment 'VLESS/Reality'
+$ssh
+ufw allow 443/tcp comment '$([ "$ROLE" = balancer ] && echo "балансер (SNI → ноды)" || echo "VLESS/Reality")'
 $udp
-ufw allow 80/tcp comment 'ACME'
-ufw allow from $panel to any port $node_port proto tcp comment 'Remnawave control-API (панель)'
+ufw allow 80/tcp comment 'ACME / редирект'
+$panel_line
 $bridge
-# ВАЖНО: НЕ добавляй «ufw limit $ssh_port/tcp» — limit в ufw это ALLOW отовсюду
-# (с рейт-лимитом): такое правило открыло бы SSH всему интернету и обесценило
+# ВАЖНО: НЕ добавляй «ufw limit $ssh_port/tcp» поверх правила по IP — limit в ufw это ALLOW
+# отовсюду (с рейт-лимитом): такое правило открыло бы SSH всему интернету и обесценило
 # ограничение по IP выше. Анти-брут делает CrowdSec (node-diagnostic.sh install crowdsec).
 ufw --force enable
 ufw status verbose
@@ -465,10 +583,30 @@ EOF
 }
 
 _gen_apply() {
-    local out=$1 ssh_port=$2 ssh_ip=$3 via_nb=$4 nb_addr=$5 nd ssh_note nb_ip nb_net
+    local out=$1 ssh_port=$2 ssh_ip=$3 via_nb=$4 nb_addr=$5 nd ssh_note nb_ip nb_net before portmap
     nd="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)/node-diagnostic.sh"
     nb_ip="${nb_addr%/*}"; nb_net=$(ipv4_net "$nb_addr" 2>/dev/null)
-    if [ "$via_nb" = "1" ]; then
+    if [ "$ROLE" = balancer ]; then
+        before="ПЕРЕД ВСЕМ: убедись, что вместо <YOUR_SSH_IP> подставлен твой SSH-IP (если он в правилах).
+  Файлы: firewall.nft / firewall-ufw.sh."
+        portmap="Карта портов балансера: 443 (SNI → upstream'ы нод), 80 (редирект на https), SSH.
+Порт мостов, NODE_PORT и UDP здесь не нужны. На нодах за балансером: rr protect bridge add <IP балансера>."
+    else
+        before="ПЕРЕД ВСЕМ: убедись, что в правилах подставлены реальные значения —
+  IP панели вместо <PANEL_IP>, NODE_PORT вместо <NODE_PORT>, твой SSH-IP вместо <YOUR_SSH_IP>.
+  Файлы: firewall.nft / firewall-ufw.sh."
+        portmap="Карта портов Remnawave-ноды: 443 (вход), 80 (ACME), NODE_PORT (панель->нода, только IP панели),
+61000/localhost и Caddy :9443/localhost наружу НЕ открываются.
+⚠ remnanode в docker BRIDGE (порт через -p): фильтр NODE_PORT в input его не видит
+  (трафик идёт через forward после DNAT) — раскомментируй правило в chain forward
+  файла firewall.nft. Штатный remnanode с network_mode: host — ничего не нужно."
+    fi
+    if [ "$ssh_ip" = any ]; then
+        ssh_note="⚠ SSH открыт с ЛЮБОГО адреса (protect --ssh-from any): лок-аута по смене IP нет, но порт виден
+  всему интернету. Защита — rate-limit $SSH_RATE соединений/мин на IP (v6 — на /64) в firewall.nft,
+  CrowdSec (шаг 2) и вход только по ключу (шаг 3) — оба шага здесь обязательны.
+  Вернуть ограничение по IP: protect --ssh-from <IP|CIDR>."
+    elif [ "$via_nb" = "1" ]; then
         ssh_note="⚠ SSH открыт ТОЛЬКО из NetBird «${ssh_ip}» — с публичного IP вход закрыт.
   Заходи по NetBird-IP ноды: ssh root@${nb_ip:-<NETBIRD_IP>}  (кому из пиров можно — решают ACL NetBird).
   Упадёт NetBird на ноде (демон, management, смена сети) — вход только через VNC/serial-
@@ -482,8 +620,8 @@ _gen_apply() {
   Варианты до применения:
     · вписать вместо одного IP подсеть провайдера (whois $ssh_ip → route/CIDR),
       в firewall.nft: «ip saddr 203.0.113.0/24», в ufw: «from 203.0.113.0/24»;
-    · или убрать ограничение по IP и оставить только rate-limit + CrowdSec
-      (nft: убери «ip saddr …» из SSH-правил; ufw: «ufw limit $ssh_port/tcp»);
+    · или убрать ограничение по IP и оставить только rate-limit + CrowdSec:
+      protect --ssh-from any (перегенерирует nft и ufw);
     · ходишь через NetBird — пусти SSH из его подсети: protect --ssh-from ${nb_net:-100.x.0.0/16};
     · применяешь как есть — убедись, что VNC-консоль хостера реально работает."
     fi
@@ -491,9 +629,7 @@ _gen_apply() {
 ================  node-diagnostic · применение защиты  ================
 Всё сгенерировано, НО НЕ ПРИМЕНЕНО. Порядок безопасного наката на удалённой ноде.
 
-ПЕРЕД ВСЕМ: убедись, что в правилах подставлены реальные значения —
-  IP панели вместо <PANEL_IP>, NODE_PORT вместо <NODE_PORT>, твой SSH-IP вместо <YOUR_SSH_IP>.
-  Файлы: firewall.nft / firewall-ufw.sh.
+$before
 
 $ssh_note
 
@@ -548,15 +684,17 @@ $ssh_note
   node_protect (если она загружена) и обновляют $PROTECT_PERSIST (если он есть). SSH не трогают.
   HY2 сейчас: $([ "$HY2" = y ] && echo "да — 443/udp открыт" || echo "нет — 443/udp закрыт"); поменять: protect --hy2 y|n (остальное возьмётся из protect.conf).
   Включён guard --geo ru, а trusted не из России — тот же IP в rr guard allow <IP> (порт мостов guard не фильтрует).
+  Порт мостов идёт через conntrack: под пиковую нагрузку через балансер nf_conntrack_max должен быть
+  с запасом — его масштабирует rr optimize, заполнение показывает rr diagnose (чек Conntrack).
+  Широкие префиксы: /0 не принимается вовсе, короче /8 (v4) и /32 (v6) — только с подтверждением.
 
 ⚠ guard (rr guard on) ставит NOTRACK на 443/80: conn443 (ct count) при включённом guard не действует,
   SYN-флуд закрывает guard; SYN-rate (syn443) считается по флагу SYN и работает и под NOTRACK.
+  HY2 под guard: лимит udp443 считает только QUIC Long Header (рукопожатие) — поток данных не душится.
+  С обфускацией Salamander заголовки случайны: под guard подними UDP_RATE при генерации.
+Счётчики лимитов (кого режут): sudo nft list chain inet node_protect input | grep -E 'counter packets [1-9]'
 
-Карта портов Remnawave-ноды: 443 (вход), 80 (ACME), NODE_PORT (панель->нода, только IP панели),
-61000/localhost и Caddy :9443/localhost наружу НЕ открываются.
-⚠ remnanode в docker BRIDGE (порт через -p): фильтр NODE_PORT в input его не видит
-  (трафик идёт через forward после DNAT) — раскомментируй правило в chain forward
-  файла firewall.nft. Штатный remnanode с network_mode: host — ничего не нужно.
+$portmap
 ======================================================================
 EOF
 }
@@ -671,6 +809,8 @@ protect_live() {
         case "$CONF_PRESENT" in *" $k "*) v=CONF_$k; printf -v "$k" '%s' "${!v}" ;; esac
     done
     [ "$BRIDGE_PORT" = off ] && BRIDGE_PORT=""
+    [ "$kind" = bridge ] && [ "$ROLE" = balancer ] && [ "$act" != list ] \
+        && die "protect bridge: это балансер (ROLE=balancer в protect.conf) — порт мостов открывается на нодах"
     ssh_conf=$CONF_SSH_FROM
     if [ "$kind" = trust ]; then var=TRUST_NETS; else var=BRIDGE_NETS; fi
     case "$act" in
@@ -678,6 +818,7 @@ protect_live() {
             [ $# -gt 0 ] || die "protect $kind $act: укажи IP или подсеть (v4/v6), можно несколько"
             for n in "$@"; do
                 c=$(net_norm "$n") || die "protect $kind: «${n}» не IP/подсеть"
+                if [ "$act" = add ]; then _net_wide_ok "$c" "protect $kind add" || die "protect $kind: $c не принят"; fi
                 nets=$(_nets_add "$nets" "$c")
             done
             # shellcheck disable=SC2086
@@ -759,8 +900,10 @@ protect_main() {
             --out)       PROTECT_OUT="$2"; shift ;;
             --ssh-from)  SSH_FROM="$2"; shift ;;
             --hy2)       HY2=$(_yn "${2:-}") || die "protect: --hy2 ждёт y или n, получено: ${2:-}"; shift ;;
+            --role)      ROLE=${2:-}; case "$ROLE" in node|balancer) ;; *) die "protect: --role ждёт node или balancer, получено: $ROLE" ;; esac; shift ;;
             --trust|--bridge-from)
                 c=$(net_norm "${2:-}") || die "protect: $1 ждёт IP или подсеть (v4/v6), получено: ${2:-}"
+                _net_wide_ok "$c" "protect $1" || die "protect: $1 $c не принят"
                 if [ "$1" = --trust ]; then TRUST_NETS="$TRUST_NETS $c"; else BRIDGE_NETS="$BRIDGE_NETS $c"; fi
                 shift ;;
             --bridge-port)
@@ -772,8 +915,10 @@ protect_main() {
         esac
         shift
     done
+    # any/all/0.0.0.0/0/::/0 — SSH без ограничения по IP (только rate-limit)
+    case "$SSH_FROM" in any|all|ANY|0.0.0.0/0|::/0) SSH_FROM=any ;; esac
     # IPv4[/N] строго; IPv6 — грубо (уходит в ip6 saddr, nft -c отвергнет мусор)
-    if [ -n "$SSH_FROM" ] && ! ipv4_net "$SSH_FROM" >/dev/null && [[ ! "$SSH_FROM" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ || "$SSH_FROM" != *:* ]]; then
+    if [ -n "$SSH_FROM" ] && [ "$SSH_FROM" != any ] && ! ipv4_net "$SSH_FROM" >/dev/null && [[ ! "$SSH_FROM" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ || "$SSH_FROM" != *:* ]]; then
         die "protect: --ssh-from ждёт IP или подсеть (напр. 100.92.0.0/16), получено: $SSH_FROM"
     fi
     protect_generate
