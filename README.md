@@ -163,7 +163,7 @@ sudo bash node-diagnostic.sh protect --panel-ip <IP_панели> --ssh-from 100
 ### Лимиты и фильтры
 
 - Per-IP лимиты (`conn443`, `syn443`, `udp443`, ICMP, SSH) живут в set'ах с `size` и `timeout` (v4 — до `RL_SIZE4=131072` адресов, v6 — до `RL_SIZE6=65536`, `RL_TIMEOUT=30s`). У прежних `meter` записи не истекали: set забивался, и для новых адресов лимит молча переставал действовать.
-- IPv6-лимиты считаются по /64: по /128 их обходили перебором адресов внутри своей сети.
+- IPv6-лимиты считаются по /64: по /128 их обходили перебором адресов внутри своей сети. NDP со своего сегмента (`hoplimit 255`) идёт мимо лимита ICMPv6 (RFC 4890), иначе весь `fe80::/64` делил бы один бакет.
 - HY2 под guard (NOTRACK): лимит `udp443` считает только QUIC Long Header (рукопожатие), поток данных не душится. Без guard — только новые потоки, как раньше. С обфускацией Salamander под guard подними `UDP_RATE`.
 - У каждого лимитирующего `drop` есть `counter` — видно, кого режут: `nft list chain inet node_protect input | grep -E 'counter packets [1-9]'`.
 - Невозможные комбинации TCP-флагов (SYN+FIN, SYN+RST, null, xmas) отбрасываются после `established`: под NOTRACK `ct state invalid` их не ловит.

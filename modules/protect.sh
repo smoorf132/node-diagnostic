@@ -459,6 +459,9 @@ EOF
         tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 counter drop
         tcp flags & (fin|psh|urg) == (fin|psh|urg) counter drop
 
+        # NDP (соседи/роутер) — до лимита и без него (RFC 4890): весь fe80::/64 попал бы в один
+        # /64-бакет icmp6, и на шумном L2 нода теряла бы шлюз по IPv6. hoplimit 255 — только свой сегмент
+        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } ip6 hoplimit 255 accept
         # ICMP нужен для PMTU — не резать полностью, только флуд (per-IP, v6 — per-/64)
         ip  protocol icmp  update @icmp4 { ip saddr limit rate over ${ICMP_RATE}/second } counter drop
         ip6 nexthdr icmpv6 update @icmp6 { $K6 limit rate over ${ICMP_RATE}/second } counter drop

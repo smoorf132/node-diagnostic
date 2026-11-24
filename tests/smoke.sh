@@ -179,6 +179,10 @@ f="$lm/firewall.nft"
 grep -q 'udp dport 443 meta nfproto ipv4 ct state untracked @th,64,1 1' "$f" \
     && grep -q 'udp dport 443 meta nfproto ipv4 ct state new' "$f" \
     && ok "protect: HY2 под guard — лимит только QUIC Long Header" || bad "protect: udp443 под NOTRACK"
+ln=$(grep -n 'icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } ip6 hoplimit 255 accept' "$f" | cut -d: -f1)
+li=$(grep -n 'update @icmp6' "$f" | cut -d: -f1)
+[ -n "$ln" ] && [ -n "$li" ] && [ "$ln" -lt "$li" ] \
+    && ok "protect: NDP (hoplimit 255) до /64-лимита icmp6" || bad "protect: NDP под лимитом icmp6"
 grep -A4 'set banned6' "$f" | grep -q 'elements = { 2001:db8:dead::/48 }' \
     && [ "$(grep -c 'ip6 saddr @banned6 counter drop' "$f")" = 2 ] \
     && ok "protect: banned6 (input + forward)" || bad "protect: banned6"
