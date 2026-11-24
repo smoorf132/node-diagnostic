@@ -200,7 +200,7 @@ sudo rr balancer render                                  # показать ngin
 
 - nginx — **последняя stable из официального репозитория nginx.org**. apt (Debian/Ubuntu): ключ подписи сверяется по отпечатку `573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62`, pin 900 на origin nginx.org. dnf/yum: репозиторий `nginx-stable`. nginx дистрибутива конфликтует с пакетом nginx.org, поэтому модуль предлагает удалить его (`/etc/nginx` уходит в бэкап). Сборка без `--with-stream_ssl_preread_module` — отказ.
 - Маршруты лежат в `/etc/node-diagnostic/balancer.conf`. Из него целиком генерируется `/etc/nginx/nginx.conf`: шаблон с `map $ssl_preread_server_name $backend { hostnames; … }`, маски `*.domain`, IPv6-upstream'ы `[2001:db8::1]:8443`. Прежний файл сохраняется в `nginx.conf.nd-bak-<время>`. Если `nginx -t` не прошёл, он возвращается, иначе — `reload`.
-- Отличия от исходного шаблона: `worker_rlimit_nofile 140000` (у проксируемого соединения два fd, а `worker_connections 65535`), `user` — `www-data` или `nginx`, `listen [::]` — только если на хосте есть IPv6.
+- Отличия от исходного шаблона: `user` — `www-data` или `nginx`, `listen [::]` — только если на хосте есть IPv6.
 - Порты 80 и 443 должен держать только nginx, иначе установка откажет.
 
 На каждой ноде за балансером: `rr protect bridge port 8443 && rr protect bridge add <IP балансера>`. У inbound'а xray на этом порту должен стоять `sockopt.acceptProxyProtocol: true`, иначе xray не разберёт PROXY-заголовок. Меню: **[13]**, также `install balancer`.

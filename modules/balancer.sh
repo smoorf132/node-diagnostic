@@ -22,8 +22,9 @@ BALANCER_CONF="${BALANCER_CONF:-/etc/node-diagnostic/balancer.conf}"
 NGINX_CONF="${NGINX_CONF:-/etc/nginx/nginx.conf}"
 BAL_MARK="# node-diagnostic balancer"           # первая строка nginx.conf, который ведём мы
 BAL_WORKER_CONN=65535
-# у проксируемого соединения два fd (клиент + upstream): лимит ≥ 2 × worker_connections + запас
-BAL_RLIMIT=140000
+# как в исходном шаблоне. У проксируемого соединения два fd (клиент + upstream), так что на воркер
+# реально влезает ~35000 соединений, а не worker_connections 65535
+BAL_RLIMIT=70000
 # ключ подписи пакетов nginx.org (https://nginx.org/en/linux_packages.html) — отпечаток сверяется
 NGINX_KEY_URL="https://nginx.org/keys/nginx_signing.key"
 NGINX_KEY_FPR="573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"
@@ -134,7 +135,6 @@ $BAL_MARK — сгенерировано из $BALANCER_CONF, руками не 
 # Правка маршрутов: rr balancer add|del|default, затем применяется сам (nginx -t + reload).
 user $(bal_user);
 worker_processes auto;
-# ≥ 2 × worker_connections: у проксируемого соединения два fd (клиент + upstream)
 worker_rlimit_nofile $BAL_RLIMIT;
 pid /run/nginx.pid;
 error_log /var/log/nginx/error.log warn;
