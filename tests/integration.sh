@@ -154,7 +154,8 @@ if command -v nft >/dev/null 2>&1 && ip netns add ndprot 2>/dev/null; then
     rm -f "$lo/protect.conf"
     awk '/^    set (trusted|bridge)[46] \{/{skip=1} skip{ if ($0 ~ /^    \}/) skip=0; next } /"nd:/{next} {print}' \
         "$lo/firewall.nft" > "$lo/old.nft"
-    ip netns exec ndprot nft -f "$lo/old.nft" && ! grep -q trusted4 "$lo/old.nft" \
+    # комментарии с «trusted4» остаются — проверяем именно отсутствие set'ов и правил nd:*
+    ip netns exec ndprot nft -f "$lo/old.nft" && ! grep -qE 'set (trusted|bridge)[46] \{|"nd:' "$lo/old.nft" \
         && ok "старая таблица загружена" || bad "старая таблица не загрузилась"
     pp trust add 198.51.100.50
     lt=$(lnum 'ip saddr @trusted4 tcp dport 443'); lc=$(lnum 'conn443_4')
