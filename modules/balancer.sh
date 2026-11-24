@@ -175,11 +175,13 @@ EOF
         for d in ${BAL_UPS[i]}; do printf '        server %s;\n' "$d"; done
         printf '    }\n'
     done
+    # без deferred (TCP_DEFER_ACCEPT): в связке с ssl_preread часть клиентов висела в preread
+    # до preread_timeout (sni="" in=0 t=5.0 в access-логе) — проверено на проде 2026-11-24
     cat <<EOF
 
     server {
-        listen 443 reuseport deferred backlog=65535 so_keepalive=30s:10s:3;
-$([ "$v6" = 1 ] && echo "        listen [::]:443 reuseport deferred backlog=65535 so_keepalive=30s:10s:3;")
+        listen 443 reuseport backlog=65535 so_keepalive=30s:10s:3;
+$([ "$v6" = 1 ] && echo "        listen [::]:443 reuseport backlog=65535 so_keepalive=30s:10s:3;")
 
         ssl_preread on;
         preread_timeout 5s;

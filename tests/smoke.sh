@@ -384,7 +384,8 @@ if grep -qF 'map $ssl_preread_server_name $backend {' "$bc/nginx.conf" \
    && grep -qF 'server [2001:db8::1]:8443;' "$bc/nginx.conf" \
    && grep -q 'ssl_preread on;' "$bc/nginx.conf" && grep -qF 'proxy_pass $backend;' "$bc/nginx.conf" \
    && grep -q 'proxy_protocol on;' "$bc/nginx.conf" && grep -q 'preread_timeout 5s;' "$bc/nginx.conf" \
-   && grep -qF 'listen [::]:443 reuseport deferred backlog=65535 so_keepalive=30s:10s:3;' "$bc/nginx.conf" \
+   && grep -qF 'listen [::]:443 reuseport backlog=65535 so_keepalive=30s:10s:3;' "$bc/nginx.conf" \
+   && ! grep -q 'deferred' "$bc/nginx.conf" \
    && grep -q 'worker_rlimit_nofile 70000;' "$bc/nginx.conf" && grep -q 'worker_connections 65535;' "$bc/nginx.conf"; then
     ok "balancer: рендер (map hostnames, маска, IPv6-upstream, ssl_preread, proxy_protocol)"
 else

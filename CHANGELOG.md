@@ -41,6 +41,7 @@ WARP, IPv6 и команда `rr`. fail2ban заменён на CrowdSec; SSH м
 - Команда `guard` (алиас `ddos`) в диспетчере и `usage`, строка «Guard (DDoS)» в `rr status`; smoke: `help: guard`, диспетчер, SYN-rate в `protect`.
 
 ### Changed
+- **balancer: `listen 443` без `deferred`.** С TCP_DEFER_ACCEPT часть клиентов зависала в `ssl_preread` до `preread_timeout`: в логе `sni="" up=- in=0 t=5.0`, у пользователей нестабильное подключение. На проде без `deferred` всё стабильно, маршрутизация по SNI работает.
 - **protect: per-IP лимиты — set'ы с size и timeout вместо `meter`.** Записи meter'а не истекали: set забивался (65535), и на полном set'е лимит молча переставал действовать для новых адресов. Теперь `RL_SIZE4=131072`, `RL_SIZE6=65536`, `RL_TIMEOUT=30s` (SSH — 5 мин).
 - **protect: IPv6-лимиты по /64** (`ip6 saddr and ffff:ffff:ffff:ffff::`) — по /128 обходились перебором адресов. NDP (neighbor/router solicit/advert с `hoplimit 255`) пропускается до лимита: весь `fe80::/64` иначе делил бы один бакет, и на шумном L2 нода теряла бы шлюз по IPv6.
 - **protect: HY2 под guard** — `udp443` под NOTRACK считает только QUIC Long Header: раньше лимит на каждый пакет срезал HY2 до ~2 Мбит/с на IP. Без guard — только новые потоки.
