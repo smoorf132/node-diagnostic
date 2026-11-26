@@ -19,6 +19,7 @@ source "$_certs_self/../lib/dns.sh" 2>/dev/null \
     || { echo "не найден lib/dns.sh — нужен весь репозиторий (см. install.sh)" >&2; exit 1; }
 
 LE_LIVE="${LE_LIVE:-/etc/letsencrypt/live}"
+LE_ARCHIVE="${LE_ARCHIVE:-${LE_LIVE%/*}/archive}"
 LE_RENEWAL="${LE_RENEWAL:-/etc/letsencrypt/renewal}"
 NGINX_CONTAINER="remnawave-nginx"
 CERT_RENEW_DAYS=30            # продлеваем, когда осталось столько дней или меньше
@@ -273,20 +274,49 @@ configure_certbot_renewal_hooks() {   # <renewal.conf>
     fi
 }
 
+# Цель ссылки live/<d>/<f>.pem → archive/<d>/<f><N>.pem: относительная, как у certbot.
+# nginx ноды видит live/ и archive/ под /etc/nginx/ssl и /etc/nginx/archive — абсолютная
+# ссылка на /etc/letsencrypt/archive/… внутри контейнера битая.
+le_link_target() {   # <каталог в live/> <файл в archive/>
+    if [ "${LE_ARCHIVE%/*}" = "${LE_LIVE%/*}" ]; then
+        printf '../../%s/%s/%s' "${LE_ARCHIVE##*/}" "$1" "$2"
+    else
+        printf '%s/%s/%s' "$LE_ARCHIVE" "$1" "$2"
+    fi
+}
+
+# Абсолютные ссылки на archive/ (их делали прежние версии fix_letsencrypt_structure) →
+# относительные. rc 0 всегда; печатает, сколько ссылок переделано
+le_relativize_links() {   # <каталог в live/>
+    local d=$1 f t n=0
+    for f in "$LE_LIVE/$d"/*.pem; do
+        [ -L "$f" ] || continue
+        t=$(readlink "$f")
+        case "$t" in
+            "$LE_ARCHIVE/$d/"*) ln -sfn "$(le_link_target "$d" "${t##*/}")" "$f" && n=$((n + 1)) ;;
+        esac
+    done
+    [ "$n" -gt 0 ] && msg_info "$d: $n ссылок live/ → archive/ сделаны относительными (их видит nginx в контейнере)"
+    return 0
+}
+
 # live/ должен состоять из симлинков на последнюю версию в archive/ — после ручных
 # копирований certbot отказывается продлевать
 fix_letsencrypt_structure() {   # <каталог в live/>
-    local d=$1 live="$LE_LIVE/$1" archive="/etc/letsencrypt/archive/$1" conf="$LE_RENEWAL/$1.conf" ver f
+    local d=$1 live="$LE_LIVE/$1" archive="$LE_ARCHIVE/$1" conf="$LE_RENEWAL/$1.conf" ver f
     [ -d "$live" ] && [ -d "$archive" ] && [ -f "$conf" ] || return 1
     [ "$(grep '^archive_dir' "$conf" | cut -d= -f2 | tr -d ' ')" = "$archive" ] || {
         msg_warn "$d: archive_dir в $conf не совпадает с $archive — структуру не трогаю"; return 1; }
-    ver=$(find "$archive" -maxdepth 1 -name 'cert[0-9]*.pem' -printf '%f\n' 2>/dev/null \
-        | sed -E 's/cert([0-9]+)\.pem/\1/' | sort -n | tail -n1)
+    # последняя версия certN.pem (без find -printf — его нет в busybox)
+    ver=$(for f in "$archive"/cert*.pem; do
+              f=${f##*/cert}; f=${f%.pem}
+              [[ "$f" =~ ^[0-9]+$ ]] && echo "$f"
+          done | sort -n | tail -n1)
     [ -n "$ver" ] || return 1
     for f in cert chain fullchain privkey; do
         [ -f "$archive/$f$ver.pem" ] || { msg_warn "$d: нет $archive/$f$ver.pem"; return 1; }
         [ -f "$live/$f.pem" ] && [ ! -L "$live/$f.pem" ] && rm -f "$live/$f.pem"
-        ln -sf "$archive/$f$ver.pem" "$live/$f.pem"
+        ln -sfn "$(le_link_target "$d" "$f$ver.pem")" "$live/$f.pem"
         grep -q "^$f = $live/$f.pem" "$conf" || sed -i "s|^$f =.*|$f = $live/$f.pem|" "$conf"
     done
     configure_certbot_renewal_hooks "$conf"
@@ -497,7 +527,7 @@ certs_issue() {   # [домен]
         msg_ok "выпущен: $LE_LIVE/$CERT_LINEAGE"
     fi
     record_fix "certs issue $domain → $CERT_LINEAGE"
-    msg_info "уже запущенная нода новый сертификат сама не подхватит — пути в $REMNANODE_DIR/nginx.conf и docker-compose.yml"
+    msg_info "чтобы нода отвечала сайтом на $domain: rr node domain add $domain"
 }
 
 # [3] Свой сертификат
@@ -509,7 +539,7 @@ certs_manual() {   # [домен]
     done
     manual_certificate_flow "$domain" || return 1
     record_fix "certs manual $domain → $CERT_LINEAGE"
-    msg_info "уже запущенная нода новый сертификат сама не подхватит — пути в $REMNANODE_DIR/nginx.conf и docker-compose.yml"
+    msg_info "домен уже на ноде — подхватит после: docker exec $NGINX_CONTAINER nginx -s reload; новый домен: rr node domain add $domain"
 }
 
 certs_menu() {

@@ -404,6 +404,8 @@ ensure_dns_record() {   # <домен> [allow_cf]
 
 # Проверка домена перед установкой: 0 — указывает сюда, 1 — нет, но продолжаем
 # по согласию, 2 — отмена. allow_cf=false: прокси Cloudflare недопустим (selfsteal).
+# A-запись через API меняется только по явному выбору: нода за балансером законно
+# смотрит на чужой IP, а сохранённый ключ провайдера не означает согласия её переписать.
 check_domain() {   # <домен> [allow_cf]
     local domain=$1 allow_cf=${2:-true} dip sip
     sip=$(public_ipv4) || {
@@ -421,7 +423,20 @@ check_domain() {   # <домен> [allow_cf]
     else
         msg_warn "у $domain нет A-записи"
     fi
+    local c
+    echo -e "    ${C}${BOLD}[1]${NC} $([ -n "$dip" ] && echo Изменить || echo Создать) A-запись: $domain → $sip ${DIM}(API Cloudflare / Gcore / Bunny или вручную)${NC}"
+    echo -e "    ${C}${BOLD}[2]${NC} Оставить как есть и продолжить ${DIM}(нода за балансером, запись правлю сам)${NC}"
+    echo -e "    ${C}${BOLD}[0]${NC} Отмена"
+    while true; do
+        ask "Выбор [0-2]" c 2 || return 2
+        case "$c" in
+            1) break ;;
+            2) msg_info "A-запись $domain не меняю"; return 1 ;;
+            0) return 2 ;;
+            *) msg_warn "нет такого пункта" ;;
+        esac
+    done
     ensure_dns_record "$domain" "$allow_cf" && return 0
-    confirm "Запись не исправлена. Всё равно продолжить установку?" || return 2
+    confirm "Запись не исправлена. Всё равно продолжить?" || return 2
     return 1
 }

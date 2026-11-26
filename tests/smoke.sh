@@ -255,6 +255,12 @@ for m in node certs warp ipv6; do
     bash "modules/$m.sh" help >/dev/null 2>&1 && ok "$m help" || bad "$m help"
     bash "modules/$m.sh" bogus >/dev/null 2>&1; [ "$?" = "2" ] && ok "$m отвергает мусор (rc=2)" || bad "$m bogus rc"
 done
+for a in "update bogus" "domain bogus" "domain add" "xray bogus"; do
+    # shellcheck disable=SC2086  # сабкоманда и аргумент через пробел
+    bash modules/node.sh $a </dev/null >/dev/null 2>&1; [ "$?" = "2" ] && ok "node $a → rc=2" || bad "node $a rc"
+done
+bash node-diagnostic.sh node help 2>/dev/null | grep -q 'domain add' && bash node-diagnostic.sh help | grep -q 'node     {update' \
+    && ok "dispatcher node + help" || bad "dispatcher node / help"
 # без TTY (или без root) — отказ ДО любых изменений
 bash modules/node.sh install </dev/null >/dev/null 2>&1; [ "$?" = "1" ] && ok "node install без TTY → отказ (rc=1)" || bad "node install rc"
 bash modules/certs.sh issue </dev/null >/dev/null 2>&1; [ "$?" = "1" ] && ok "certs issue без TTY → отказ (rc=1)" || bad "certs issue rc"
@@ -287,6 +293,77 @@ else
     bad "certs: хуки guard вокруг standalone ($r1 [$l1]; $r2 [$l2])"
 fi
 
+echo "== сертификаты: ссылки live/ → archive/ относительные (их разрешает nginx в контейнере) =="
+le=$(mktemp -d)
+mkdir -p "$le/live/ex.com" "$le/archive/ex.com" "$le/renewal" "$le/live/old.com" "$le/archive/old.com"
+for f in cert chain fullchain privkey; do
+    echo 1 >"$le/archive/ex.com/${f}1.pem"; echo 2 >"$le/archive/ex.com/${f}2.pem"
+    echo 1 >"$le/live/ex.com/$f.pem"                       # копия файлом — certbot её не продлит
+    echo o >"$le/archive/old.com/${f}1.pem"
+    ln -s "$le/archive/old.com/${f}1.pem" "$le/live/old.com/$f.pem"   # абсолютная — от прежних версий
+done
+printf 'archive_dir = %s\ncert = x\nchain = x\nfullchain = x\nprivkey = x\nauthenticator = webroot\n' "$le/archive/ex.com" >"$le/renewal/ex.com.conf"
+LE_LIVE="$le/live" LE_RENEWAL="$le/renewal" bash -c 'source lib/common.sh; source modules/certs.sh
+    fix_letsencrypt_structure ex.com && le_relativize_links old.com' >/dev/null 2>&1
+if [ "$(readlink "$le/live/ex.com/fullchain.pem")" = "../../archive/ex.com/fullchain2.pem" ] \
+   && [ "$(cat "$le/live/ex.com/privkey.pem")" = 2 ] \
+   && [ "$(readlink "$le/live/old.com/privkey.pem")" = "../../archive/old.com/privkey1.pem" ] \
+   && [ "$(cat "$le/live/old.com/cert.pem")" = o ] \
+   && grep -q "^fullchain = $le/live/ex.com/fullchain.pem" "$le/renewal/ex.com.conf"; then
+    ok "fix_letsencrypt_structure / le_relativize_links: ../../archive/<lineage>/…"
+else
+    bad "ссылки live/ → archive/ ($(readlink "$le/live/ex.com/fullchain.pem"); $(readlink "$le/live/old.com/privkey.pem"))"
+fi
+rm -rf "$le"
+
+echo "== DNS: A-запись меняется только с согласия =="
+cdns() {   # cdns ОТВЕТ → «rc=N[ API]»: check_domain при чужом IP, ключ провайдера «сохранён»
+    printf '%s\n' "$1" | bash -c 'source lib/common.sh; source modules/certs.sh
+        public_ipv4() { echo 203.0.113.5; }; domain_a_record() { echo 198.51.100.7; }
+        ip_is_cloudflare() { return 1; }
+        CLOUDFLARE_API_KEY=Tok; ensure_dns_record() { echo API >&3; return 0; }
+        check_domain node.example.com false >/dev/null 2>&1; echo "rc=$?"' 3>&1 2>/dev/null | tr '\n' ' '
+}
+d1=$(cdns ""); d2=$(cdns 1); d3=$(cdns 0)
+if [ "$d1" = "rc=1 " ] && [ "$d2" = "API rc=0 " ] && [ "$d3" = "rc=2 " ]; then
+    ok "check_domain: Enter — оставить (API не зовётся), 1 — через API, 0 — отмена"
+else
+    bad "check_domain: согласие на смену A-записи (Enter: $d1; 1: $d2; 0: $d3)"
+fi
+
+echo "== rr: актуальная версия при каждом запуске, без сети — локальная =="
+if command -v git >/dev/null 2>&1; then
+    rt=$(mktemp -d)
+    gc() { git -C "$rt/src" -c user.name=t -c user.email=t@t.invalid "$@" >/dev/null 2>&1; }
+    mkdir -p "$rt/src/lib" "$rt/fk" "$rt/home"
+    printf 'echo "nd v1 $*"\n' >"$rt/src/node-diagnostic.sh"
+    printf 'ND_VERSION="9.9.1"\n' >"$rt/src/lib/common.sh"
+    git init -q "$rt/src" && git -C "$rt/src" checkout -q -b main && gc add -A && gc commit -qm v1
+    # фейки: id -u — 1000, пока «sudo» не выставил FAKE_ROOT; sudo — env (обёртка перезапускает себя)
+    printf '#!/bin/sh\nexec env FAKE_ROOT=1 "$@"\n' >"$rt/fk/sudo"
+    printf '#!/bin/sh\nif [ "$1" = -u ]; then [ -n "${FAKE_ROOT:-}" ] && echo 0 || echo 1000; exit 0; fi\nexec /usr/bin/id "$@"\n' >"$rt/fk/id"
+    chmod +x "$rt/fk/sudo" "$rt/fk/id"
+    HOME="$rt/home" ND_REPO="file://$rt/src" ND_REF=main ND_DEST="$rt/dest" ND_BIN_DIR="$rt/bin" \
+        bash install.sh </dev/null >/dev/null 2>&1
+    rrun() { PATH="$rt/fk:$PATH" timeout 60 bash "$rt/bin/rr" "$@" 2>&1; }
+    o1=$(rrun a)
+    printf 'echo "nd v2 $*"\n' >"$rt/src/node-diagnostic.sh"; gc commit -qam v2
+    o2=$(rrun b)
+    printf 'echo "nd v3 $*"\n' >"$rt/src/node-diagnostic.sh"; gc commit -qam v3
+    o3=$(ND_NO_PULL=1 rrun c)
+    mv "$rt/src" "$rt/src.gone"
+    o4=$(rrun d); r4=$?
+    if [ "$o1" = "nd v1 a" ] && [[ "$o2" == *"обновлён"*"nd v2 b" ]] && [ "$o3" = "nd v2 c" ] \
+       && [ "$r4" = 0 ] && [[ "$o4" == *"не подтянулась"*"v9.9.1"*"nd v2 d" ]]; then
+        ok "rr: подтягивает новую версию; ND_NO_PULL=1 через sudo; нет origin — локальная + предупреждение"
+    else
+        bad "rr: подтягивание ($o1 | $o2 | $o3 | $r4 $o4)"
+    fi
+    rm -rf "$rt"
+else
+    echo "  ~ git нет — пропускаю проверку rr"
+fi
+
 echo "== нода: домены, покрытие сертификатом =="
 fn=$(bash -c 'source lib/common.sh; source modules/node.sh
     [ "$(extract_domain node.example.com)" = example.com ] || exit 1
@@ -305,9 +382,10 @@ echo "== нода: рендер docker-compose.yml / .env / nginx.conf / nginx-m
 nd=$(mktemp -d)
 bash -c 'source lib/common.sh; source modules/node.sh
     node_render_env "$1" 2222 eyJhbGciOiJIUzI1NiJ9.dGVzdC1zZWNyZXQ
-    node_render_compose "$1" example.com
+    node_render_compose "$1"
     node_render_nginx "$1" node.example.com example.com
-    node_render_nginx_main "$1"' _ "$nd" >/dev/null 2>&1
+    node_render_nginx_main "$1"
+    mkdir -p "$1/x" && node_render_compose "$1/x" xray' _ "$nd" >/dev/null 2>&1
 if grep -qx 'NODE_PORT=2222' "$nd/.env" 2>/dev/null && grep -q '^SECRET_KEY=eyJ' "$nd/.env" \
    && [ "$(stat -c %a "$nd/.env" 2>/dev/null)" = "600" ]; then
     ok ".env (NODE_PORT, SECRET_KEY, 600)"
@@ -315,14 +393,25 @@ else
     bad ".env"
 fi
 if grep -q 'env_file:' "$nd/docker-compose.yml" 2>/dev/null \
-   && grep -qF '/etc/letsencrypt/live/example.com/fullchain.pem:/etc/nginx/ssl/example.com/fullchain.pem:ro' "$nd/docker-compose.yml" \
+   && grep -qxF '      - /etc/letsencrypt/live:/etc/nginx/ssl:ro' "$nd/docker-compose.yml" \
+   && grep -qxF '      - /etc/letsencrypt/archive:/etc/nginx/archive:ro' "$nd/docker-compose.yml" \
+   && ! grep -q 'fullchain.pem' "$nd/docker-compose.yml" \
+   && grep -qxF '    image: nginx:alpine' "$nd/docker-compose.yml" \
    && grep -qF "rm -f /dev/shm/nginx.sock && exec nginx" "$nd/docker-compose.yml" \
    && grep -qF './nginx-main.conf:/etc/nginx/nginx.conf:ro' "$nd/docker-compose.yml" \
    && grep -qF './nginx.conf:/etc/nginx/conf.d/default.conf:ro' "$nd/docker-compose.yml" \
+   && ! grep -q 'xray' "$nd/docker-compose.yml" \
    && ! grep -qiE 'caddy|ufw' "$nd/docker-compose.yml"; then
-    ok "docker-compose.yml (nginx + remnanode, маунты конфигов и сертификата, без Caddy)"
+    ok "docker-compose.yml (nginx:alpine, сертификаты каталогами live/archive, без Caddy)"
 else
     bad "docker-compose.yml"
+fi
+if [ "$(tail -n1 "$nd/x/docker-compose.yml" 2>/dev/null)" = "      - /opt/xray-core/xray:/usr/local/bin/xray:ro" ] \
+   && [ "$(python3 modules/node_conf.py compose-xray "$nd/x/docker-compose.yml" status 2>/dev/null)" = "on /opt/xray-core/xray" ] \
+   && [ "$(python3 modules/node_conf.py compose-migrate "$nd/docker-compose.yml" --out "$nd/m.yml" 2>/dev/null)" = same ]; then
+    ok "compose со своим ядром: том xray у remnanode; свежий compose миграции не требует"
+else
+    bad "compose: том xray / миграция свежего"
 fi
 if grep -q 'server_name node.example.com;' "$nd/nginx.conf" 2>/dev/null \
    && grep -q 'listen unix:/dev/shm/nginx.sock ssl proxy_protocol;' "$nd/nginx.conf" \
@@ -351,17 +440,24 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     if docker compose version >/dev/null 2>&1; then
         (cd "$nd" && docker compose config -q) >/dev/null 2>&1 && ok "docker compose config" || bad "docker compose config"
     fi
-    # оба конфига целиком через nginx -t в том же образе, что ставит нода
+    # оба конфига целиком через nginx -t в том же образе, что ставит нода; сертификаты —
+    # как у certbot: live/<lineage>/*.pem — относительные ссылки на ../../archive/<lineage>/*1.pem,
+    # каталоги смонтированы как в compose. Второй домен добавлен node_conf.py add (другой lineage)
     if command -v openssl >/dev/null 2>&1; then
         img=$(bash -c 'source lib/common.sh; source modules/node.sh; echo "$NGINX_IMAGE"')
-        mkdir -p "$nd/ssl/example.com"
-        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 -nodes -days 1 \
-            -subj /CN=node.example.com -keyout "$nd/ssl/example.com/privkey.pem" \
-            -out "$nd/ssl/example.com/fullchain.pem" >/dev/null 2>&1
+        for l in example.com two.example.org; do
+            mkdir -p "$nd/le/archive/$l" "$nd/le/live/$l"
+            openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 -nodes -days 1 \
+                -subj "/CN=$l" -keyout "$nd/le/archive/$l/privkey1.pem" \
+                -out "$nd/le/archive/$l/fullchain1.pem" >/dev/null 2>&1
+            ln -s "../../archive/$l/fullchain1.pem" "$nd/le/live/$l/fullchain.pem"
+            ln -s "../../archive/$l/privkey1.pem" "$nd/le/live/$l/privkey.pem"
+        done
+        python3 modules/node_conf.py add "$nd/nginx.conf" two.example.org two.example.org --out "$nd/nginx2.conf" 2>/dev/null
         if nt=$(docker run --rm -v "$nd/nginx-main.conf:/etc/nginx/nginx.conf:ro" \
-                -v "$nd/nginx.conf:/etc/nginx/conf.d/default.conf:ro" \
-                -v "$nd/ssl:/etc/nginx/ssl:ro" "$img" nginx -t 2>&1); then
-            ok "nginx -t ($img): nginx-main.conf + nginx.conf"
+                -v "$nd/nginx2.conf:/etc/nginx/conf.d/default.conf:ro" \
+                -v "$nd/le/live:/etc/nginx/ssl:ro" -v "$nd/le/archive:/etc/nginx/archive:ro" "$img" nginx -t 2>&1); then
+            ok "nginx -t ($img): nginx-main.conf + nginx.conf на 2 домена, live/archive каталогами"
         else
             bad "nginx -t ($img)"; printf '%s\n' "$nt" | tail -n 5 | sed 's/^/      /'
         fi
@@ -469,6 +565,11 @@ if command -v python3 >/dev/null 2>&1; then
         ok "guard_ctrl чистые тесты"
     else
         bad "guard_ctrl чистые тесты"
+    fi
+    if python3 -m unittest tests/test_node_conf.py >/dev/null 2>&1; then
+        ok "node_conf unittest (nginx.conf: add/del домена; compose: миграция, том xray)"
+    else
+        bad "node_conf unittest"
     fi
 else
     echo "  ~ python3 нет — пропускаю guard-тесты"
