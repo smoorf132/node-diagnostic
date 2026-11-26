@@ -28,6 +28,7 @@
 | `guard`    | защита от DDoS: XDP-cookies + NOTRACK, вариант «только Россия» / «весь мир», allowlist, dead-man | да (XDP + tc + nft, свой `off`) |
 | `bbr3`     | ядро XanMod для TCP **BBRv3** (mainline даёт только v1) | да, но **без автоперезагрузки** |
 | `install`  | установка ноды Remnawave (nginx-selfsteal + сертификат) / WARP / NetBird / мониторинга / CrowdSec | да (по подтверждению) |
+| `node`     | управление нодой: домены сайта в `nginx.conf`, обновление nginx/remnanode по запросу, своё ядро Xray | да (правки на месте, с бэкапом) |
 | `certs`    | сертификаты: продление, выпуск (Cloudflare / Gcore / Bunny / HTTP-01), свой сертификат | да |
 | `warp`     | WARP Native: интерфейс `warp` для outbound Xray | да (по подтверждению) |
 | `ipv6`     | включить/выключить IPv6 (sysctl `disable_ipv6`) | да |
@@ -49,7 +50,8 @@ modules/
   bbr3.sh                   установка XanMod (BBRv3)
   rollback.sh               откат оптимизаций
   install.sh                диспетчер установки: нода/WARP/NetBird/мониторинг/CrowdSec
-  node.sh                   установка ноды: remnanode + nginx-selfsteal + шаблон сайта
+  node.sh                   нода: установка (remnanode + nginx-selfsteal + шаблон сайта), домены, обновление, ядро Xray
+  node_conf.py              правка nginx.conf и docker-compose.yml ноды на месте (сайты, тома)
   certs.sh                  сертификаты: выпуск 5 методами, продление, хуки, cron
   warp.sh                   WARP Native (distillium/warp-native)
   ipv6.sh                   включение/выключение IPv6
@@ -73,7 +75,7 @@ modules/
 curl -sSL https://raw.githubusercontent.com/smoorf132/node-diagnostic/main/install.sh | sudo bash
 ```
 
-Скачивает репозиторий в `/opt/node-diagnostic`, ставит команду **`rr`** (`/usr/local/bin/rr`) и в терминале сразу открывает меню. Дальше тулкит запускается просто `rr` (`rr certs renew`, `rr ipv6 status` и т.д.); не под root `rr` сам перезапускается через `sudo`. Если на сервере остался alias `rr` от remnawave-reverse-proxy (`/etc/bash.bashrc`), установщик его комментирует, а сам скрипт остаётся доступен как `remnawave_reverse`. Переопределяемо через env: `ND_REF` (ветка/тег), `ND_DEST` (каталог), `ND_BIN_DIR` (куда положить `rr`).
+Скачивает репозиторий в `/opt/node-diagnostic`, ставит команду **`rr`** (`/usr/local/bin/rr`) и в терминале сразу открывает меню. Дальше тулкит запускается просто `rr` (`rr certs renew`, `rr ipv6 status` и т.д.); не под root `rr` сам перезапускается через `sudo`. **При каждом запуске `rr` подтягивает актуальную версию** из репозитория (git, без git — tarball, тайм-аут 20 с); если GitHub недоступен, предупреждает и запускает локальную копию. `ND_NO_PULL=1 rr …` — без подтягивания. На нодах, поставленных до 4.5.0, обёртка `rr` старая: один раз выполни команду установки выше — она обновит тулкит и перепишет `rr`. Если на сервере остался alias `rr` от remnawave-reverse-proxy (`/etc/bash.bashrc`), установщик его комментирует, а сам скрипт остаётся доступен как `remnawave_reverse`. Переопределяемо через env: `ND_REF` (ветка/тег), `ND_DEST` (каталог), `ND_BIN_DIR` (куда положить `rr`).
 
 **Или вручную** (тулкит модульный — нужен весь репозиторий):
 
@@ -97,6 +99,9 @@ sudo bash node-diagnostic.sh optimize --dry-run    # показать, что п
 sudo bash node-diagnostic.sh protect --panel-ip 1.2.3.4 --node-port 2222
 sudo bash node-diagnostic.sh bbr3 --install        # XanMod (нужен reboot); --level 2 если CPU маскирован
 sudo bash node-diagnostic.sh install node          # нода Remnawave: nginx-selfsteal + сертификат
+sudo rr node domain add two.example.com            # ещё домен сайта-заглушки (проверка сертификата)
+sudo rr node update                                # nginx и remnanode до последней версии
+sudo rr node xray https://…/Xray-linux-64          # своё ядро Xray по ссылке
 sudo bash node-diagnostic.sh certs renew           # продлить сертификаты, у которых ≤30 дней
 sudo bash node-diagnostic.sh ipv6 off              # выключить IPv6
 sudo bash node-diagnostic.sh install monitoring    # WARP/NetBird/мониторинг/CrowdSec — так же
@@ -301,14 +306,34 @@ sudo bash node-diagnostic.sh install crowdsec     # CrowdSec + nftables-bouncer 
 
 1. Пакеты: Docker (get.docker.com → проверенная копия с зеркала → `docker.io` из дистрибутива), certbot, `dig`, `jq`, cron, зеркала Docker Hub (`mirror.gcr.io`, `dockerhub.timeweb.cloud`), unattended-upgrades. BBR не трогает: это делает `optimize`.
 2. Проверки: на сервере не запущены `remnanode`/`remnawave-nginx`, свободны порты 443 (xray ноды) и 80 (nginx, редирект на https).
-3. Selfsteal-домен: A-запись должна указывать на сервер **без прокси Cloudflare**. Если записи нет или она чужая, её можно создать через API Cloudflare / Gcore / Bunny или вручную (установщик ждёт, пока запись появится).
-4. IP панели, `SECRET_KEY` из карточки ноды (можно вставить целиком вместе с `NODE_PORT=`), `NODE_PORT` (по умолчанию 2222).
+3. Selfsteal-домен: A-запись должна указывать на сервер **без прокси Cloudflare**. Если записи нет или она указывает на другой IP, установщик спрашивает: изменить её через API Cloudflare / Gcore / Bunny (или вручную — ждёт, пока запись появится), оставить как есть (нода за балансером) или отменить. Без явного выбора запись не меняется, даже если ключ провайдера сохранён от прошлой установки.
+4. IP панели, `SECRET_KEY` из карточки ноды (можно вставить целиком вместе с `NODE_PORT=`), `NODE_PORT` (по умолчанию 2222), ссылка на своё ядро Xray (Enter — встроенное в образ; см. `node xray`).
 5. Сертификат: уже есть подходящий — берётся он; нет — выпускается (см. `certs`). Если A-запись только что создана через API провайдера, wildcard выпускается тем же провайдером без вопроса.
-6. `/opt/remnanode`: `docker-compose.yml` (nginx + remnanode, `network_mode: host`), `.env` (`NODE_PORT`, `SECRET_KEY`, права 600), `nginx.conf` (сайт, монтируется в `conf.d/default.conf`), `nginx-main.conf` (главный `/etc/nginx/nginx.conf` контейнера: воркеры, буферы, gzip, `log_format proxy_protocol`). Прежние конфиги сохраняются как `*.bak-<время>`.
+6. `/opt/remnanode`: `docker-compose.yml` (`nginx:alpine` + remnanode, `network_mode: host`; сертификаты монтируются каталогами `/etc/letsencrypt/live:/etc/nginx/ssl:ro` и `/etc/letsencrypt/archive:/etc/nginx/archive:ro` — любой домен и продление видны без правки compose), `.env` (`NODE_PORT`, `SECRET_KEY`, права 600), `nginx.conf` (сайт, монтируется в `conf.d/default.conf`), `nginx-main.conf` (главный `/etc/nginx/nginx.conf` контейнера: воркеры, буферы, gzip, `log_format proxy_protocol`). Прежние конфиги сохраняются как `*.bak-<время>`.
 7. Случайный шаблон сайта-маскировки в `/var/www/html` из одного из трёх наборов: simple-web-templates, sni-templates, nothing-sni. Title, meta и классы рандомизируются.
 8. `docker compose up -d` и проверка, что `https://домен` отвечает сайтом.
 
 nginx принимает selfsteal только на unix-сокете `/dev/shm/nginx.sock` с `proxy_protocol` (TLS 1.3, access-лог с реальным IP клиента, неизвестные SNI — обрыв рукопожатия), а на `:80` отвечает редиректом на https. При продлении HTTP-01 certbot на время останавливает `remnawave-nginx` (pre/post-хуки), чтобы освободить 80. В профиле Xray в панели: Reality `target` = `/dev/shm/nginx.sock`, `xver: 1`, `serverNames: ["домен"]`. ufw нет, поэтому `NODE_PORT` открыт всем, пока его не закроет firewall. Установщик в конце подсказывает команду `rr protect --panel-ip … --node-port …`; `protect` и сам находит порт в `/opt/remnanode/.env`.
+
+### Управление нодой (`node`)
+
+Пункт меню **[14]** и команда `node`. Файлы в `/opt/remnanode` правятся **на месте**: меняются только нужные блоки и строки, ручные правки остаются, перед каждой правкой — бэкап `<файл>.bak-<время>`. Разбор — `modules/node_conf.py` (python3 есть на ноде вместе с certbot).
+
+```bash
+sudo rr node domain list                 # домены сайта-заглушки, сертификат, дней до истечения
+sudo rr node domain add two.example.com  # добавить домен
+sudo rr node domain del two.example.com  # убрать (последний — нельзя)
+sudo rr node update                      # nginx и remnanode до последней версии; update nginx | update node — по одному
+sudo rr node xray https://github.com/XTLS/Xray-core/releases/download/vX.Y.Z/Xray-linux-64.zip
+sudo rr node xray off                    # вернуть встроенное ядро
+sudo rr node xray status
+```
+
+- **`domain add`**: проверяется A-запись (смена — только с согласия, как при установке), затем сертификат: подходящий есть — берётся он, нет — в терминале предлагается выпуск (`certs`), без терминала — отказ. Новый блок `server` — копия первого сайта (со всеми ручными правками: заголовки, `location`) с новым `server_name` и путями сертификата. Перед записью все `ssl_certificate*` проверяются на диске и конфиг проходит `nginx -t` в отдельном контейнере; затем запись, `nginx -t` в живом контейнере и `nginx -s reload`, при ошибке — прежний конфиг. Домен нужно добавить и в `serverNames` профиля Reality в панели.
+- **`domain del`**: имя убирается из `server_name`, а если оно там одно — блок целиком. Сертификат остаётся.
+- **`update`** — по запросу, автообновления нет. `docker compose pull`; nginx на новом образе сначала проходит `nginx -t` (не прошёл — остаётся на старом), remnanode перед перезапуском спрашивает подтверждение (клиенты отключатся на несколько секунд). Пересоздаются только изменившиеся контейнеры, старые образы удаляются (`docker image prune`). Своё ядро не обновляется — `update` об этом напоминает.
+- **`xray URL`** — бинарь или zip релиза (из zip берётся `xray`). Проверяются ELF и архитектура сервера, затем `xray version` в образе remnanode; ядро кладётся в `/opt/xray-core/xray`, в compose remnanode добавляется `- /opt/xray-core/xray:/usr/local/bin/xray:ro`, remnanode пересоздаётся. Ссылки на `github.com` при недоступности качаются через GitHub-прокси. `xray off` убирает том, файл ядра остаётся.
+- **Ноды, поставленные до 4.5.0**: первая команда `node` переводит `docker-compose.yml` на каталоги `live/` + `archive/` и `nginx:alpine` и пересоздаёт nginx. Ссылки `live/ → archive/` должны быть относительными (так их делает certbot): абсолютные, оставленные прежним `certs renew`, переделываются автоматически.
 
 ### WARP Native (`warp`)
 
@@ -337,7 +362,7 @@ sudo bash node-diagnostic.sh certs manual example.com   # загрузить с�
 | ACME HTTP-01 | один домен | открытый снаружи 80/tcp (firewall `protect` его открывает) |
 | Свой сертификат | что загрузишь | `fullchain.pem` + `privkey.pem`; проверяются пара, домен и срок |
 
-Ключи DNS-провайдеров хранятся в `/root/.secrets/certbot/*.ini` (600): по ним certbot продлевает сертификат, и следующая установка их не спрашивает. Ключи ECDSA secp384r1. Продление идёт через `certbot.timer` пакета и cron (`0 5 * * 0 certbot renew`). Хук перезапускает `remnawave-nginx`, потому что сертификат примонтирован в контейнер файлом. Для HTTP-01 хуки останавливают nginx на время проверки и запускают обратно. Свой сертификат certbot не продлевает: `renew` только показывает его срок.
+Ключи DNS-провайдеров хранятся в `/root/.secrets/certbot/*.ini` (600): по ним certbot продлевает сертификат, и следующая установка их не спрашивает. Ключи ECDSA secp384r1. Продление идёт через `certbot.timer` пакета и cron (`0 5 * * 0 certbot renew`). Хук перезапускает `remnawave-nginx`, чтобы nginx перечитал новый сертификат. Ссылки `live/ → archive/` относительные, как у certbot: так их разрешает и nginx в контейнере. Для HTTP-01 хуки останавливают nginx на время проверки и запускают обратно. Свой сертификат certbot не продлевает: `renew` только показывает его срок.
 
 ## `ipv6` — IPv6 на ноде
 

@@ -62,6 +62,9 @@ node-diagnostic.sh v$ND_VERSION — модульный тулкит ноды (Re
   install {node|warp|netbird|monitoring|crowdsec|balancer}
                                  Установка ноды Remnawave (nginx-selfsteal + сертификат) / WARP /
                                  NetBird / мониторинга / CrowdSec
+  node     {update [nginx|node]|domain list|add ДОМЕН|del ДОМЕН|xray URL|off|status}
+                                 Управление нодой: обновление образов по запросу, домены сайта
+                                 в nginx.conf (с проверкой сертификата), своё ядро Xray по ссылке
   certs    [menu|renew|issue [ДОМЕН]|manual [ДОМЕН]]
                                  Сертификаты: продление, выпуск (Cloudflare/Gcore/Bunny/HTTP-01), свой
   warp     [menu|install|uninstall|status]
@@ -78,7 +81,8 @@ node-diagnostic.sh v$ND_VERSION — модульный тулкит ноды (Re
   help | --version
 
 Без аргументов: меню в терминале, диагностика — если ввод не интерактивный (curl | bash).
-После install.sh тулкит доступен командой rr (например: rr, rr certs renew, rr ipv6 status).
+После install.sh тулкит доступен командой rr (например: rr, rr certs renew, rr ipv6 status);
+rr при каждом запуске подтягивает актуальную версию (ND_NO_PULL=1 — без этого).
 HELP
 }
 
@@ -99,9 +103,10 @@ menu() {
         echo -e "   ${C}${BOLD}[11]${NC} IPv6               ${DIM}включить/выключить${NC}"
         echo -e "   ${C}${BOLD}[12]${NC} Защита от DDoS     ${DIM}XDP: только Россия / весь мир${NC}"
         echo -e "   ${C}${BOLD}[13]${NC} Балансер nginx     ${DIM}SNI → ноды, proxy-protocol${NC}"
+        echo -e "   ${C}${BOLD}[14]${NC} Управление нодой   ${DIM}домены, обновление, ядро Xray${NC}"
         echo -e "    ${C}${BOLD}[0]${NC} Выход"
         echo
-        printf "  ${BOLD}Выбор${NC} ${DIM}[0-13]${NC}: "
+        printf "  ${BOLD}Выбор${NC} ${DIM}[0-14]${NC}: "
         local c; read -r c
         echo
         case "$c" in
@@ -118,6 +123,7 @@ menu() {
             11) run ipv6 menu ;;
             12) menu_guard ;;
             13) menu_balancer ;;
+            14) menu_node ;;
             0|q|"") echo -e "  ${DIM}выход${NC}"; return 0 ;;
             *) echo -e "  ${Y}нет такого пункта${NC}" ;;
         esac
@@ -356,6 +362,36 @@ menu_balancer() {
     esac
 }
 
+menu_node() {
+    if [ ! -t 0 ]; then run node domain list; return; fi
+    echo -e "  ${BOLD}Управление нодой${NC} ${DIM}($REMNANODE_DIR; правки на месте, с бэкапом)${NC}"
+    echo -e "    ${C}${BOLD}[1]${NC} Домены: список"
+    echo -e "    ${C}${BOLD}[2]${NC} Добавить домен        ${DIM}сертификат проверяется, нет — выпуск${NC}"
+    echo -e "    ${C}${BOLD}[3]${NC} Удалить домен"
+    echo -e "    ${C}${BOLD}[4]${NC} Обновить nginx и remnanode ${DIM}до последней версии${NC}"
+    echo -e "    ${C}${BOLD}[5]${NC} Обновить только nginx"
+    echo -e "    ${C}${BOLD}[6]${NC} Обновить только remnanode"
+    echo -e "    ${C}${BOLD}[7]${NC} Своё ядро Xray        ${DIM}по ссылке на бинарь или zip${NC}"
+    echo -e "    ${C}${BOLD}[8]${NC} Встроенное ядро Xray  ${DIM}убрать своё${NC}"
+    echo -e "    ${C}${BOLD}[9]${NC} Ядро Xray: статус"
+    echo -e "    ${C}${BOLD}[0]${NC} Назад"
+    printf "  ${BOLD}Выбор${NC} ${DIM}[0-9]${NC}: "; local c d; read -r c; echo
+    case "$c" in
+        1) run node domain list ;;
+        2) printf "  Домен: "; read -r d; [ -n "$d" ] && run node domain add "$d" ;;
+        3) run node domain list; printf "  Домен: "; read -r d; [ -n "$d" ] && run node domain del "$d" ;;
+        4) run node update ;;
+        5) run node update nginx ;;
+        6) run node update node ;;
+        7) printf "  Ссылка на ядро (напр. https://github.com/XTLS/Xray-core/releases/download/vX.Y.Z/Xray-linux-64.zip): "
+           read -r d; [ -n "$d" ] && run node xray "$d" ;;
+        8) run node xray off ;;
+        9) run node xray status ;;
+        0|q|"") return 0 ;;
+        *) echo -e "  ${Y}нет такого пункта${NC}" ;;
+    esac
+}
+
 menu_install() {
     if [ ! -t 0 ]; then echo -e "  ${Y}установка доступна только в интерактивном режиме${NC}"; return 0; fi
     echo -e "  ${BOLD}Установка Remnanode${NC}"
@@ -438,6 +474,7 @@ case "$cmd" in
     rollback|revert)       run rollback "$@" ;;
     status|st)             show_status ;;
     install|setup)         run install "$@" ;;
+    node|remnanode)        run node "$@" ;;
     shape|shaper)          run shape "$@" ;;
     guard|ddos)            run guard "$@" ;;
     balancer|lb)           run balancer "$@" ;;
